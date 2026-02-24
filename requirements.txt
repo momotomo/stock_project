@@ -1,1 +1,5 @@
-streamlityfinancepandasnumpyscikit-learn
+streamlit
+yfinance
+pandas
+numpy
+scikit-learn
