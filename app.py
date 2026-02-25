@@ -2,12 +2,16 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score
+from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor, HistGradientBoostingClassifier, StackingClassifier
+from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import RobustScaler
 import os
 import plotly.express as px
 from github import Github
+import warnings
+
+# --- 警告の非表示設定 ---
+warnings.simplefilter('ignore', ResourceWarning)
 
 # ページ設定
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
@@ -33,18 +37,34 @@ def get_secret(key):
 # --- 分析・特徴量作成関数（共通化） ---
 @st.cache_data(show_spinner=False)
 def get_macro_data():
-    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret"}
+    macro_tickers = {
+        "USDJPY=X": "USDJPY_Ret", 
+        "^GSPC": "SP500_Ret",
+        "^VIX": "VIX_Ret",      # 恐怖指数
+        "^TNX": "US10Y_Ret"     # 米国10年債利回り
+    }
     try:
         macro_df = yf.download(list(macro_tickers.keys()), period="5y", progress=False)
         if isinstance(macro_df.columns, pd.MultiIndex):
             macro_data = macro_df.xs('Close', level=0, axis=1) if 'Close' in macro_df.columns.levels[0] else macro_df
         else:
             macro_data = macro_df['Close']
+            
+        # 対数収益率による定常化
         macro_returns = np.log(macro_data / macro_data.shift(1)).rename(columns=macro_tickers)
         macro_returns.index = pd.to_datetime(macro_returns.index).map(lambda x: x.replace(tzinfo=None).normalize())
         return macro_returns
     except Exception:
         return pd.DataFrame()
+
+FEATURES = [
+    'Log_Return', 'Log_Return_Lag1', 'Log_Return_Lag2', 
+    'Ret_RollStd_20',                                   
+    'Disparity_5', 'Disparity_25', 'SMA_Cross', 
+    'RSI_14', 'MFI_14',                                 
+    'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 
+    'USDJPY_Ret', 'SP500_Ret', 'VIX_Ret', 'US10Y_Ret'   
+]
 
 def get_stock_features(ticker, macro_returns):
     data = yf.download(ticker, period="5y", progress=False)
@@ -64,9 +84,20 @@ def get_stock_features(ticker, macro_returns):
     ema_up, ema_down = up.ewm(com=13, adjust=False).mean(), down.ewm(com=13, adjust=False).mean()
     data['RSI_14'] = 100 - (100 / (1 + (ema_up / ema_down)))
     
+    tp = (data['High'] + data['Low'] + data['Close']) / 3
+    rmf = tp * data['Volume']
+    pos_mf = pd.Series(np.where(tp > tp.shift(1), rmf, 0), index=data.index)
+    neg_mf = pd.Series(np.where(tp < tp.shift(1), rmf, 0), index=data.index)
+    mfi_ratio = pos_mf.rolling(14).sum() / (neg_mf.rolling(14).sum() + 1e-9)
+    data['MFI_14'] = 100 - (100 / (1 + mfi_ratio))
+    
+    data['Log_Return_Lag1'] = data['Log_Return'].shift(1)
+    data['Log_Return_Lag2'] = data['Log_Return'].shift(2)
+    data['Ret_RollStd_20'] = data['Log_Return'].rolling(20).std()
+    
     std_20, ma_20 = data['Close'].rolling(20).std(), data['Close'].rolling(20).mean()
-    data['BB_PctB'] = (data['Close'] - (ma_20 - 2*std_20)) / (4*std_20)
-    data['BB_Bandwidth'] = (4*std_20) / data['Close'].rolling(25).mean()
+    data['BB_PctB'] = (data['Close'] - (ma_20 - 2*std_20)) / (4*std_20 + 1e-9)
+    data['BB_Bandwidth'] = (4*std_20) / (data['Close'].rolling(25).mean() + 1e-9)
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
     tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
     data['ATR'] = tr.rolling(14).mean() / data['Close']
@@ -74,9 +105,9 @@ def get_stock_features(ticker, macro_returns):
     
     data.replace([np.inf, -np.inf], np.nan, inplace=True)
     if not macro_returns.empty: data = data.join(macro_returns)
-    for col in ['USDJPY_Ret', 'SP500_Ret']:
+    for col in ['USDJPY_Ret', 'SP500_Ret', 'VIX_Ret', 'US10Y_Ret']:
         if col not in data.columns: data[col] = 0.0
-    data[['USDJPY_Ret', 'SP500_Ret']] = data[['USDJPY_Ret', 'SP500_Ret']].ffill().fillna(0)
+    data[['USDJPY_Ret', 'SP500_Ret', 'VIX_Ret', 'US10Y_Ret']] = data[['USDJPY_Ret', 'SP500_Ret', 'VIX_Ret', 'US10Y_Ret']].ffill().fillna(0)
     
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
     data['Target_Price'] = data['Close'].shift(-1)
@@ -106,9 +137,9 @@ def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
             labels[i] = 0
     return labels
 
-st.title("🚀 AI株価スクリーニングダッシュボード")
+st.title("🚀 AI株価スクリーニングダッシュボード (全スパン・アンサンブル版)")
 
-tab1, tab2, tab3 = st.tabs(["🔍 今日の分析", "📈 予測推移", "📊 バックテスト (検証)"])
+tab1, tab2, tab3 = st.tabs(["🔍 今日の分析", "📈 予測推移", "📊 バックテスト (WFO検証)"])
 
 # --- サイドバー設定 ---
 st.sidebar.header("⚙️ 分析銘柄の設定")
@@ -156,24 +187,37 @@ for line in ticker_input.strip().split('\n'):
         tickers[name.strip()] = ticker.strip()
 
 # ==========================================
-# タブ1：今日の分析
+# 🌟 タブ1：今日の分析 (アンサンブル学習・全スパン対応)
 # ==========================================
 with tab1:
-    st.write("短期の予測に加え、中長期スパンでの「損切り前に利確ラインに到達する確率」を複数のAIモデルで並行予測します。")
+    st.write("ランダムフォレスト(RF)、勾配ブースティング(GB)、そして『統合メタAI (Stacking)』を用いて、**明日〜1年後までの全期間の期待値**を一斉に計算します。")
 
-    if st.button("🔍 プロ仕様の分析を実行する", type="primary") and tickers:
+    if st.button("🔍 全期間（明日〜1Y）の予測を一斉実行", type="primary") and tickers:
         results = []
-        with st.spinner('データを取得し、AIモデルを学習しています...'):
+        
+        base_models = [
+            ("RF", RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)),
+            ("GB", HistGradientBoostingClassifier(max_depth=5, random_state=42))
+        ]
+        
+        model_dict = {
+            "Stacking": StackingClassifier(
+                estimators=base_models,
+                final_estimator=LogisticRegression(random_state=42),
+                cv=3
+            ),
+            "RF": RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42),
+            "GB": HistGradientBoostingClassifier(max_depth=5, random_state=42)
+        }
+        
+        with st.spinner('データを取得し、全期間（1W〜1Y）のAIモデルを学習しています...（時間がかかります）'):
             macro_returns = get_macro_data()
 
             for name, ticker in tickers.items():
                 data = get_stock_features(ticker, macro_returns)
                 if data is None: continue
                 
-                features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
-                            'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
-                
-                data_features = data.dropna(subset=features)
+                data_features = data.dropna(subset=FEATURES)
                 if len(data_features) <= 100: continue
                 
                 latest_data = data_features.iloc[[-1]]
@@ -182,54 +226,87 @@ with tab1:
                 
                 if len(historical_data) <= 100: continue
                 
-                X_raw = historical_data[features]
+                X_raw = historical_data[FEATURES]
                 scaler = RobustScaler()
-                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=features)
-                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[features]), index=latest_data.index, columns=features)
+                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=FEATURES)
+                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[FEATURES]), index=latest_data.index, columns=FEATURES)
                 
-                clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-                clf.fit(X_scaled, historical_data['Target_Class'])
-                prob_up = clf.predict_proba(latest_X_scaled)[0][1]
+                # --- 1. 明日上昇の確率 ---
+                prob_tom = {}
+                y_train_tom = historical_data['Target_Class']
+                if len(np.unique(y_train_tom)) > 1:
+                    for m_name, model in model_dict.items():
+                        model.fit(X_scaled, y_train_tom)
+                        cls = list(model.classes_)
+                        p = model.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
+                        prob_tom[m_name] = p
+                else:
+                    for m_name in model_dict.keys():
+                        prob_tom[m_name] = 0.0
                 
+                # 予測価格
                 reg = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
                 reg.fit(X_scaled, historical_data['Target_Price'])
                 pred_price = reg.predict(latest_X_scaled)[0]
                 
+                # --- 2. 全スパン（1W〜1Y）のトリプルバリア予測 ---
                 tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
-                pt_sl = {'1W':0.03, '2W':0.05, '1M':0.10, '3M':0.20, '6M':0.30, '1Y':0.50}
+                pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
                 tb_results = {}
+                
                 for h_key, h_days in tb_horizons.items():
                     target_col = f'Target_TB_{h_key}'
                     data[target_col] = calc_triple_barrier(data['Close'], h_days, pt_sl[h_key], pt_sl[h_key])
-                    v_idx = data[data[target_col].notna()].index.intersection(X_raw.index)
-                    if len(v_idx) > 100:
-                        clf_h = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-                        clf_h.fit(X_scaled.loc[v_idx], data.loc[v_idx, target_col])
-                        cls = list(clf_h.classes_)
-                        p1 = clf_h.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
-                        tb_results[f"{h_key}利確"] = float(p1 * 100)
+                    valid_idx = data[data[target_col].notna()].index.intersection(X_raw.index)
+                    
+                    if len(valid_idx) > 100:
+                        y_train_tb = data.loc[valid_idx, target_col]
+                        if len(np.unique(y_train_tb)) > 1:
+                            for m_name, model in model_dict.items():
+                                model.fit(X_scaled.loc[valid_idx], y_train_tb)
+                                cls = list(model.classes_)
+                                p = model.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
+                                tb_results[f"{h_key}({m_name})"] = float(p * 100)
+                        else:
+                            for m_name in model_dict.keys():
+                                tb_results[f"{h_key}({m_name})"] = 0.0
                     else:
-                        tb_results[f"{h_key}利確"] = 0.0
+                        for m_name in model_dict.keys():
+                            tb_results[f"{h_key}({m_name})"] = 0.0
                 
-                res = {"銘柄名": name, "現在価格": float(current_price), "予測価格": float(pred_price), "明日上昇率": float(prob_up * 100)}
-                res.update(tb_results)
-                results.append(res)
+                # --- 3. 結果の合体 ---
+                res_dict = {
+                    "銘柄名": name,
+                    "現在価格": float(current_price),
+                    "予測価格(RF)": float(pred_price),
+                    "明日(Stacking)": float(prob_tom.get("Stacking", 0) * 100),
+                    "明日(RF)": float(prob_tom.get("RF", 0) * 100),
+                    "明日(GB)": float(prob_tom.get("GB", 0) * 100),
+                }
+                res_dict.update(tb_results)
+                results.append(res_dict)
 
         if results:
-            df_res = pd.DataFrame(results)
-            st.write("### 📊 本日のスクリーニング結果")
-            st.dataframe(
-                df_res,
-                column_config={
-                    "明日上昇率": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-                    "1W利確": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-                    "1M利確": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-                    "3M利確": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
-                    "現在価格": st.column_config.NumberColumn(format="¥%.1f"),
-                    "予測価格": st.column_config.NumberColumn(format="¥%.1f"),
-                },
-                hide_index=True, use_container_width=True
-            )
+            df_res = pd.DataFrame(results).sort_values("明日(Stacking)", ascending=False)
+            st.write("### 📊 本日のスタッキングAIスクリーニング結果（全期間）")
+            
+            # 見やすいようにカラム設定を構築
+            cfg = {
+                "現在価格": st.column_config.NumberColumn(format="¥%.1f"),
+                "予測価格(RF)": st.column_config.NumberColumn(format="¥%.1f")
+            }
+            # Stackingは目立つプログレスバー、それ以外は数字のみで表示
+            for col in df_res.columns:
+                if "Stacking" in col:
+                    cfg[col] = st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
+                elif "RF" in col or "GB" in col:
+                    cfg[col] = st.column_config.NumberColumn(format="%.1f%%")
+            
+            st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True)
+            
+            with st.expander("📋 クリップボードへのコピー用 (Excel/スプレッドシート用)"):
+                tsv_data = df_res.to_csv(index=False, sep='\t')
+                st.code(tsv_data, language="text")
 
 # ==========================================
 # タブ2：過去の予測推移
@@ -247,21 +324,29 @@ with tab2:
                 df_s['Date'] = pd.to_datetime(df_s['Date'])
                 df_s = df_s.sort_values('Date').reset_index(drop=True)
                 
-                fig = px.line(df_s, x='Date', y=['明日の上昇確率', '1M 利確(>10%)'], 
-                              title=f"{selected_stock} の予測確率推移", markers=True)
+                # --- CSV内に存在する全スパンのカラムを動的に探してグラフ化 ---
+                available_cols = ['明日の上昇確率']
+                for h_key, pt in zip(['1W', '2W', '1M', '3M', '6M', '1Y'], [3, 5, 10, 20, 30, 50]):
+                    col_name = f"{h_key} 利確(>{pt}%)"
+                    if col_name in df_s.columns:
+                        available_cols.append(col_name)
+                
+                # 重複を削除してプロット
+                available_cols = list(dict.fromkeys(available_cols))
+                
+                fig = px.line(df_s, x='Date', y=available_cols, 
+                              title=f"{selected_stock} の予測確率推移（全スパン）", markers=True)
                 fig.update_layout(yaxis_range=[0, 100], yaxis_title="確率 (%)")
                 st.plotly_chart(fig, use_container_width=True)
                 
                 st.markdown("---")
                 st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
-                st.write("※システムが過去に記録した確率を元に、**「確率が設定値以上だったら1単元だけ買い、次の記録日の終値で売る」**と仮定した場合の資産推移です。")
-                
                 selected_ticker = tickers.get(selected_stock, "")
                 default_lot = 100 if selected_ticker.endswith(".T") else 1
                 
                 col_sim1, col_sim2, col_sim3 = st.columns(3)
                 with col_sim1:
-                    sim_threshold = st.slider("買い条件（上昇確率 ％以上）", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
+                    sim_threshold = st.slider("買い条件（明日の上昇確率 ％以上）", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
                 with col_sim2:
                     sim_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="tab2_cash")
                 with col_sim3:
@@ -311,23 +396,27 @@ with tab2:
         st.info("まだ履歴データがありません。自動実行が開始されるまでお待ちください。")
 
 # ==========================================
-# 🌟 タブ3：バックテスト (即時反映＆UX改善版)
+# 🌟 タブ3：バックテスト (ウォークフォワード検証)
 # ==========================================
 with tab3:
-    st.write("### 📊 AIシグナルによる運用シミュレーション（即時反映版）")
-    st.write("直近1年間のデータを使って、「シグナルが出たら**1単元だけ**買い、利確/損切ルールで売る」を繰り返した場合の資産推移を検証します。**条件を変更するとグラフが自動で更新されます。**")
+    st.write("### 📊 ウォークフォワード検証 (WFO) による運用シミュレーション")
+    st.write("レポートの提言に従い、**「過去1年間で学習し、次の3ヶ月を予測する」**というローリング再学習（WFO）を実装しました。相場環境の変化（コンセプトドリフト）に適応する、より現実に近いシミュレーションです。")
     
     if not tickers:
         st.warning("左側のサイドバーで監視リストを設定してください。")
     else:
-        # パラメータ入力UI
         col1, col2 = st.columns(2)
         with col1:
             bt_stock_name = st.selectbox("検証する銘柄", list(tickers.keys()), key="bt_stock")
             bt_ticker = tickers[bt_stock_name]
             
+            bt_model_name = st.selectbox(
+                "検証に使用するAIモデル", 
+                ["Stacking (統合メタAI)", "RF (ランダムフォレスト)", "GB (勾配ブースティング)"]
+            )
+            
             default_lot = 100 if str(bt_ticker).endswith(".T") else 1
-            bt_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1, help="資金が許せば、この株数だけ購入します。")
+            bt_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1)
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
             bt_threshold = st.slider("買い条件（明日の上昇確率が何％以上で買うか）", min_value=50, max_value=80, value=55, step=1, key="bt_threshold")
             
@@ -336,41 +425,66 @@ with tab3:
             bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
             bt_hold_days = st.number_input("最大保有日数（強制決済）", value=5, step=1)
 
-        # 🌟 【改善点1】AIの学習・予測という「重い処理」だけを関数化し、キャッシュ（一時保存）する
         @st.cache_data(show_spinner=False)
-        def run_ml_prediction_for_bt(ticker):
+        def run_wfo_backtest(ticker, model_type):
             macro_returns = get_macro_data()
             data = get_stock_features(ticker, macro_returns)
             if data is None: return None, None
             
-            features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
-                        'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
-            data_features = data.dropna(subset=features + ['Target_Class'])
+            data_features = data.dropna(subset=FEATURES + ['Target_Class'])
             
-            if len(data_features) <= 300: return None, None
+            if len(data_features) <= 500: return None, None
             
-            test_size = 250
-            train_data = data_features.iloc[:-test_size]
-            test_data = data_features.iloc[-test_size:]
+            train_window = 250  # 学習期間：約1年（250営業日）
+            step_size = 60      # テスト期間・スライド幅：約3ヶ月（60営業日）
             
-            X_train = train_data[features]
-            y_train = train_data['Target_Class']
+            test_probs = []
+            test_data_list = []
             
-            scaler = RobustScaler()
-            X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
-            X_test_scaled = pd.DataFrame(scaler.transform(test_data[features]), index=test_data.index, columns=features)
+            start_idx = train_window
             
-            clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-            clf.fit(X_train_scaled, y_train)
-            test_probs = clf.predict_proba(X_test_scaled)[:, 1]
-            
-            return test_data, test_probs
+            for i in range(start_idx, len(data_features), step_size):
+                train_data = data_features.iloc[i - train_window : i]
+                test_data = data_features.iloc[i : i + step_size]
+                
+                if len(test_data) == 0:
+                    break
+                    
+                X_train = train_data[FEATURES]
+                y_train = train_data['Target_Class']
+                X_test = test_data[FEATURES]
+                
+                scaler = RobustScaler()
+                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=FEATURES)
+                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=test_data.index, columns=FEATURES)
+                
+                # 単一クラスエラー回避
+                if len(np.unique(y_train)) <= 1:
+                    probs = np.zeros(len(test_data))
+                else:
+                    if model_type.startswith("Stacking"):
+                        base_models = [
+                            ("RF", RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)),
+                            ("GB", HistGradientBoostingClassifier(max_depth=5, random_state=42))
+                        ]
+                        clf = StackingClassifier(estimators=base_models, final_estimator=LogisticRegression(random_state=42), cv=3)
+                    elif model_type.startswith("RF"):
+                        clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+                    else:
+                        clf = HistGradientBoostingClassifier(max_depth=5, random_state=42)
+                    
+                    clf.fit(X_train_scaled, y_train)
+                    probs = clf.predict_proba(X_test_scaled)[:, 1]
+                
+                test_probs.extend(probs)
+                test_data_list.append(test_data)
+                
+            final_test_data = pd.concat(test_data_list)
+            return final_test_data, test_probs
 
-        # 🌟 【改善点2】実行ボタンを廃止し、タブを開いたらすぐに表示開始
-        with st.spinner('AIが過去のチャートを分析中...（銘柄変更時のみ数秒かかります）'):
-            test_data, test_probs = run_ml_prediction_for_bt(bt_ticker)
+        with st.spinner(f'🔄 WFO（ローリング再学習）を実行中...'):
+            test_data, test_probs = run_wfo_backtest(bt_ticker, bt_model_name)
 
-        # データが揃っていれば、一瞬で終わる損益計算ループだけを回す
         if test_data is not None and test_probs is not None:
             cash = bt_initial_cash
             position = 0
@@ -448,7 +562,7 @@ with tab3:
             mcol3.metric("勝率", f"{win_rate:.1f}%")
             mcol4.metric("取引回数", f"{len(trades_df)}回")
             
-            st.info(f"💡 **比較**: もし最初に1単元（{bt_lot_size}株）だけ買って1年間放置（ガチホ）していた場合のリターンは **{bh_profit_pct:.1f}%** でした。")
+            st.info(f"💡 **WFOによる比較**: 過去数年間、AIの指示に従った場合のリターンは **{profit_pct:.1f}%** でした。もし最初に買って放置（ガチホ）していた場合のリターンは **{bh_profit_pct:.1f}%** でした。")
             
             fig = px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）")
             st.plotly_chart(fig, use_container_width=True)
@@ -457,4 +571,4 @@ with tab3:
                 with st.expander("📜 個別の取引履歴を見る"):
                     st.dataframe(trades_df, hide_index=True, use_container_width=True)
         else:
-            st.warning("データ不足のためバックテストを実行できません。")
+            st.warning("データ不足のためバックテストを実行できません。WFOには長期間（約2年以上）のデータが必要です。")
