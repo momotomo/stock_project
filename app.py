@@ -108,7 +108,6 @@ def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
 
 st.title("🚀 AI株価スクリーニングダッシュボード")
 
-# 🌟 タブを3つに増やしました
 tab1, tab2, tab3 = st.tabs(["🔍 今日の分析", "📈 予測推移", "📊 バックテスト (検証)"])
 
 # --- サイドバー設定 ---
@@ -243,154 +242,219 @@ with tab2:
             df_history = pd.read_csv(csv_file)
             if not df_history.empty:
                 stock_list = df_history['銘柄名'].unique()
-                selected_stock = st.selectbox("銘柄を選択してください", stock_list)
+                selected_stock = st.selectbox("銘柄を選択してください", stock_list, key="tab2_stock")
                 df_s = df_history[df_history['銘柄名'] == selected_stock].copy()
                 df_s['Date'] = pd.to_datetime(df_s['Date'])
-                df_s = df_s.sort_values('Date')
+                df_s = df_s.sort_values('Date').reset_index(drop=True)
                 
                 fig = px.line(df_s, x='Date', y=['明日の上昇確率', '1M 利確(>10%)'], 
                               title=f"{selected_stock} の予測確率推移", markers=True)
                 fig.update_layout(yaxis_range=[0, 100], yaxis_title="確率 (%)")
                 st.plotly_chart(fig, use_container_width=True)
-                st.dataframe(df_s.sort_values('Date', ascending=False), hide_index=True, use_container_width=True)
+                
+                st.markdown("---")
+                st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
+                st.write("※システムが過去に記録した確率を元に、**「確率が設定値以上だったら1単元だけ買い、次の記録日の終値で売る」**と仮定した場合の資産推移です。")
+                
+                selected_ticker = tickers.get(selected_stock, "")
+                default_lot = 100 if selected_ticker.endswith(".T") else 1
+                
+                col_sim1, col_sim2, col_sim3 = st.columns(3)
+                with col_sim1:
+                    sim_threshold = st.slider("買い条件（上昇確率 ％以上）", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
+                with col_sim2:
+                    sim_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="tab2_cash")
+                with col_sim3:
+                    sim_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1, key="tab2_lot")
+                
+                cash = sim_initial_cash
+                sim_history = []
+                
+                for i in range(len(df_s)):
+                    current_date = df_s.iloc[i]['Date']
+                    current_price = df_s.iloc[i]['今日の終値']
+                    current_prob = df_s.iloc[i]['明日の上昇確率']
+                    
+                    profit = 0
+                    executed = False
+                    
+                    if i < len(df_s) - 1:
+                        next_price = df_s.iloc[i+1]['今日の終値']
+                        required_cash = current_price * sim_lot_size
+                        
+                        if current_prob >= sim_threshold and cash >= required_cash:
+                            profit = (next_price - current_price) * sim_lot_size
+                            cash += profit
+                            executed = True
+                            
+                    sim_history.append({
+                        'Date': current_date,
+                        '今日の終値': current_price,
+                        '明日の上昇確率': current_prob,
+                        'シグナル': "買い" if executed else "-",
+                        '損益(円)': profit if executed else 0,
+                        '仮想累積資産(円)': cash
+                    })
+                
+                df_sim = pd.DataFrame(sim_history)
+                
+                fig2 = px.line(df_sim, x='Date', y='仮想累積資産(円)', 
+                               title=f"{selected_stock} の仮想累積資産推移 (円)", markers=True)
+                fig2.add_hline(y=sim_initial_cash, line_dash="dash", line_color="gray", annotation_text="初期資金")
+                st.plotly_chart(fig2, use_container_width=True)
+                
+                st.write("#### データ詳細（最新順）")
+                st.dataframe(df_sim.sort_values('Date', ascending=False), hide_index=True, use_container_width=True)
         except Exception as e:
             st.error(f"履歴データの読み込み中にエラーが発生しました: {e}")
     else:
         st.info("まだ履歴データがありません。自動実行が開始されるまでお待ちください。")
 
 # ==========================================
-# 🌟 タブ3：バックテスト (フェーズ3 新機能)
+# 🌟 タブ3：バックテスト (即時反映＆UX改善版)
 # ==========================================
 with tab3:
-    st.write("### 📊 AIシグナルによる運用シミュレーション")
-    st.write("直近1年間のデータを使って、「もしAIの予測ルール通りに売買していたら資金はどうなっていたか」を検証します。")
+    st.write("### 📊 AIシグナルによる運用シミュレーション（即時反映版）")
+    st.write("直近1年間のデータを使って、「シグナルが出たら**1単元だけ**買い、利確/損切ルールで売る」を繰り返した場合の資産推移を検証します。**条件を変更するとグラフが自動で更新されます。**")
     
-    col1, col2 = st.columns(2)
-    with col1:
-        if tickers:
-            bt_stock_name = st.selectbox("検証する銘柄", list(tickers.keys()))
+    if not tickers:
+        st.warning("左側のサイドバーで監視リストを設定してください。")
+    else:
+        # パラメータ入力UI
+        col1, col2 = st.columns(2)
+        with col1:
+            bt_stock_name = st.selectbox("検証する銘柄", list(tickers.keys()), key="bt_stock")
             bt_ticker = tickers[bt_stock_name]
-        bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000)
-        bt_threshold = st.slider("買い条件（明日の上昇確率が何％以上で買うか）", min_value=50, max_value=80, value=55, step=1)
-        
-    with col2:
-        bt_tp = st.number_input("利確幅（％）", value=5.0, step=1.0) / 100.0
-        bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
-        bt_hold_days = st.number_input("最大保有日数（この日数が経過したら強制決済）", value=5, step=1)
-        
-    if st.button("🚀 バックテストを実行する", type="primary") and tickers:
-        with st.spinner('過去1年間の仮想トレードを実行中...'):
-            macro_returns = get_macro_data()
-            data = get_stock_features(bt_ticker, macro_returns)
             
-            if data is not None:
-                features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
-                            'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
-                data_features = data.dropna(subset=features + ['Target_Class'])
+            default_lot = 100 if str(bt_ticker).endswith(".T") else 1
+            bt_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1, help="資金が許せば、この株数だけ購入します。")
+            bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
+            bt_threshold = st.slider("買い条件（明日の上昇確率が何％以上で買うか）", min_value=50, max_value=80, value=55, step=1, key="bt_threshold")
+            
+        with col2:
+            bt_tp = st.number_input("利確幅（％）", value=5.0, step=1.0) / 100.0
+            bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
+            bt_hold_days = st.number_input("最大保有日数（強制決済）", value=5, step=1)
+
+        # 🌟 【改善点1】AIの学習・予測という「重い処理」だけを関数化し、キャッシュ（一時保存）する
+        @st.cache_data(show_spinner=False)
+        def run_ml_prediction_for_bt(ticker):
+            macro_returns = get_macro_data()
+            data = get_stock_features(ticker, macro_returns)
+            if data is None: return None, None
+            
+            features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
+                        'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
+            data_features = data.dropna(subset=features + ['Target_Class'])
+            
+            if len(data_features) <= 300: return None, None
+            
+            test_size = 250
+            train_data = data_features.iloc[:-test_size]
+            test_data = data_features.iloc[-test_size:]
+            
+            X_train = train_data[features]
+            y_train = train_data['Target_Class']
+            
+            scaler = RobustScaler()
+            X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
+            X_test_scaled = pd.DataFrame(scaler.transform(test_data[features]), index=test_data.index, columns=features)
+            
+            clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+            clf.fit(X_train_scaled, y_train)
+            test_probs = clf.predict_proba(X_test_scaled)[:, 1]
+            
+            return test_data, test_probs
+
+        # 🌟 【改善点2】実行ボタンを廃止し、タブを開いたらすぐに表示開始
+        with st.spinner('AIが過去のチャートを分析中...（銘柄変更時のみ数秒かかります）'):
+            test_data, test_probs = run_ml_prediction_for_bt(bt_ticker)
+
+        # データが揃っていれば、一瞬で終わる損益計算ループだけを回す
+        if test_data is not None and test_probs is not None:
+            cash = bt_initial_cash
+            position = 0
+            entry_price = 0
+            days_held = 0
+            trades = []
+            history = []
+            
+            initial_price = test_data['Close'].iloc[0]
+            bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
+            bh_cash = bt_initial_cash - (bh_shares * initial_price)
+            
+            for i in range(len(test_data)):
+                current_date = test_data.index[i]
+                current_price = test_data['Close'].iloc[i]
+                current_prob = test_probs[i]
                 
-                if len(data_features) > 300:
-                    test_size = 250 # 直近約1年間をテスト（検証）期間とする
-                    train_data = data_features.iloc[:-test_size]
-                    test_data = data_features.iloc[-test_size:]
-                    
-                    X_train = train_data[features]
-                    y_train = train_data['Target_Class']
-                    
-                    # 1年前の時点のデータでAIを学習させる
-                    scaler = RobustScaler()
-                    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
-                    X_test_scaled = pd.DataFrame(scaler.transform(test_data[features]), index=test_data.index, columns=features)
-                    
-                    clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-                    clf.fit(X_train_scaled, y_train)
-                    
-                    # 直近1年間の「毎日」の予測確率を一気に出す
-                    test_probs = clf.predict_proba(X_test_scaled)[:, 1]
-                    
-                    # --- シミュレーションループ ---
-                    cash = bt_initial_cash
-                    position = 0
-                    entry_price = 0
-                    days_held = 0
-                    trades = []
-                    history = []
-                    
-                    # 比較用：ガチホ（Buy & Hold）した場合の初期設定
-                    initial_price = test_data['Close'].iloc[0]
-                    bh_shares = int(bt_initial_cash // initial_price)
-                    bh_cash = bt_initial_cash - (bh_shares * initial_price)
-                    
-                    for i in range(len(test_data)):
-                        current_date = test_data.index[i]
-                        current_price = test_data['Close'].iloc[i]
-                        current_prob = test_probs[i]
-                        
-                        # 【1. 決済の判定】
-                        if position > 0:
-                            days_held += 1
-                            ret = (current_price - entry_price) / entry_price
-                            
-                            # 利確、損切り、または期日到来で決済
-                            if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
-                                profit = position * (current_price - entry_price)
-                                cash += position * current_price
-                                trades.append({
-                                    '決済日': current_date.strftime('%Y-%m-%d'),
-                                    '損益(円)': int(profit),
-                                    'リターン(%)': round(ret * 100, 2),
-                                    '保有日数': days_held
-                                })
-                                position = 0
-                                entry_price = 0
-                                days_held = 0
-                        
-                        # 【2. 新規エントリー判定】（ポジションがない場合のみ）
-                        if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
-                            shares = int(cash // current_price)
-                            if shares > 0:
-                                position = shares
-                                entry_price = current_price
-                                cash -= position * entry_price
-                                days_held = 0
-                        
-                        # 【3. 毎日の資産評価額を記録】
-                        equity = cash + (position * current_price)
-                        bh_equity = bh_cash + (bh_shares * current_price)
-                        history.append({
-                            'Date': current_date,
-                            'AI戦略の資産': equity,
-                            '放置(ガチホ)の資産': bh_equity
+                # 決済判定
+                if position > 0:
+                    days_held += 1
+                    ret = (current_price - entry_price) / entry_price
+                    if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
+                        profit = position * (current_price - entry_price)
+                        cash += position * current_price
+                        trades.append({
+                            '決済日': current_date.strftime('%Y-%m-%d'),
+                            '取引株数': position,
+                            '損益(円)': int(profit),
+                            'リターン(%)': round(ret * 100, 2),
+                            '保有日数': days_held
                         })
-                    
-                    # --- 結果表示 ---
-                    history_df = pd.DataFrame(history)
-                    trades_df = pd.DataFrame(trades)
-                    
-                    final_equity = history_df.iloc[-1]['AI戦略の資産']
-                    total_profit = final_equity - bt_initial_cash
-                    profit_pct = (total_profit / bt_initial_cash) * 100
-                    
-                    bh_final = history_df.iloc[-1]['放置(ガチホ)の資産']
-                    bh_profit_pct = ((bh_final - bt_initial_cash) / bt_initial_cash) * 100
-                    
-                    win_rate = 0
-                    if not trades_df.empty:
-                        win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100
-                        
-                    st.write(f"### 🏁 バックテスト結果 ({bt_stock_name} / 過去1年間)")
-                    mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                    mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
-                    mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
-                    mcol3.metric("勝率", f"{win_rate:.1f}%")
-                    mcol4.metric("取引回数", f"{len(trades_df)}回")
-                    
-                    st.info(f"💡 **比較**: もし最初に買って1年間ずっと放置（ガチホ）していた場合のリターンは **{bh_profit_pct:.1f}%** でした。")
-                    
-                    fig = px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）")
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                    if not trades_df.empty:
-                        st.write("#### 📜 個別の取引履歴")
-                        st.dataframe(trades_df, hide_index=True, use_container_width=True)
-                else:
-                    st.warning("データ不足のためバックテストを実行できません。")
+                        position = 0
+                        entry_price = 0
+                        days_held = 0
+                
+                # エントリー判定
+                if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
+                    required_cash = current_price * bt_lot_size
+                    if cash >= required_cash:
+                        position = bt_lot_size
+                        entry_price = current_price
+                        cash -= required_cash
+                        days_held = 0
+                
+                # 記録
+                equity = cash + (position * current_price)
+                bh_equity = bh_cash + (bh_shares * current_price)
+                history.append({
+                    'Date': current_date,
+                    'AI戦略の資産': equity,
+                    '放置(ガチホ)の資産': bh_equity
+                })
+            
+            history_df = pd.DataFrame(history)
+            trades_df = pd.DataFrame(trades)
+            
+            final_equity = history_df.iloc[-1]['AI戦略の資産']
+            total_profit = final_equity - bt_initial_cash
+            profit_pct = (total_profit / bt_initial_cash) * 100
+            
+            bh_final = history_df.iloc[-1]['放置(ガチホ)の資産']
+            bh_profit_pct = ((bh_final - bt_initial_cash) / bt_initial_cash) * 100
+            
+            win_rate = 0
+            if not trades_df.empty:
+                win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100
+                
+            st.write("---")
+            if trades_df.empty and bh_shares == 0:
+                st.warning(f"⚠️ 初期資金（{bt_initial_cash}円）が足りず、一度も {bt_lot_size}株 を購入できませんでした。")
+            
+            mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+            mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
+            mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
+            mcol3.metric("勝率", f"{win_rate:.1f}%")
+            mcol4.metric("取引回数", f"{len(trades_df)}回")
+            
+            st.info(f"💡 **比較**: もし最初に1単元（{bt_lot_size}株）だけ買って1年間放置（ガチホ）していた場合のリターンは **{bh_profit_pct:.1f}%** でした。")
+            
+            fig = px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）")
+            st.plotly_chart(fig, use_container_width=True)
+            
+            if not trades_df.empty:
+                with st.expander("📜 個別の取引履歴を見る"):
+                    st.dataframe(trades_df, hide_index=True, use_container_width=True)
+        else:
+            st.warning("データ不足のためバックテストを実行できません。")
