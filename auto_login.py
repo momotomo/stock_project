@@ -98,21 +98,35 @@ def get_otp_from_email(max_retries=12, wait_seconds=10):
     return None
 
 def perform_login():
-    """画像に基づいたログインシーケンス"""
+    """画像認識に基づいたログインシーケンス"""
     print("🚀 アプリを起動します...")
     subprocess.Popen([KABU_APP_PATH])
-    time.sleep(25) # 起動待機
     
-    # 画面をアクティブにするため中央をクリック
-    w, h = pyautogui.size()
-    pyautogui.click(w/2, h/2)
-    time.sleep(1)
+    print("⏳ ログイン画面の表示を待機しています（最大30秒）...")
+    
+    # --- Step 1: ログイン実行 (画像認識) ---
+    login_btn_pos = None
+    # 画面にログインボタンが表示されるまで最大30秒間、1秒おきに探し続ける
+    for _ in range(30):
+        try:
+            # confidence=0.8 で、多少の色の違いがあっても80%一致すれば認識する
+            login_btn_pos = pyautogui.locateCenterOnScreen('login_btn.png', confidence=0.8)
+            if login_btn_pos:
+                break
+        except pyautogui.ImageNotFoundException:
+            pass
+        except Exception as e:
+            print(f"画像認識エラー: {e}")
+        time.sleep(1)
 
-    # --- Step 1: ログイン実行 (パスワード保存済み) ---
-    print("⌨️ ログインボタンを押下します (ID/PW保存済み)...")
-    
-    # パスワード入力欄にフォーカスがあり、値も入っているため、Enterキーだけで送信可能
-    pyautogui.press('enter')
+    if not login_btn_pos:
+        print("❌ 画面上に「login_btn.png」が見つかりませんでした。")
+        print("💡 ヒント: login_btn.png が正しく保存されているか、画面が他のウィンドウに隠れていないか確認してください。")
+        return
+
+    print(f"🎯 ログインボタンを発見しました (座標: {login_btn_pos})。クリックします...")
+    # 発見した座標にマウスを移動してクリック
+    pyautogui.click(login_btn_pos)
     print("✅ ログイン要求の送信完了")
     time.sleep(10) # OTP画面への遷移待機
 
