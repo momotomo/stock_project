@@ -108,19 +108,12 @@ def perform_login():
     pyautogui.click(w/2, h/2)
     time.sleep(1)
 
-    # --- Step 1: パスワード入力 ---
-    print("⌨️ パスワードを入力中...")
-    # 安全のため、Tabキーでパスワード欄へ移動
-    pyautogui.press('tab')
-    time.sleep(0.5)
+    # --- Step 1: ログイン実行 (パスワード保存済み) ---
+    print("⌨️ ログインボタンを押下します (ID/PW保存済み)...")
     
-    pyperclip.copy(LOGIN_PASSWORD)
-    pyautogui.hotkey('ctrl', 'v')
-    time.sleep(1)
-    
-    # 「ログイン」ボタンを押す（Enterキー）
+    # パスワード入力欄にフォーカスがあり、値も入っているため、Enterキーだけで送信可能
     pyautogui.press('enter')
-    print("✅ パスワード送信完了")
+    print("✅ ログイン要求の送信完了")
     time.sleep(10) # OTP画面への遷移待機
 
     # --- Step 2: OTP入力 ---
