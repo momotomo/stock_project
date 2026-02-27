@@ -113,20 +113,23 @@ class KabuAPI:
         return await self._request("GET", endpoint)
 
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0):
+        # 💡 API側の非常に厳格なJSON構造チェックを通過させるための「完全版」注文データ
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
-            "Symbol": symbol,
-            "Exchange": self.config.EXCHANGE,
+            "Symbol": str(symbol),
+            "Exchange": int(self.config.EXCHANGE),
             "SecurityType": 1,
-            "Side": side,
-            "CashMargin": 3,         # 3:現物
-            "DelivType": 0,          # 0:指定なし (現物買の場合の標準)
-            "FundType": "  ",        # 現物(保護預り)を示す半角スペース2つ
-            "AccountType": 4,        # 4:特定口座
+            "Side": str(side),
+            "CashMargin": 3,         # 3: 現物取引
+            "MarginTradeType": 1,    # 💡 必須ダミー: 現物でも省略不可（APIのエラー回避）
+            "MarginPremiumUnit": 1,  # 💡 必須ダミー: 同上
+            "DelivType": 2 if side == "2" else 0, # 💡 買=2(お預り金), 売=0(指定なし)
+            "FundType": "  ",        # 現物保護預りを示す半角スペース2つ
+            "AccountType": 4,        # 4: 特定口座
             "Qty": int(qty),
-            "Price": int(price) if price == 0 else float(price), # 💡修正: 成行の「0」は絶対に整数(int)として送る
+            "Price": 0 if price == 0 else float(price), # 成行の「0」は整数で渡す
             "ExpireDay": 0,
-            "FrontOrderType": 10     # 10:成行
+            "FrontOrderType": 10     # 10: 成行
         }
         action = "買" if side == "2" else "売"
         logger.info(f"🚀 発注要求: {action} {symbol} {qty}株 (成行)")
