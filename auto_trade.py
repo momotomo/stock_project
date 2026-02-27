@@ -119,14 +119,12 @@ class KabuAPI:
             "Exchange": self.config.EXCHANGE,
             "SecurityType": 1,
             "Side": side,
-            "CashMargin": 1,         # 1:現物
-            "MarginTradeType": 1,    # 💡 必須: 現物取引でもAPIの型変換エラーを防ぐためダミーの1(制度信用)を指定
-            "MarginPremiumUnit": 0,  # 💡 必須: 同上
-            "DelivType": 2,          # 2:お預り金
-            "FundType": "  ",        # 💡 必須: 現物取引の場合は「半角スペース2つ」がAPIの仕様
+            "CashMargin": 3,         # 💡 3:現物 (前回1=信用新規となっていました。申し訳ありません！)
+            "DelivType": 0,          # 💡 0:指定なし (現物買の場合の標準)
+            "FundType": "  ",        # 💡 現物(保護預り)を示す半角スペース2つ
             "AccountType": 4,        # 4:特定口座
             "Qty": int(qty),
-            "Price": float(price),   # 💡 必須: API側が小数を要求するため明示的にfloat化
+            "Price": float(price),   # API側が小数を要求するため明示的にfloat化
             "ExpireDay": 0,
             "FrontOrderType": 10     # 10:成行
         }
