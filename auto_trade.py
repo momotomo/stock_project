@@ -27,7 +27,7 @@ class Config:
     API_URL = f"http://localhost:{PORT}/kabusapi"
     
     # 認証情報（ご自身のパスワードに書き換えてください）
-    API_PASSWORD = "Tr7smjnxg"   # kabuステーションAPIのパスワード
+    API_PASSWORD = "1111111111"   # kabuステーションAPIのパスワード
     TRADE_PASSWORD = "Tr7smv_jnxg" # 注文・決済パスワード
 
     # ロット管理（Q2, Q3対応）
@@ -112,9 +112,9 @@ class KabuAPI:
             logger.error("❌ トークン取得失敗")
 
     async def get_board(self, symbol: str, exchange: int):
-        # 銘柄の現在価格を取得
-        params = {"Symbol": symbol, "Exchange": exchange}
-        return await self._request("GET", "board", params=params)
+        # 銘柄の現在価格を取得 (kabuステーション特有の 銘柄@市場 形式)
+        endpoint = f"board/{symbol}@{exchange}"
+        return await self._request("GET", endpoint)
 
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0):
         # side: "1" (売), "2" (買)
