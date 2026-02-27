@@ -11,70 +11,45 @@ import re
 from datetime import datetime, timedelta
 
 # =========================================================
-# kabuステーション 完全自動ログインスクリプト (OTP対応版)
+# kabuステーション 完全自動ログインスクリプト (最新UI＆メール対応版)
 # ---------------------------------------------------------
 # 【動作要件】
-# 1. pip install pyautogui pyperclip psutil opencv-python を実行しておくこと
-# 2. kabuステーションのショートカットがデスクトップ等にある、あるいはパスを指定
-# 3. 画面の解像度やスケーリング（100%推奨）を変更しないこと
+# 1. pip install pyautogui pyperclip psutil opencv-python
+# 2. 画面のスケーリング（拡大率）は 100% を推奨
 # =========================================================
 
-# --- 設定項目 ---
-# kabuステーション本体のパス
-KABU_APP_PATH = r"C:\Program Files (x86)\kabu.com\kabu station\kabu.station.exe"
-# 証券口座のパスワード
-LOGIN_PASSWORD = "Tr7smv_jnxg" 
+# --- 基本設定 ---
+KABU_APP_PATH = r"D:\Users\to-ka\AppData\Local\kabuStation\KabuS.exe"
+LOGIN_PASSWORD = "Tr7smv_jnxg"  # 証券口座のパスワード
 
 # --- メール（IMAP）設定 ---
-# ※Gmailを使用する場合、通常のパスワードではなく「アプリパスワード」の発行が必要です。
 IMAP_SERVER = "imap.gmail.com"
 EMAIL_ADDRESS = "tomo.19851206@gmail.com"
-EMAIL_PASSWORD = "ehxqpbtcpdrtotsy"
-
+EMAIL_PASSWORD = "ehxqpbtcpdrtotsy" # Gmailのアプリパスワード(16桁)
 
 def kill_existing_process():
-    """既に起動しているkabuステーションがあれば強制終了する"""
-    print("🔄 既存のkabuステーションプロセスを確認しています...")
+    """既存のkabuステーションを終了"""
+    print("🔄 既存プロセスの確認中...")
     for proc in psutil.process_iter(['name']):
         if proc.info['name'] == 'kabu.station.exe':
-            print(f"⚠️ 既存のプロセス (PID:{proc.pid}) を終了します...")
             proc.kill()
             time.sleep(3)
 
-def launch_app():
-    """アプリを起動する"""
-    print("🚀 kabuステーションを起動します...")
-    try:
-        subprocess.Popen([KABU_APP_PATH])
-        print("⏳ ログイン画面の表示を待機中 (20秒)...")
-        time.sleep(20)
-    except FileNotFoundError:
-        print(f"❌ エラー: 指定されたパスにアプリが見つかりません: {KABU_APP_PATH}")
-        sys.exit(1)
-
-def get_one_time_password(max_retries=10, wait_seconds=5):
-    """
-    メールボックスを監視し、最新のワンタイムパスワードを取得する
-    """
-    print("📧 メールボックスからワンタイムパスワード(OTP)を検索しています...")
-    
-    # 今の時刻から少し前（3分前）以降のメールのみを対象にする
-    since_time = datetime.now() - timedelta(minutes=3)
-    
+def get_otp_from_email(max_retries=12, wait_seconds=10):
+    """メールからワンタイム認証コードを抽出"""
+    print("📧 メールボックスをスキャン中...")
     for attempt in range(max_retries):
         try:
-            # IMAPサーバーに接続
             mail = imaplib.IMAP4_SSL(IMAP_SERVER)
             mail.login(EMAIL_ADDRESS, EMAIL_PASSWORD)
             mail.select("inbox")
             
-            # 検索条件: 未読メール、またはカブコムからのメール（環境に合わせて調整）
-            # ここでは「ALL」から取得し、Python側で日付と送信元をチェックします
+            # 最近のメールを取得
             status, messages = mail.search(None, "ALL")
             mail_ids = messages[0].split()
             
             if mail_ids:
-                # 最新のメールから数件を確認
+                # 最新のメール5件をチェック
                 for i in reversed(mail_ids[-5:]):
                     res, msg_data = mail.fetch(i, "(RFC822)")
                     for response_part in msg_data:
@@ -84,87 +59,88 @@ def get_one_time_password(max_retries=10, wait_seconds=5):
                             # 件名のデコード
                             subject, encoding = decode_header(msg["Subject"])[0]
                             if isinstance(subject, bytes):
-                                subject = subject.decode(encoding if encoding else "utf-8")
+                                subject = subject.decode(encoding if encoding else "utf-8", errors="ignore")
                             
-                            # カブコムのワンタイムパスワードメールか判定
-                            if "ワンタイムパスワード" in subject or "kabu.com" in msg.get("From", ""):
-                                
-                                # 本文の取得
+                            # スクショに基づく条件: 件名に「ワンタイム」または「認証コード」を含むか
+                            if "ワンタイム" in subject or "認証コード" in subject:
                                 body = ""
+                                
+                                # 本文のデコード（日本のメール特有の文字コードに対応）
                                 if msg.is_multipart():
                                     for part in msg.walk():
                                         if part.get_content_type() == "text/plain":
-                                            body = part.get_payload(decode=True).decode()
+                                            charset = part.get_content_charset() or 'utf-8'
+                                            body = part.get_payload(decode=True).decode(charset, errors="ignore")
                                             break
                                 else:
-                                    body = msg.get_payload(decode=True).decode()
+                                    charset = msg.get_content_charset() or 'utf-8'
+                                    body = msg.get_payload(decode=True).decode(charset, errors="ignore")
                                 
-                                # 正規表現でパスワードらしき文字列（例: 半角英数字6〜10桁）を抽出
-                                # ※実際のメール本文に合わせてパターンを調整する必要があります
-                                match = re.search(r'([A-Za-z0-9]{6,10})', body)
+                                # スクショに基づく抽出ロジック
+                                # 「■ワンタイム認証コード」の直後にある6桁の数字を狙い撃ち
+                                match = re.search(r'■ワンタイム認証コード\s*(\d{6})', body)
+                                
+                                # もし上の条件で見つからなければ、単独の6桁の数字を探す（保険）
+                                if not match:
+                                    match = re.search(r'(?<!\d)(\d{6})(?!\d)', body)
+                                    
                                 if match:
                                     otp = match.group(1)
-                                    print(f"✅ ワンタイムパスワードを取得しました: {otp}")
-                                    mail.close()
+                                    print(f"✅ メールの解析成功！認証コードを発見: {otp}")
                                     mail.logout()
                                     return otp
-            
-            mail.close()
             mail.logout()
         except Exception as e:
-            print(f"⚠️ メール確認中にエラー: {e}")
+            print(f"⚠️ メール取得・解析エラー: {e}")
             
-        print(f"⏳ まだメールが届いていません。{wait_seconds}秒後に再確認します... ({attempt+1}/{max_retries})")
+        print(f"⏳ メール待機中... ({attempt+1}/{max_retries})")
         time.sleep(wait_seconds)
-        
-    print("❌ 指定時間内にワンタイムパスワードメールを受信できませんでした。")
     return None
 
 def perform_login():
-    """マウスとキーボードを自動操作してログイン（OTP対応）"""
-    print("🔑 ログイン処理を開始します...")
+    """画像に基づいたログインシーケンス"""
+    print("🚀 アプリを起動します...")
+    subprocess.Popen([KABU_APP_PATH])
+    time.sleep(25) # 起動待機
     
-    # 1. 第一パスワードの入力とEnter
+    # 画面をアクティブにするため中央をクリック
+    w, h = pyautogui.size()
+    pyautogui.click(w/2, h/2)
+    time.sleep(1)
+
+    # --- Step 1: パスワード入力 ---
+    print("⌨️ パスワードを入力中...")
+    # 安全のため、Tabキーでパスワード欄へ移動
+    pyautogui.press('tab')
+    time.sleep(0.5)
+    
     pyperclip.copy(LOGIN_PASSWORD)
-    
-    # ウィンドウをアクティブにする
-    screen_width, screen_height = pyautogui.size()
-    pyautogui.click(screen_width / 2, screen_height / 2)
-    time.sleep(1)
-    
-    # パスワードをペーストしてログインボタンを押す（Enter）
     pyautogui.hotkey('ctrl', 'v')
     time.sleep(1)
+    
+    # 「ログイン」ボタンを押す（Enterキー）
     pyautogui.press('enter')
-    
-    print("✅ パスワードを入力しました。ワンタイムパスワードの要求画面を待機します (5秒)...")
-    time.sleep(5)
-    
-    # 2. メールの受信とOTPの取得
-    otp = get_one_time_password()
+    print("✅ パスワード送信完了")
+    time.sleep(10) # OTP画面への遷移待機
+
+    # --- Step 2: OTP入力 ---
+    otp = get_otp_from_email()
     if not otp:
-        print("❌ ログインを中断します。")
-        sys.exit(1)
-        
-    # 3. ワンタイムパスワードの入力とEnter
-    print("🔑 画面にワンタイムパスワードを入力します...")
-    # ウィンドウがアクティブなまま、OTP入力欄にフォーカスがあると想定
-    # （もしフォーカスが外れる場合は、再度クリックやTAB移動が必要です）
+        print("❌ 認証コードの取得に失敗しました。")
+        return
+
+    print(f"🔑 画面に認証コード ({otp}) を入力中...")
     pyperclip.copy(otp)
-    time.sleep(1)
     pyautogui.hotkey('ctrl', 'v')
     time.sleep(1)
+    
+    # 「続ける」ボタンを押す（Enterキー）
     pyautogui.press('enter')
     
-    print("✅ 最終ログイン操作を実行しました。起動完了まで待機します (30秒)...")
+    print("🎊 ログインシーケンス完了。アプリの起動を待ちます。")
     time.sleep(30)
-    print("🎉 自動ログインプロセス完了。")
 
 if __name__ == "__main__":
-    print("=== kabuステーション 自動ログインシステム (OTP対応) ===")
     kill_existing_process()
-    launch_app()
     perform_login()
-    
-    # クリップボードの消去
-    pyperclip.copy("")
+    pyperclip.copy("") # セキュリティのためクリップボード消去
