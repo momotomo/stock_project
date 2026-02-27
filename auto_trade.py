@@ -119,14 +119,16 @@ class KabuAPI:
             "Exchange": self.config.EXCHANGE,
             "SecurityType": 1,
             "Side": side,
-            "CashMargin": 1, # 1:現物
-            # 💡 "MarginTradeType": 1, <- 現物取引では不要な項目（エラーの元になるため削除）
-            "DelivType": 2,
-            "AccountType": 4,
-            "Qty": qty,
-            "Price": price,
+            "CashMargin": 1,         # 1:現物
+            "MarginTradeType": 1,    # 💡 必須: 現物取引でもAPIの型変換エラーを防ぐためダミーの1(制度信用)を指定
+            "MarginPremiumUnit": 0,  # 💡 必須: 同上
+            "DelivType": 2,          # 2:お預り金
+            "FundType": "  ",        # 💡 必須: 現物取引の場合は「半角スペース2つ」がAPIの仕様
+            "AccountType": 4,        # 4:特定口座
+            "Qty": int(qty),
+            "Price": float(price),   # 💡 必須: API側が小数を要求するため明示的にfloat化
             "ExpireDay": 0,
-            "FrontOrderType": 10 # 10:成行
+            "FrontOrderType": 10     # 10:成行
         }
         action = "買" if side == "2" else "売"
         logger.info(f"🚀 発注要求: {action} {symbol} {qty}株 (成行)")
