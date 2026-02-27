@@ -35,7 +35,7 @@ class Config:
     MAX_POSITIONS = 1             # 同時に保有する最大銘柄数
     LOT_CALC_MODE = "FIXED"
     FIXED_LOT_SIZE = 100          # 1回の購入株数（1単元）
-    ENTRY_THRESHOLD_PROB = 60.0   # 💡 買いシグナルを発火する「明日の上昇確率」のしきい値(%)
+    ENTRY_THRESHOLD_PROB = 55.0   # 💡 買いシグナルを発火する「明日の上昇確率」のしきい値(%)
 
     # トリプルバリア設定（利確・損切）
     TAKE_PROFIT_PCT = 0.05        # 利確 5% (0.05)
@@ -87,10 +87,15 @@ class KabuAPI:
         
         try:
             async with self.session.request(method, url, headers=headers, json=data, params=params) as response:
+                # 💡 HTTPエラー時に、kabuステーションからの詳しいエラーメッセージ（日本語）をログに出すように強化
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"API HTTP Error {response.status} at {endpoint}: {error_text}")
+                
                 response.raise_for_status()
                 return await response.json()
         except Exception as e:
-            logger.error(f"API Request Error ({endpoint}): {e}")
+            logger.error(f"API Request Exception ({endpoint}): {e}")
             return None
 
     async def get_token(self):
@@ -114,14 +119,14 @@ class KabuAPI:
             "Exchange": self.config.EXCHANGE,
             "SecurityType": 1,
             "Side": side,
-            "CashMargin": 1,
-            "MarginTradeType": 1,
+            "CashMargin": 1, # 1:現物
+            # 💡 "MarginTradeType": 1, <- 現物取引では不要な項目（エラーの元になるため削除）
             "DelivType": 2,
             "AccountType": 4,
             "Qty": qty,
             "Price": price,
             "ExpireDay": 0,
-            "FrontOrderType": 10
+            "FrontOrderType": 10 # 10:成行
         }
         action = "買" if side == "2" else "売"
         logger.info(f"🚀 発注要求: {action} {symbol} {qty}株 (成行)")
