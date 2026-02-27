@@ -119,12 +119,12 @@ class KabuAPI:
             "Exchange": self.config.EXCHANGE,
             "SecurityType": 1,
             "Side": side,
-            "CashMargin": 3,         # 💡 3:現物 (前回1=信用新規となっていました。申し訳ありません！)
-            "DelivType": 0,          # 💡 0:指定なし (現物買の場合の標準)
-            "FundType": "  ",        # 💡 現物(保護預り)を示す半角スペース2つ
+            "CashMargin": 3,         # 3:現物
+            "DelivType": 0,          # 0:指定なし (現物買の場合の標準)
+            "FundType": "  ",        # 現物(保護預り)を示す半角スペース2つ
             "AccountType": 4,        # 4:特定口座
             "Qty": int(qty),
-            "Price": float(price),   # API側が小数を要求するため明示的にfloat化
+            "Price": int(price) if price == 0 else float(price), # 💡修正: 成行の「0」は絶対に整数(int)として送る
             "ExpireDay": 0,
             "FrontOrderType": 10     # 10:成行
         }
@@ -190,7 +190,7 @@ def get_ticker_mapping() -> dict:
         "東京エレクトロン": "8035.T", "信越化学": "4063.T", "三井住友FG": "8316.T",
         "日立製作所": "6501.T", "伊藤忠商事": "8001.T", "KDDI": "9433.T",
         "ホンダ": "7267.T", "三菱商事": "8058.T", "ソフトバンクG": "9984.T",
-        "任天堂": "7974.T"
+        "任天堂": "7974.T", "オリックス": "8591.T"
     }
     # ユーザーのカスタムリストがあれば結合
     if os.path.exists("tickers.txt"):
