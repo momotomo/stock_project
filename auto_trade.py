@@ -164,11 +164,16 @@ class PortfolioManager:
         """毎ループで現在価格を取得し、トリプルバリアを自律的に発動させる"""
         for symbol, pos in list(self.positions.items()):
             board = await self.api.get_board(symbol, self.config.EXCHANGE)
-            if not board or "CurrentPrice" not in board:
+            if not board:
                 continue
             
-            current_price = board["CurrentPrice"]
+            # 現在値の取得を試みる（市場時間外の対応）
+            current_price = board.get("CurrentPrice")
             if current_price is None:
+                current_price = board.get("PreviousClose") # 取れなければ前日終値を使用
+                
+            if current_price is None:
+                logger.info(f"👀 {symbol} 監視中... (市場時間外のため価格データなし)")
                 continue
 
             logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
@@ -218,11 +223,21 @@ async def main():
         # =========================================================
         logger.info("=== 仮想エントリー処理開始 ===")
         board = await api.get_board(config.TARGET_SYMBOL, config.EXCHANGE)
-        if board and board.get("CurrentPrice"):
-            current_price = board["CurrentPrice"]
-            # 実際のAPI買い発注はコメントアウトし、ポジションだけ追加します（安全のため）
-            # await api.send_order(config.TARGET_SYMBOL, side="2", qty=config.FIXED_LOT_SIZE)
-            portfolio.add_position(config.TARGET_SYMBOL, config.FIXED_LOT_SIZE, current_price)
+        current_price = None
+        
+        if board:
+            if board.get("CurrentPrice"):
+                current_price = board["CurrentPrice"]
+            elif board.get("PreviousClose"):
+                current_price = board["PreviousClose"]
+                logger.warning("🌙 市場が閉まっているため、前日終値を仮想エントリー価格として使用します。")
+                
+        # それでも取れなければダミー価格を設定
+        if not current_price:
+            current_price = 2000.0
+            logger.warning("⚠️ 価格が一切取得できないため、ダミー価格(2000円)でテストを強行します。")
+
+        portfolio.add_position(config.TARGET_SYMBOL, config.FIXED_LOT_SIZE, current_price)
         
         logger.info("=== リアルタイムインメモリ監視ループ開始 ===")
         while True:
@@ -238,9 +253,9 @@ async def main():
         await api.close_session()
 
 if __name__ == "__main__":
-    # Windowsでasyncioを安定動作させるための設定
+    # Windowsでasyncioを安定動作させるための設定（Python3.14以降は警告が出るため除外）
     import sys
-    if sys.platform == "win32":
+    if sys.platform == "win32" and sys.version_info < (3, 14):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
     # 実行前に必要なライブラリ(aiohttp)がインストールされているか確認してください
