@@ -93,8 +93,8 @@ def perform_login():
         print(f"❌ エラー: {KABU_APP_PATH} が見つかりません。")
         sys.exit(1)
     
-    # 💡 【今回の変更】見つけ次第動くのではなく、まずは無条件で60秒待機
-    FIXED_WAIT = 60 
+    # 💡 【今回の変更】見つけ次第動くのではなく、まずは無条件で30秒待機
+    FIXED_WAIT = 30 
     print(f"⏳ アプリの安定化のため、無条件で {FIXED_WAIT} 秒間待機します...")
     for i in range(FIXED_WAIT):
         time.sleep(1)
@@ -132,11 +132,11 @@ def perform_login():
     time.sleep(2) # 入力後の微調整待機
     pyautogui.press('enter')
     
-    # ログイン後のメイン画面起動待ち（ここも無条件60秒）
+    # ログイン後のメイン画面起動待ち（ここも無条件30秒）
     print(f"🎊 ログイン完了。メイン画面の起動をさらに {FIXED_WAIT} 秒間待ちます。")
     for i in range(6):
         time.sleep(10)
-        print(f"...最終起動待機中 ({ (i+1)*10 }/60秒経過)")
+        print(f"...最終起動待機中 ({ (i+1)*10 }/{FIXED_WAIT}秒経過)")
     
     print("✅ すべての準備が整いました。")
 
