@@ -93,9 +93,13 @@ class KabuAPI:
             "SecurityType": 1,
             "Side": str(side),
             "CashMargin": 3,         # 3: 現物取引
-            "MarginTradeType": 1,    # 💡 C#プログラムのパースエラー(強制終了)を回避するための必須キー
-            "MarginPremiumUnit": 1,  # 💡 同上（念のため追加）
-            "DelivType": 2 if side == "2" else 0, # 買=2(お預り金), 売=0(指定なし)
+            
+            # 👇 【完全解決の鍵】キーは存在させつつ、値は None(null) で送る！
+            "MarginTradeType": None, 
+            "MarginPremiumUnit": None, 
+            
+            # 👇 どんな口座設定でも通りやすい安全な 0(指定なし) に統一
+            "DelivType": 0,
             
             # 👇 ユーザー様発見の正解ロジック！買=02(保護預り), 売=半角スペース2つ
             "FundType": "02" if side == "2" else "  ", 
