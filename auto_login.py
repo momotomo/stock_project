@@ -11,12 +11,12 @@ import re
 from datetime import datetime, timedelta
 
 # =========================================================
-# kabuステーション 完全自動ログインスクリプト (パス修正版)
+# kabuステーション 完全自動ログインスクリプト (決定版パス修正)
 # =========================================================
 
 # --- 基本設定 ---
-# 💡 プロセス名に合わせて実行ファイル名も「KabuS.exe」に変更しました
-KABU_APP_PATH = r"C:\Program Files (x86)\kabu.com\kabu station\KabuS.exe"
+# 💡 教えていただいた正しいインストールパスを反映しました
+KABU_APP_PATH = r"D:\Users\to-ka\AppData\Local\kabuStation\KabuS.exe"
 TARGET_PROCESS = "KabuS.exe"
 
 # --- メール（IMAP）設定 ---
@@ -88,12 +88,11 @@ def get_otp_from_email(max_retries=12, wait_seconds=10):
 def perform_login():
     """画像認識に基づいたログインシーケンス"""
     print("🚀 アプリを起動します...")
-    # 💡 ここで FileNotFoundError が出たのは KABU_APP_PATH の場所が間違っていたためです
     try:
+        # 指定されたパスからプロセスを起動
         subprocess.Popen([KABU_APP_PATH])
     except FileNotFoundError:
         print(f"❌ エラー: {KABU_APP_PATH} が見つかりません。")
-        print("デスクトップのショートカットを右クリックして『プロパティ』から正しいパスを確認してください。")
         sys.exit(1)
     
     print("⏳ ログイン画面の表示を待機しています（最大60秒）...")
