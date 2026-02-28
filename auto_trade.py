@@ -23,6 +23,10 @@ class Config:
     TRADE_PASSWORD = "Tr7smv_jnxg" # 取引(注文)パスワード
     EXCHANGE = 1  # 1: 東証
 
+    # 💡 【追加】現物・信用の切り替えスイッチ
+    # "CASH" = 現物取引 / "MARGIN" = 信用取引（制度信用）
+    TRADE_MODE = "CASH" 
+
 class TokenBucket:
     def __init__(self, capacity: int, fill_rate: float):
         self.capacity = capacity
@@ -83,34 +87,51 @@ class KabuAPI:
         else:
             logger.error("❌ トークン取得失敗")
 
-    async def send_order(self, symbol: str, side: str, qty: int, price: float = 0):
-        # 💡 ここが数々のエラーを乗り越えて完成した、kabuステーションAPIの「完全解」です！
+    async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None):
+        """ 発注処理（現物・信用を自動で出し分け） """
+        
+        if self.config.TRADE_MODE == "CASH":
+            # --- 現物取引のパラメータ ---
+            cash_margin = 1
+            margin_trade_type = 1 # ダミー値
+            deliv_type = 2 if side == "2" else 0
+            fund_type = "02" if side == "2" else "  "
+        else:
+            # --- 信用取引のパラメータ ---
+            cash_margin = 3 if is_close else 2 # 3:返済, 2:新規
+            margin_trade_type = 1 # 1:制度信用
+            deliv_type = 0
+            fund_type = "  "
+
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
             "Symbol": str(symbol),
             "Exchange": int(self.config.EXCHANGE),
             "SecurityType": 1,
             "Side": str(side),
-            "CashMargin": 1,         # 💡 1: 現物取引 (ここが最大の真実でした！)
-            
-            # 👇 C#のパースエラーを防ぐため、現物でも必須（整数型・ダミー値として1を入れる）
-            "MarginTradeType": 1, 
+            "CashMargin": cash_margin,
+            "MarginTradeType": margin_trade_type, 
             "MarginPremiumUnit": 1, 
-            
-            # 👇 買=2(お預り金), 売=0(指定なし)
-            "DelivType": 2 if side == "2" else 0,
-            
-            # 👇 ユーザー様発見の正解ロジック！買=02(保護預り), 売=半角スペース2つ
-            "FundType": "02" if side == "2" else "  ", 
-            
-            "AccountType": 4,        # 4: 特定口座
+            "DelivType": deliv_type,
+            "FundType": fund_type, 
+            "AccountType": 4,
             "Qty": int(qty),
             "Price": int(price) if price == 0 else float(price),
             "ExpireDay": 0,
-            "FrontOrderType": 10     # 10: 成行
+            "FrontOrderType": 10
         }
+
+        # 💡 信用返済の場合は、どの借金(建玉)を返すかの指定が必要
+        if self.config.TRADE_MODE == "MARGIN" and is_close:
+            if hold_id:
+                order_data["ClosePositions"] = [{"HoldID": hold_id, "Qty": int(qty)}]
+            else:
+                logger.warning("⚠️ 信用返済ですが建玉ID(HoldID)が指定されていません（APIで弾かれる可能性大）")
+
         action = "買" if side == "2" else "売"
-        logger.info(f"🚀 発注リクエスト送信: {action} {symbol} {qty}株 (成行)")
+        trade_type_str = "現物" if self.config.TRADE_MODE == "CASH" else ("信用返済" if is_close else "信用新規")
+        logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行)")
+        
         return await self._request("POST", "sendorder", data=order_data)
 
 async def main():
@@ -131,30 +152,32 @@ async def main():
 
     try:
         # =========================================================
-        # 【発注テストシーケンス】買い注文 → 10秒待機 → 売り注文
+        # 【発注テストシーケンス】買い注文 → 10秒待機 → 売り(決済)注文
         # =========================================================
         test_symbol = "8591" # テスト銘柄：オリックス
         qty = 100
         
-        logger.info(f"=== 🟢 テストステップ1: 買い注文 ({test_symbol}) ===")
-        res_buy = await api.send_order(test_symbol, side="2", qty=qty)
+        logger.info(f"=== 🟢 テストステップ1: エントリー注文 ({test_symbol}) ===")
+        # is_close=False (新規注文) として送信
+        res_buy = await api.send_order(test_symbol, side="2", qty=qty, is_close=False)
         
         if res_buy and res_buy.get("Result") == 0:
-            logger.info(f"✅ 買い注文 成功！ 受付番号: {res_buy.get('OrderId')}")
+            logger.info(f"✅ エントリー注文 成功！ 受付番号: {res_buy.get('OrderId')}")
         else:
-            logger.error(f"❌ 買い注文 失敗。処理を中断します。")
+            logger.error(f"❌ エントリー注文 失敗。処理を中断します。")
             return
             
         logger.info("⏳ 注文の約定とシステムの反映を待つため、10秒間待機します...")
         await asyncio.sleep(10)
         
-        logger.info(f"=== 🔴 テストステップ2: 売り(決済)注文 ({test_symbol}) ===")
-        res_sell = await api.send_order(test_symbol, side="1", qty=qty)
+        logger.info(f"=== 🔴 テストステップ2: エグジット(決済)注文 ({test_symbol}) ===")
+        # is_close=True (決済注文) として送信
+        res_sell = await api.send_order(test_symbol, side="1", qty=qty, is_close=True)
         
         if res_sell and res_sell.get("Result") == 0:
-            logger.info(f"✅ 売り注文 成功！ 受付番号: {res_sell.get('OrderId')}")
+            logger.info(f"✅ 決済注文 成功！ 受付番号: {res_sell.get('OrderId')}")
         else:
-            logger.error(f"❌ 売り注文 失敗。")
+            logger.error(f"❌ 決済注文 失敗。")
             
         logger.info("🎉 買い・売り両方のテストシーケンスが完了しました。")
 
