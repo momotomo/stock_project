@@ -2,31 +2,50 @@ import asyncio
 import time
 import logging
 import aiohttp
+import csv
+import os
+from dataclasses import dataclass
+from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引テストスクリプト (現物 買い→売り 連続テスト版)
+# kabuステーション 自動取引エンジン (auto_trade.py) - 統合本番仕様
 # ---------------------------------------------------------
-# 指定した銘柄を買い、10秒後にすぐ売る「往復テスト」を行います。
+# 【特徴】
+# 1. AI予測結果 (recommendations.csv) の自動読み込みとシグナル抽出
+# 2. 現物/信用のシームレスな切り替え（完全攻略版APIパラメータ）
+# 3. TokenBucketによるAPI制限(秒間5件)の回避
+# 4. インメモリストートマシンによるリアルタイムバリア監視(利確/損切)
 # =========================================================
 
 # --- ログ設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- システム設定 (Config) ---
 class Config:
+    # ⚠️ 動作環境モード (Trueで本番口座、Falseでシミュレーター環境)
     IS_PRODUCTION = False  
     PORT = 18080 if IS_PRODUCTION else 18081
     API_URL = f"http://localhost:{PORT}/kabusapi"
     
     # 認証情報（ご自身のパスワードに書き換えてください）
-    API_PASSWORD = "1111111111"     # kabuステーションAPI(検証用)のパスワード
+    API_PASSWORD = "1111111111"     # kabuステーションAPIのパスワード
     TRADE_PASSWORD = "Tr7smv_jnxg" # 取引(注文)パスワード
-    EXCHANGE = 1  # 1: 東証
+    EXCHANGE = 1                           # 1: 東証
 
-    # 💡 【追加】現物・信用の切り替えスイッチ
-    # "CASH" = 現物取引 / "MARGIN" = 信用取引（制度信用）
+    # 💡 現物・信用の切り替えスイッチ ("CASH" = 現物取引 / "MARGIN" = 信用取引)
     TRADE_MODE = "CASH" 
 
+    # ロット管理とシグナル設定
+    MAX_POSITIONS = 1             # 同時に保有する最大銘柄数
+    FIXED_LOT_SIZE = 100          # 1回の購入株数（1単元）
+    ENTRY_THRESHOLD_PROB = 55.0   # 買いシグナルを発火する「明日の上昇確率」のしきい値(%)
+
+    # トリプルバリア設定（利確・損切）
+    TAKE_PROFIT_PCT = 0.05        # 利確 5% (0.05)
+    STOP_LOSS_PCT = 0.05          # 損切 5% (0.05)
+
+# --- トークンバケット（API流量制限回避） ---
 class TokenBucket:
     def __init__(self, capacity: int, fill_rate: float):
         self.capacity = capacity
@@ -47,6 +66,7 @@ class TokenBucket:
                     return
                 await asyncio.sleep(0.1)
 
+# --- APIクライアント ---
 class KabuAPI:
     def __init__(self, config: Config):
         self.config = config
@@ -87,17 +107,19 @@ class KabuAPI:
         else:
             logger.error("❌ トークン取得失敗")
 
+    async def get_board(self, symbol: str, exchange: int):
+        endpoint = f"board/{symbol}@{exchange}"
+        return await self._request("GET", endpoint)
+
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None):
-        """ 発注処理（現物・信用を自動で出し分け） """
+        """ 現物・信用、新規・決済の全ての組み合わせを完全に網羅した発注ロジック """
         
         if self.config.TRADE_MODE == "CASH":
-            # --- 現物取引のパラメータ ---
             cash_margin = 1
             margin_trade_type = 1 # ダミー値
             deliv_type = 2 if side == "2" else 0
             fund_type = "02" if side == "2" else "  "
         else:
-            # --- 信用取引のパラメータ ---
             cash_margin = 3 if is_close else 2 # 3:返済, 2:新規
             margin_trade_type = 1 # 1:制度信用
             deliv_type = 0
@@ -121,7 +143,6 @@ class KabuAPI:
             "FrontOrderType": 10
         }
 
-        # 💡 信用返済の場合は、どの借金(建玉)を返すかの指定が必要
         if self.config.TRADE_MODE == "MARGIN" and is_close:
             if hold_id:
                 order_data["ClosePositions"] = [{"HoldID": hold_id, "Qty": int(qty)}]
@@ -134,9 +155,106 @@ class KabuAPI:
         
         return await self._request("POST", "sendorder", data=order_data)
 
+# --- ポジション管理（インメモリ監視） ---
+@dataclass
+class Position:
+    symbol: str
+    qty: int
+    entry_price: float
+    take_profit_price: float
+    stop_loss_price: float
+    hold_id: str = None
+
+class PortfolioManager:
+    def __init__(self, config: Config, api: KabuAPI):
+        self.config = config
+        self.api = api
+        self.positions: Dict[str, Position] = {}
+
+    def add_position(self, symbol: str, qty: int, entry_price: float, hold_id: str = None):
+        tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
+        sl = entry_price * (1 - self.config.STOP_LOSS_PCT)
+        self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, hold_id)
+        mode_str = "現物" if self.config.TRADE_MODE == "CASH" else "信用"
+        logger.info(f"💼 ポジション追加 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円)")
+        logger.info(f"🎯 バリア設定 -> 利確: {tp:,.1f}円 / 損切: {sl:,.1f}円")
+
+    async def check_barriers(self):
+        for symbol, pos in list(self.positions.items()):
+            board = await self.api.get_board(symbol, self.config.EXCHANGE)
+            if not board: continue
+            
+            current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+            if current_price is None: continue
+
+            logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
+
+            if current_price >= pos.take_profit_price:
+                logger.warning(f"📈 利確バリア到達！ {symbol} の決済（売り）を実行します。")
+                await self.execute_exit(pos)
+            elif current_price <= pos.stop_loss_price:
+                logger.error(f"📉 損切バリア到達！ {symbol} の決済（売り）を実行します。")
+                await self.execute_exit(pos)
+
+    async def execute_exit(self, pos: Position):
+        # 決済注文（売りの成行）
+        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id)
+        if res and res.get("Result") == 0:
+            logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
+            del self.positions[pos.symbol]
+        else:
+            logger.error(f"❌ 決済注文失敗: {res}")
+
+# --- AI連携モジュール ---
+def get_ticker_mapping() -> dict:
+    """銘柄名（日本語）から証券コード（4桁）に変換する辞書を作成"""
+    mapping = {}
+    pool = {
+        "トヨタ自動車": "7203.T", "ソニーG": "6758.T", "三菱UFJ": "8306.T",
+        "キーエンス": "6861.T", "NTT": "9432.T", "ファーストリテイリング": "9983.T",
+        "東京エレクトロン": "8035.T", "信越化学": "4063.T", "三井住友FG": "8316.T",
+        "日立製作所": "6501.T", "伊藤忠商事": "8001.T", "KDDI": "9433.T",
+        "ホンダ": "7267.T", "三菱商事": "8058.T", "ソフトバンクG": "9984.T",
+        "任天堂": "7974.T", "オリックス": "8591.T", "ANA": "9202.T", "三井物産": "8031.T"
+    }
+    if os.path.exists("tickers.txt"):
+        with open("tickers.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                if ',' in line:
+                    name, tk = line.split(',', 1)
+                    pool[name.strip()] = tk.strip()
+
+    for name, tk in pool.items():
+        mapping[name] = tk.replace(".T", "").strip()
+    return mapping
+
+def load_ai_signals(config: Config) -> List[dict]:
+    """recommendations.csv を読み込み、条件を満たすエントリー候補を返す"""
+    signals = []
+    if not os.path.exists('recommendations.csv'):
+        logger.warning("recommendations.csv が見つかりません。先にAI分析バッチを実行してください。")
+        return signals
+
+    mapping = get_ticker_mapping()
+
+    with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            prob = float(row.get('明日の上昇確率', 0))
+            if prob >= config.ENTRY_THRESHOLD_PROB:
+                name = row.get('銘柄名', '')
+                code = mapping.get(name)
+                if code:
+                    signals.append({'name': name, 'symbol': code, 'prob': prob})
+
+    # 確率が高い順に並び替え、最大保有銘柄数 (MAX_POSITIONS) までに絞り込む
+    signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
+    return signals[:config.MAX_POSITIONS]
+
+# --- メインエンジンループ ---
 async def main():
-    logger.info("=== 自動取引エンジン起動 (売買往復テストモード) ===")
     config = Config()
+    logger.info(f"=== 自動取引エンジン起動 (AI連動 & {config.TRADE_MODE}モード) ===")
     
     if not config.IS_PRODUCTION:
         logger.info("🧪 [シミュレーターモード] ポート18081(検証環境)で動作します。")
@@ -146,40 +264,58 @@ async def main():
     await api.get_token()
 
     if not api.token:
-        logger.error("APIトークンが取得できなかったため終了します。")
+        logger.error("APIトークンが取得できなかったため、システムを終了します。")
         await api.close_session()
         return
 
+    portfolio = PortfolioManager(config, api)
+
     try:
-        # =========================================================
-        # 【発注テストシーケンス】買い注文 → 10秒待機 → 売り(決済)注文
-        # =========================================================
-        test_symbol = "8591" # テスト銘柄：オリックス
-        qty = 100
-        
-        logger.info(f"=== 🟢 テストステップ1: エントリー注文 ({test_symbol}) ===")
-        # is_close=False (新規注文) として送信
-        res_buy = await api.send_order(test_symbol, side="2", qty=qty, is_close=False)
-        
-        if res_buy and res_buy.get("Result") == 0:
-            logger.info(f"✅ エントリー注文 成功！ 受付番号: {res_buy.get('OrderId')}")
+        # 1. AIシグナルの取得と新規発注
+        logger.info("=== 🤖 AI予測データの読み込みとエントリー判定 ===")
+        signals = load_ai_signals(config)
+
+        if not signals:
+            logger.info(f"😴 本日は「明日の上昇確率 {config.ENTRY_THRESHOLD_PROB}% 以上」の条件を満たす銘柄はありませんでした。エントリーを見送ります。")
         else:
-            logger.error(f"❌ エントリー注文 失敗。処理を中断します。")
-            return
-            
-        logger.info("⏳ 注文の約定とシステムの反映を待つため、10秒間待機します...")
-        await asyncio.sleep(10)
+            for sig in signals:
+                logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']}) - 上昇確率: {sig['prob']}%")
+                
+                # 現在の価格を取得 (バリア計算用)
+                board = await api.get_board(sig['symbol'], config.EXCHANGE)
+                current_price = None
+                if board:
+                    current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+                    if board.get("CurrentPrice") is None:
+                        logger.warning("🌙 市場時間外のため前日終値を参照します。")
+                
+                if not current_price:
+                    current_price = 2000.0 # フェイルセーフ用のダミー価格
+                    logger.warning("⚠️ 価格が取得できないためダミー価格(2000円)を適用します。")
+
+                # API経由で新規注文を発射！
+                res = await api.send_order(sig['symbol'], side="2", qty=config.FIXED_LOT_SIZE, is_close=False)
+                
+                if res and res.get("Result") == 0:
+                    logger.info(f"✅ エントリー注文の送信に成功しました。")
+                    # 💡 本番の信用取引ではここで「HoldID(建玉ID)」を取得して記録する必要がありますが、
+                    # 検証環境では建玉が作られないため、とりあえずNoneでインメモリに登録します。
+                    hold_id = None 
+                    portfolio.add_position(sig['symbol'], config.FIXED_LOT_SIZE, current_price, hold_id)
+                else:
+                    logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
-        logger.info(f"=== 🔴 テストステップ2: エグジット(決済)注文 ({test_symbol}) ===")
-        # is_close=True (決済注文) として送信
-        res_sell = await api.send_order(test_symbol, side="1", qty=qty, is_close=True)
-        
-        if res_sell and res_sell.get("Result") == 0:
-            logger.info(f"✅ 決済注文 成功！ 受付番号: {res_sell.get('OrderId')}")
+        # 2. 保有銘柄のリアルタイム監視（バリア決済）
+        if portfolio.positions:
+            logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
+            while True:
+                await portfolio.check_barriers()
+                if not portfolio.positions:
+                    logger.info("🎉 全てのポジションを決済しました。監視ループを終了します。")
+                    break
+                await asyncio.sleep(5)
         else:
-            logger.error(f"❌ 決済注文 失敗。")
-            
-        logger.info("🎉 買い・売り両方のテストシーケンスが完了しました。")
+            logger.info("監視するポジションがないため、システムを待機状態にします。")
 
     except KeyboardInterrupt:
         logger.info("システムを安全に停止します...")
