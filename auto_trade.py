@@ -21,7 +21,6 @@ class Config:
     # 認証情報（ご自身のパスワードに書き換えてください）
     API_PASSWORD = "1111111111"     # kabuステーションAPI(検証用)のパスワード
     TRADE_PASSWORD = "Tr7smv_jnxg" # 取引(注文)パスワード
-    
     EXCHANGE = 1  # 1: 東証
 
 class TokenBucket:
@@ -85,21 +84,21 @@ class KabuAPI:
             logger.error("❌ トークン取得失敗")
 
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0):
-        # 💡 現物取引の「買い」と「売り」を完璧に出し分ける究極の完全版
+        # 💡 ここが数々のエラーを乗り越えて完成した、kabuステーションAPIの「完全解」です！
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
             "Symbol": str(symbol),
             "Exchange": int(self.config.EXCHANGE),
             "SecurityType": 1,
             "Side": str(side),
-            "CashMargin": 3,         # 3: 現物取引
+            "CashMargin": 1,         # 💡 1: 現物取引 (ここが最大の真実でした！)
             
-            # 👇 【完全解決の鍵】キーは存在させつつ、値は None(null) で送る！
-            "MarginTradeType": None, 
-            "MarginPremiumUnit": None, 
+            # 👇 C#のパースエラーを防ぐため、現物でも必須（整数型・ダミー値として1を入れる）
+            "MarginTradeType": 1, 
+            "MarginPremiumUnit": 1, 
             
-            # 👇 どんな口座設定でも通りやすい安全な 0(指定なし) に統一
-            "DelivType": 0,
+            # 👇 買=2(お預り金), 売=0(指定なし)
+            "DelivType": 2 if side == "2" else 0,
             
             # 👇 ユーザー様発見の正解ロジック！買=02(保護預り), 売=半角スペース2つ
             "FundType": "02" if side == "2" else "  ", 
@@ -166,7 +165,6 @@ async def main():
 
 if __name__ == "__main__":
     import sys
-    # Windows用 asyncio のおまじない
     if sys.platform == "win32" and sys.version_info < (3, 14):
         try:
             asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
