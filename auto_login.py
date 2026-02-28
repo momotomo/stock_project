@@ -11,11 +11,10 @@ import re
 from datetime import datetime, timedelta
 
 # =========================================================
-# kabuステーション 完全自動ログインスクリプト (決定版パス修正)
+# kabuステーション 完全自動ログインスクリプト (無条件待機強化版)
 # =========================================================
 
 # --- 基本設定 ---
-# 💡 教えていただいた正しいインストールパスを反映しました
 KABU_APP_PATH = r"D:\Users\to-ka\AppData\Local\kabuStation\KabuS.exe"
 TARGET_PROCESS = "KabuS.exe"
 
@@ -89,30 +88,36 @@ def perform_login():
     """画像認識に基づいたログインシーケンス"""
     print("🚀 アプリを起動します...")
     try:
-        # 指定されたパスからプロセスを起動
         subprocess.Popen([KABU_APP_PATH])
     except FileNotFoundError:
         print(f"❌ エラー: {KABU_APP_PATH} が見つかりません。")
         sys.exit(1)
     
-    print("⏳ ログイン画面の表示を待機しています（最大60秒）...")
+    # 💡 【今回の変更】見つけ次第動くのではなく、まずは無条件で60秒待機
+    FIXED_WAIT = 60 
+    print(f"⏳ アプリの安定化のため、無条件で {FIXED_WAIT} 秒間待機します...")
+    for i in range(FIXED_WAIT):
+        time.sleep(1)
+        if (i + 1) % 10 == 0:
+            print(f"...待機中 ({i + 1}/{FIXED_WAIT}秒経過)")
+
+    print("🔎 ログインボタンの検索を開始します...")
     login_btn_pos = None
-    for i in range(60):
+    # 既に60秒待っているので、ここは短めの10秒間のリトライに設定
+    for _ in range(10):
         try:
             login_btn_pos = pyautogui.locateCenterOnScreen('login_btn.png', confidence=0.8)
             if login_btn_pos:
                 break
         except Exception:
             pass
-        if i % 10 == 0 and i > 0:
-            print(f"...待機中 ({i}秒経過)")
         time.sleep(1)
 
     if not login_btn_pos:
-        print("❌ 画面上に「login_btn.png」が見つかりませんでした。")
+        print("❌ 待機しましたが「login_btn.png」が見つかりませんでした。")
         return
 
-    print(f"🎯 ログインボタンを発見しました。クリックします...")
+    print(f"🎯 ログインボタンをクリックします...")
     pyautogui.click(login_btn_pos)
     time.sleep(10)
 
@@ -124,13 +129,14 @@ def perform_login():
     print(f"🔑 画面に認証コード ({otp}) を入力中...")
     pyperclip.copy(otp)
     pyautogui.hotkey('ctrl', 'v')
-    time.sleep(1)
+    time.sleep(2) # 入力後の微調整待機
     pyautogui.press('enter')
     
-    print("🎊 ログインシーケンス完了。アプリが完全に起動するまで60秒間待機します。")
+    # ログイン後のメイン画面起動待ち（ここも無条件60秒）
+    print(f"🎊 ログイン完了。メイン画面の起動をさらに {FIXED_WAIT} 秒間待ちます。")
     for i in range(6):
         time.sleep(10)
-        print(f"...起動待機中 ({ (i+1)*10 }秒経過)")
+        print(f"...最終起動待機中 ({ (i+1)*10 }/60秒経過)")
     
     print("✅ すべての準備が整いました。")
 
