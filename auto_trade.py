@@ -113,14 +113,14 @@ class KabuAPI:
         return await self._request("GET", endpoint)
 
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0):
-        # 💡 不要な信用取引のダミー項目を完全に削除し、純粋な現物注文データに修正
+        # 💡 【完全解決版】不要なダミー項目を全て排除し、完全な「現物取引」の公式仕様に準拠
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
             "Symbol": str(symbol),
             "Exchange": int(self.config.EXCHANGE),
             "SecurityType": 1,
             "Side": str(side),
-            "CashMargin": 3,         # 3: 現物取引
+            "CashMargin": 1,         # 💡 1: 現物取引 (ここが最重要でした)
             "DelivType": 2 if side == "2" else 0, # 買=2(お預り金), 売=0(指定なし)
             "FundType": "  ",        # 現物保護預りを示す半角スペース2つ
             "AccountType": 4,        # 4: 特定口座
