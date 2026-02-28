@@ -2,34 +2,25 @@ import asyncio
 import time
 import logging
 import aiohttp
-import csv
-import os
-from dataclasses import dataclass
-from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (auto_trade.py) - AI連動版
+# kabuステーション 自動取引テストスクリプト (現物 買い→売り 連続テスト版)
 # ---------------------------------------------------------
-# 【特徴】
-# 1. AI予測結果 (recommendations.csv) の自動読み込みとシグナル判定
-# 2. TokenBucketによる「秒間5件」のAPI流量制限の厳密な統制
-# 3. インメモリストートマシンによる自律的な価格監視とバリア決済
+# 指定した銘柄を買い、10秒後にすぐ売る「往復テスト」を行います。
 # =========================================================
 
 # --- ログ設定 ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# --- システム設定 (Config) ---
 class Config:
-    # ⚠️ 動作環境モード (Trueで本番口座、Falseでシミュレーター環境)
     IS_PRODUCTION = False  
     PORT = 18080 if IS_PRODUCTION else 18081
     API_URL = f"http://localhost:{PORT}/kabusapi"
     
     # 認証情報（ご自身のパスワードに書き換えてください）
-    API_PASSWORD = "1111111111"   # kabuステーションAPIのパスワード
-    TRADE_PASSWORD = "Tr7smv_jnxg" # 注文・決済パスワード
+    API_PASSWORD = "1111111111"     # kabuステーションAPI(検証用)のパスワード
+    TRADE_PASSWORD = "Tr7smv_jnxg" # 取引(注文)パスワード
     
     EXCHANGE = 1  # 1: 東証
 
@@ -102,6 +93,8 @@ class KabuAPI:
             "SecurityType": 1,
             "Side": str(side),
             "CashMargin": 3,         # 3: 現物取引
+            "MarginTradeType": 1,    # 💡 C#プログラムのパースエラー(強制終了)を回避するための必須キー
+            "MarginPremiumUnit": 1,  # 💡 同上（念のため追加）
             "DelivType": 2 if side == "2" else 0, # 買=2(お預り金), 売=0(指定なし)
             
             # 👇 ユーザー様発見の正解ロジック！買=02(保護預り), 売=半角スペース2つ
