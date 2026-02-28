@@ -21,8 +21,8 @@ TARGET_PROCESS = "KabuS.exe"
 
 # --- メール（IMAP）設定 ---
 IMAP_SERVER = "imap.gmail.com"
-EMAIL_ADDRESS = "your_email@gmail.com"
-EMAIL_PASSWORD = "your_app_password" 
+EMAIL_ADDRESS = "tomo.19851206@gmail.com"
+EMAIL_PASSWORD = "ehxqpbtcpdrtotsy" 
 
 def kill_existing_process():
     """既存のkabuステーションを終了"""
