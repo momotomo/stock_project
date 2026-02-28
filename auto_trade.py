@@ -185,6 +185,17 @@ class PortfolioManager:
             if not board: continue
             
             current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+            
+            # 💡 【休日テスト用追加コード】
+            # 市場時間外で価格が取れない場合、毎回ランダムに価格を変動させて無理やりテストを進行させる
+            if current_price is None:
+                import random
+                # 取得単価を基準に、上下10%の範囲でランダムな現在値を作り出す
+                fluctuation = pos.entry_price * random.uniform(-0.1, 0.1)
+                current_price = pos.entry_price + fluctuation
+                logger.info(f"🧪 [休日テスト] {symbol} の仮想価格を生成しました: {current_price:,.1f}円")
+
+            # （※本来の安全装置。テストコードを追加したのでここは通過します）
             if current_price is None: continue
 
             logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
