@@ -65,8 +65,8 @@ class Config:
         self.TARGET_HORIZON = str(config_data.get("TARGET_HORIZON", default_config["TARGET_HORIZON"]))
 
         self.TRADE_MODE = config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
-        # 🔥 修正: 預り区分を読み込む
-        self.FUND_TYPE = str(config_data.get("FUND_TYPE", default_config["FUND_TYPE"]))
+        # 🔥 修正: FUND_TYPEは廃止し、ACCOUNT_TYPE(特定口座=4)を読み込む
+        self.ACCOUNT_TYPE = int(config_data.get("ACCOUNT_TYPE", 4))
         
         self.MAX_POSITIONS = config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
         self.LOT_CALC_MODE = config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
@@ -158,8 +158,13 @@ class KabuAPI:
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
-            # 🔥 修正: 設定ファイルから特定口座(21)などを読み込んで適用
-            fund_type = self.config.FUND_TYPE if side == "2" else "  "
+            
+            # 🔥 修正: API仕様書に基づき、買い=02、売り=空白2文字に変更
+            if side == "2":
+                fund_type = "02"  # 買いの時は保護(02)
+            else:
+                fund_type = "  "  # 売りの時は指定なし(空白2文字)
+                
         else:
             cash_margin = 3 if is_close else 2
             margin_trade_type = 1 
@@ -177,7 +182,7 @@ class KabuAPI:
             "MarginPremiumUnit": 1, 
             "DelivType": deliv_type,
             "FundType": fund_type, 
-            "AccountType": 4,
+            "AccountType": self.config.ACCOUNT_TYPE,
             "Qty": int(qty),
             "Price": int(price) if price == 0 else float(price),
             "ExpireDay": 0,
