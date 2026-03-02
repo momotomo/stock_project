@@ -3,14 +3,28 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
-from sklearn.metrics import accuracy_score
 from sklearn.preprocessing import RobustScaler
 import os
 import plotly.express as px
 from github import Github
+import warnings
+
+# 無害な警告を非表示にする
+warnings.simplefilter('ignore', ResourceWarning)
 
 # ページ設定
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
+
+def get_tickers():
+    """外部ファイル(tickers.txt)から監視リストを読み込む関数"""
+    tickers = {}
+    if os.path.exists("tickers.txt"):
+        with open("tickers.txt", "r", encoding="utf-8") as f:
+            for line in f:
+                if ',' in line:
+                    name, ticker = line.split(',', 1)
+                    tickers[name.strip()] = ticker.strip()
+    return tickers
 
 # --- Secrets読込バックアップ機能 ---
 def get_secret(key):
@@ -46,6 +60,14 @@ def get_macro_data():
     except Exception:
         return pd.DataFrame()
 
+# 🔥 フラクショナル・ディファレンス（分数次階差）の計算関数
+def calc_fractional_diff(series, d=0.5, window=20):
+    weights = [1.0]
+    for k in range(1, window):
+        weights.append(-weights[-1] * (d - k + 1) / k)
+    weights = np.array(weights)[::-1]
+    return series.rolling(window).apply(lambda x: np.dot(weights, x), raw=True)
+
 def get_stock_features(ticker, macro_returns):
     data = yf.download(ticker, period="5y", progress=False)
     if data.empty: return None
@@ -55,8 +77,22 @@ def get_stock_features(ticker, macro_returns):
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
+    
+    # 🟢 ステップ1-A: フラクショナル・ディファレンス (トレンドと定常性の両立)
+    data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
+    
+    # ATR（ボラティリティの算出）
+    tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
+    data['ATR'] = tr.rolling(14).mean() / data['Close']
+    
+    # 🟢 ステップ1-B: ボラティリティによる正規化 (ノイズの排除)
     data['Disparity_5'] = (data['Close'] / data['Close'].rolling(5).mean()) - 1
     data['Disparity_25'] = (data['Close'] / data['Close'].rolling(25).mean()) - 1
+    
+    data['Log_Return_Norm'] = data['Log_Return'] / (data['ATR'] + 1e-9)
+    data['Disparity_5_Norm'] = data['Disparity_5'] / (data['ATR'] + 1e-9)
+    data['Disparity_25_Norm'] = data['Disparity_25'] / (data['ATR'] + 1e-9)
+    
     data['SMA_Cross'] = (data['Close'].rolling(5).mean() / data['Close'].rolling(25).mean()) - 1
     
     delta = data['Close'].diff()
@@ -69,8 +105,6 @@ def get_stock_features(ticker, macro_returns):
     data['BB_PctB'] = (data['Close'] - (ma_20 - 2*std_20)) / (4*std_20 + 1e-9)
     data['BB_Bandwidth'] = (4*std_20) / (data['Close'].rolling(25).mean() + 1e-9)
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
-    tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
-    data['ATR'] = tr.rolling(14).mean() / data['Close']
     data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
     
     data.replace([np.inf, -np.inf], np.nan, inplace=True)
@@ -126,6 +160,8 @@ ticker_input = st.sidebar.text_area(
     help="1行に1銘柄ずつ「銘柄名, ティッカー」の形式で入力"
 )
 
+st.sidebar.write("デバッグ用:", st.secrets.keys())
+
 if st.sidebar.button("💾 監視リストを保存・同期", use_container_width=True):
     with open(TICKERS_FILE, "w", encoding="utf-8") as f:
         f.write(ticker_input)
@@ -147,19 +183,12 @@ if st.sidebar.button("💾 監視リストを保存・同期", use_container_wid
     else:
         st.sidebar.warning("✅ ローカルに保存しました（クラウド同期未設定）")
 
-tickers = {}
-for line in ticker_input.strip().split('\n'):
-    if ',' in line:
-        name, ticker = line.split(',', 1)
-        tickers[name.strip()] = ticker.strip()
-
 # ==========================================
 # タブ1：今日の分析 ＆ AIおすすめ
 # ==========================================
 with tab1:
-    # --- 🌟 AIおすすめ銘柄セクション ---
     st.subheader("🌟 AIが選ぶ本日のおすすめ銘柄 (自動更新)")
-    st.write("日本の大型優良株30銘柄のチャートをAIが毎朝自動でスキャンし、目的に合わせたトップ銘柄を厳選しています。")
+    st.write("設定された銘柄のチャートをAIがスキャンし、目的に合わせたトップ銘柄を厳選しています。")
     
     rec_file = 'recommendations.csv'
     if os.path.exists(rec_file) and os.path.getsize(rec_file) > 0:
@@ -186,13 +215,12 @@ with tab1:
                 st.dataframe(df_rec, hide_index=True, use_container_width=True)
         except Exception as e:
             st.error(f"おすすめデータの読み込みに失敗しました: {e}")
-    else:
-        st.info("💡 現在おすすめ銘柄を分析中です。次回の自動バッチ処理が完了するとここに表示されます！")
-        
-    st.divider()
 
-    # --- 手動分析セクション ---
     st.subheader("🔍 あなたの監視リストの手動分析（全スパン）")
+    
+    # 常に tickers.txt の最新のリストを読み込んで使用する
+    tickers = get_tickers()
+    
     if st.button("🚀 監視銘柄の最新分析を実行", type="primary") and tickers:
         results = []
         tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
@@ -204,8 +232,12 @@ with tab1:
                 data = get_stock_features(ticker, macro_returns)
                 if data is None: continue
                 
-                features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
-                            'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
+                # 特徴量リストを「定常化・正規化」された高度なものに更新
+                features = [
+                    'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
+                    'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
+                    'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
+                ]
                 
                 data_features = data.dropna(subset=features)
                 if len(data_features) <= 100: continue
@@ -284,7 +316,6 @@ with tab2:
                 df_s['Date'] = pd.to_datetime(df_s['Date'])
                 df_s = df_s.sort_values('Date').reset_index(drop=True)
                 
-                # 存在しているスパンのカラムを動的に取得
                 available_cols = ['明日の上昇確率']
                 for col in ['1W 利確(>3%)', '2W 利確(>5%)', '1M 利確(>10%)', '3M 利確(>20%)', '6M 利確(>30%)', '1Y 利確(>50%)']:
                     if col in df_s.columns:
@@ -296,7 +327,9 @@ with tab2:
                 
                 st.markdown("---")
                 st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
-                selected_ticker = tickers.get(selected_stock, "")
+                
+                tickers_dict = get_tickers()
+                selected_ticker = tickers_dict.get(selected_stock, "")
                 default_lot = 100 if selected_ticker.endswith(".T") else 1
                 
                 col_sim1, col_sim2, col_sim3 = st.columns(3)
@@ -355,13 +388,14 @@ with tab2:
 with tab3:
     st.write("### 📊 AIシグナルによる運用シミュレーション")
     
-    if not tickers:
+    tickers_dict = get_tickers()
+    if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
     else:
         col1, col2 = st.columns(2)
         with col1:
-            bt_stock_name = st.selectbox("検証する銘柄", list(tickers.keys()), key="bt_stock")
-            bt_ticker = tickers[bt_stock_name]
+            bt_stock_name = st.selectbox("検証する銘柄", list(tickers_dict.keys()), key="bt_stock")
+            bt_ticker = tickers_dict[bt_stock_name]
             default_lot = 100 if str(bt_ticker).endswith(".T") else 1
             bt_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1)
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
@@ -378,8 +412,11 @@ with tab3:
             data = get_stock_features(ticker, macro_returns)
             if data is None: return None, None
             
-            features = ['Log_Return', 'Disparity_5', 'Disparity_25', 'SMA_Cross', 'RSI_14', 
-                        'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret']
+            features = [
+                'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
+                'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
+                'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
+            ]
             data_features = data.dropna(subset=features + ['Target_Class'])
             
             if len(data_features) <= 300: return None, None

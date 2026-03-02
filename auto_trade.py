@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (auto_trade.py) - 統合本番仕様
+# kabuステーション 自動取引エンジン (auto_trade.py) - 高度化・完全版
 # =========================================================
 
 # --- ログ設定 ---
@@ -40,7 +40,7 @@ class Config:
             "TRADE_PASSWORD": "YOUR_TRADE_PASSWORD",
             "EXCHANGE": 9,
             "TRADE_STYLE": "day",             
-            "TARGET_HORIZON": "明日",         
+            "TARGET_HORIZON": "短期",         
             "TRADE_MODE": "CASH",
             "ACCOUNT_TYPE": 4,
             "MAX_POSITIONS": 1,
@@ -169,6 +169,7 @@ class KabuAPI:
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
+            # 💡 信用口座ありの場合、現物買い(2)は「AA」、売り(1)は「指定なし」
             if side == "2":
                 fund_type = "AA"  
             else:
@@ -216,7 +217,7 @@ class KabuAPI:
         logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
-# --- 未約定の注文を取得する関数 ---
+# --- 未約定の注文を取得する関数 (ログ出力フラグを追加) ---
 async def get_active_orders(api: KabuAPI, log: bool = True):
     active_count = 0
     active_symbols = []
@@ -287,7 +288,6 @@ class PortfolioManager:
         for p in positions_data:
             symbol = p.get("Symbol")
             
-            # 🔥 究極の修正: APIの仕様では実際の保有数は「LeavesQty」に格納されます
             leaves_qty = int(p.get("LeavesQty", 0) or 0)
             hold_qty = int(p.get("HoldQty", 0) or 0)
             qty = leaves_qty + hold_qty
@@ -313,7 +313,6 @@ class PortfolioManager:
                         pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
                         logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(正確な取得単価: {entry_price:,.1f}円)")
         
-        # 認識できる株が1つもなかった時のログを補完
         if is_startup and not found_positions and len(positions_data) > 0:
             logger.info("保有しているポジションはありませんでした。")
 
@@ -331,7 +330,6 @@ class PortfolioManager:
 
             if current_price is None: continue
             
-            # 🔥 修正: 監視中の現在値更新ログを非表示（変数への記憶のみ行う）
             if current_price != pos.last_logged_price:
                 pos.last_logged_price = current_price
 
@@ -343,7 +341,11 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
-        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=pos.exchange)
+        # 🔥 最重要バグ修正: 現物取引(CASH)の売りは「新規注文」扱いのため、建玉の市場ではなく設定市場(SOR=9等)を使う！
+        # 信用取引(MARGIN)の返済の時のみ、建玉の市場(pos.exchange)を指定する。
+        target_exchange = pos.exchange if self.config.TRADE_MODE == "MARGIN" else self.config.EXCHANGE
+        
+        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
         if res and res.get("Result") == 0:
             logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
             del self.positions[pos.symbol]
@@ -352,33 +354,25 @@ class PortfolioManager:
 
 # --- AI連携モジュール ---
 def get_ticker_mapping() -> dict:
+    # 🔥 修正: ハードコーディングを廃止し、外部ファイル(tickers.txt)からのみ読み込む
     mapping = {}
-    pool = {
-        "トヨタ自動車": "7203.T", "ソニーG": "6758.T", "三菱UFJ": "8306.T",
-        "キーエンス": "6861.T", "NTT": "9432.T", "ファーストリテイリング": "9983.T",
-        "東京エレクトロン": "8035.T", "信越化学": "4063.T", "三井住友FG": "8316.T",
-        "日立製作所": "6501.T", "伊藤忠商事": "8001.T", "KDDI": "9433.T",
-        "ホンダ": "7267.T", "三菱商事": "8058.T", "ソフトバンクG": "9984.T",
-        "任天堂": "7974.T", "オリックス": "8591.T", "ANA": "9202.T", "三井物産": "8031.T",
-        "ダイキン工業": "6367.T", "武田薬品": "4502.T", "リクルートHD": "6098.T",
-        "みずほFG": "8411.T", "村田製作所": "6981.T", "デンソー": "6902.T",
-        "ファナック": "6954.T", "アステラス製薬": "4503.T", "セブン＆アイ": "3382.T",
-        "第一三共": "4568.T", "コマツ": "6301.T", "丸紅": "8002.T"
-    }
     if os.path.exists("tickers.txt"):
         with open("tickers.txt", "r", encoding="utf-8") as f:
             for line in f:
                 if ',' in line:
                     name, tk = line.split(',', 1)
-                    pool[name.strip()] = tk.strip()
-    for name, tk in pool.items():
-        mapping[name] = tk.replace(".T", "").strip()
+                    # カブコムAPIの仕様に合わせて「.T」を取り除いたコード番号だけを抽出
+                    mapping[name.strip()] = tk.replace(".T", "").strip()
+    else:
+        logger.error("tickers.txt が見つかりません。対象銘柄を読み込めません。")
     return mapping
 
 def load_ai_signals(config: Config) -> List[dict]:
     signals = []
     if not os.path.exists('recommendations.csv'): return signals
+    
     mapping = get_ticker_mapping()
+    
     with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         
@@ -538,7 +532,6 @@ async def main():
                     if board:
                         current_price = board.get("CurrentPrice") or board.get("PreviousClose")
                         if current_price and current_price != last_logged_active_prices.get(sym):
-                            # 🔥 修正: 予約中(約定待ち)の現在値更新ログも非表示
                             last_logged_active_prices[sym] = current_price
 
                 await portfolio.check_barriers()
