@@ -14,7 +14,18 @@ from typing import Dict, List
 # =========================================================
 
 # --- ログ設定 ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# logsフォルダを作成し、日付ごとのログファイルを出力する
+os.makedirs("logs", exist_ok=True)
+log_filename = f"logs/auto_trade_{datetime.now().strftime('%Y%m%d')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'), # ログファイルへの出力
+        logging.StreamHandler()                              # コンソールへの出力
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # --- システム設定 (Config) ---
@@ -213,6 +224,7 @@ class Position:
     stop_loss_price: float
     hold_id: str = None
     exchange: int = 1
+    last_logged_price: float = 0.0  # 🔥 最後にログ出力した価格を記憶しておく変数を追加
 
 class PortfolioManager:
     def __init__(self, config: Config, api: KabuAPI):
@@ -262,7 +274,10 @@ class PortfolioManager:
 
             if current_price is None: continue
             
-            logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
+            # 🔥 価格が前回ログに出力した時と「変化」している場合のみ出力する
+            if current_price != pos.last_logged_price:
+                logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
+                pos.last_logged_price = current_price
 
             if current_price >= pos.take_profit_price:
                 logger.warning(f"📈 利確バリア到達！ {symbol} の決済（売り）を実行します。")
