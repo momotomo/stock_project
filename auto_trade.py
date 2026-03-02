@@ -159,11 +159,11 @@ class KabuAPI:
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
-            # 🔥 修正: API仕様書に基づき、買い=02、売り=空白2文字に変更
+            # 🔥 修正: 買いは「指定なし(空白2文字)」、売りは「保護預り(02)」が正解です！
             if side == "2":
-                fund_type = "02"  # 買いの時は保護(02)
+                fund_type = "  "  # 買いの時は指定なし(半角スペース2文字)
             else:
-                fund_type = "  "  # 売りの時は指定なし(空白2文字)
+                fund_type = "02"  # 売りの時は保護預り(02)から売る
                 
         else:
             cash_margin = 3 if is_close else 2
