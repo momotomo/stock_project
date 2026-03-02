@@ -407,7 +407,7 @@ with tab3:
             bt_hold_days = st.number_input("最大保有日数（強制決済）", value=5, step=1)
 
         @st.cache_data(show_spinner=False)
-        def run_ml_prediction_for_bt(ticker):
+        def run_purged_walk_forward_cv(ticker, hold_days):
             macro_returns = get_macro_data()
             data = get_stock_features(ticker, macro_returns)
             if data is None: return None, None
@@ -421,26 +421,51 @@ with tab3:
             
             if len(data_features) <= 300: return None, None
             
-            test_size = 250
-            train_data = data_features.iloc[:-test_size]
-            test_data = data_features.iloc[-test_size:]
+            # 🔥 🟢 ステップ2: Purged Walk-Forward Cross Validation（パージング付きウォークフォワード検証）
+            # 過去5年間のデータを4つに分割し、境界線の「カンニング（リーケージ）」を防ぐために
+            # 最大保有日数分(hold_days)のデータを意図的に「パージ（捨てる）」してからテストを行います。
+            n_splits = 4 
+            purge_days = int(hold_days) + 1 
             
-            X_train = train_data[features]
-            y_train = train_data['Target_Class']
+            test_probs_all = pd.Series(dtype=float)
+            test_data_all = pd.DataFrame()
             
-            scaler = RobustScaler()
-            X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
-            X_test_scaled = pd.DataFrame(scaler.transform(test_data[features]), index=test_data.index, columns=features)
+            indices = np.arange(len(data_features))
+            fold_size = len(data_features) // (n_splits + 1)
             
-            clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-            clf.fit(X_train_scaled, y_train)
-            test_probs = clf.predict_proba(X_test_scaled)[:, 1]
-            
-            return test_data, test_probs
+            for i in range(n_splits):
+                train_end = (i + 1) * fold_size
+                test_start = train_end + purge_days # 🔥 情報漏洩を防ぐためパージ期間を空ける！
+                test_end = test_start + fold_size if i < n_splits - 1 else len(data_features)
+                
+                if test_start >= len(data_features): break
+                
+                train_idx = indices[:train_end]
+                test_idx = indices[test_start:test_end]
+                
+                train_data = data_features.iloc[train_idx]
+                test_data = data_features.iloc[test_idx]
+                
+                X_train = train_data[features]
+                y_train = train_data['Target_Class']
+                X_test = test_data[features]
+                
+                scaler = RobustScaler()
+                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
+                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=features)
+                
+                clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+                clf.fit(X_train_scaled, y_train)
+                
+                probs = clf.predict_proba(X_test_scaled)[:, 1]
+                test_probs_all = pd.concat([test_probs_all, pd.Series(probs, index=test_data.index)])
+                test_data_all = pd.concat([test_data_all, test_data])
+                
+            return test_data_all, test_probs_all
 
-        if st.button("🔄 シミュレーションを実行", type="primary"):
-            with st.spinner('過去のチャートを分析中...'):
-                test_data, test_probs = run_ml_prediction_for_bt(bt_ticker)
+        if st.button("🔄 厳密な実戦シミュレーションを実行 (Purged CV)", type="primary"):
+            with st.spinner('過去5年間を通じたパージング付きウォークフォワード検証を実行中...'):
+                test_data, test_probs = run_purged_walk_forward_cv(bt_ticker, bt_hold_days)
 
             if test_data is not None and test_probs is not None:
                 cash = bt_initial_cash
