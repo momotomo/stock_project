@@ -32,6 +32,7 @@ class Config:
             "TRADE_STYLE": "day",             # day: 14:50強制決済, swing: 持ち越し
             "TARGET_HORIZON": "明日",         # 明日, 1W, 2W, 1M, 3M, 6M, 1Y
             "TRADE_MODE": "CASH",
+            "FUND_TYPE": "21",                # デフォルトは特定口座(21)
             "MAX_POSITIONS": 1,
             "LOT_CALC_MODE": "AUTO",
             "FIXED_LOT_SIZE": 100,
@@ -64,6 +65,9 @@ class Config:
         self.TARGET_HORIZON = str(config_data.get("TARGET_HORIZON", default_config["TARGET_HORIZON"]))
 
         self.TRADE_MODE = config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
+        # 🔥 修正: 預り区分を読み込む
+        self.FUND_TYPE = str(config_data.get("FUND_TYPE", default_config["FUND_TYPE"]))
+        
         self.MAX_POSITIONS = config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
         self.LOT_CALC_MODE = config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
         self.FIXED_LOT_SIZE = config_data.get("FIXED_LOT_SIZE", default_config["FIXED_LOT_SIZE"])
@@ -154,7 +158,8 @@ class KabuAPI:
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
-            fund_type = "02" if side == "2" else "  "
+            # 🔥 修正: 設定ファイルから特定口座(21)などを読み込んで適用
+            fund_type = self.config.FUND_TYPE if side == "2" else "  "
         else:
             cash_margin = 3 if is_close else 2
             margin_trade_type = 1 
@@ -396,7 +401,7 @@ async def main():
                     logger.info(f"💰 ロット自動計算: 余力={available_cash:,.0f}円 -> 割当予算={budget_per_trade:,.0f}円 -> 算出ロット={qty}株")
 
                 if qty == 0:
-                    logger.warning(f"⚠️ 資金不足（算出ロット0株）ため、{sig['symbol']} のエントリーを見送ります。")
+                    logger.warning(f"⚠️ 資金不足（算出ロット0株）のため、{sig['symbol']} のエントリーを見送ります。")
                     continue
 
                 res = await api.send_order(sig['symbol'], side="2", qty=qty, is_close=False)

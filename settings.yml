@@ -27,6 +27,9 @@ TARGET_HORIZON: "明日"
 # 取引モード。「CASH」で現物取引、「MARGIN」で信用取引（制度信用）を行います
 TRADE_MODE: "CASH"
 
+# 🔥 NEW: 預り区分。「21」特定口座、「11」一般口座、「02」NISA
+FUND_TYPE: "21"
+
 # システムが同時に保有する最大銘柄数
 MAX_POSITIONS: 1
 
