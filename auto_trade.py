@@ -28,11 +28,11 @@ class Config:
             "IS_PRODUCTION": False,
             "API_PASSWORD": "YOUR_API_PASSWORD",
             "TRADE_PASSWORD": "YOUR_TRADE_PASSWORD",
-            "EXCHANGE": 1,
-            "TRADE_STYLE": "day",             # day: 14:50強制決済, swing: 持ち越し
-            "TARGET_HORIZON": "明日",         # 明日, 1W, 2W, 1M, 3M, 6M, 1Y
+            "EXCHANGE": 9,                    # 🔥 デフォルトを東証(1)からSOR(9)に変更
+            "TRADE_STYLE": "day",             
+            "TARGET_HORIZON": "明日",         
             "TRADE_MODE": "CASH",
-            "FUND_TYPE": "21",                # デフォルトは特定口座(21)
+            "ACCOUNT_TYPE": 4,                # 特定口座(4)
             "MAX_POSITIONS": 1,
             "LOT_CALC_MODE": "AUTO",
             "FIXED_LOT_SIZE": 100,
@@ -59,14 +59,13 @@ class Config:
         
         self.API_PASSWORD = str(config_data.get("API_PASSWORD", default_config["API_PASSWORD"]))
         self.TRADE_PASSWORD = str(config_data.get("TRADE_PASSWORD", default_config["TRADE_PASSWORD"]))
-        self.EXCHANGE = config_data.get("EXCHANGE", default_config["EXCHANGE"])
+        self.EXCHANGE = int(config_data.get("EXCHANGE", default_config["EXCHANGE"]))
         
         self.TRADE_STYLE = config_data.get("TRADE_STYLE", default_config["TRADE_STYLE"])
         self.TARGET_HORIZON = str(config_data.get("TARGET_HORIZON", default_config["TARGET_HORIZON"]))
 
         self.TRADE_MODE = config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
-        # 🔥 修正: FUND_TYPEは廃止し、ACCOUNT_TYPE(特定口座=4)を読み込む
-        self.ACCOUNT_TYPE = int(config_data.get("ACCOUNT_TYPE", 4))
+        self.ACCOUNT_TYPE = int(config_data.get("ACCOUNT_TYPE", default_config["ACCOUNT_TYPE"]))
         
         self.MAX_POSITIONS = config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
         self.LOT_CALC_MODE = config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
@@ -139,31 +138,31 @@ class KabuAPI:
             logger.error("❌ トークン取得失敗")
 
     async def get_board(self, symbol: str, exchange: int):
-        return await self._request("GET", f"board/{symbol}@{exchange}")
+        # 💡 ボード情報(株価取得)は市場に関わらず基本的に東証(1)で見ます
+        return await self._request("GET", f"board/{symbol}@1")
 
     async def get_wallet_cash(self):
-        """現物買付余力照会"""
         return await self._request("GET", "wallet/cash")
 
     async def get_wallet_margin(self, symbol: str, exchange: int):
-        """信用新規建余力照会"""
-        return await self._request("GET", f"wallet/margin/{symbol}@{exchange}")
+        # 💡 余力照会も代表して東証(1)を使用します
+        return await self._request("GET", f"wallet/margin/{symbol}@1")
 
     async def get_positions(self, product: int = 0):
-        """保有ポジション(建玉)一覧を取得。product: 1=現物, 2=信用"""
         return await self._request("GET", "positions", params={"product": product})
 
-    async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None):
+    # 🔥 修正: 引数に `exchange` を追加し、指定された市場で注文を出せるようにする
+    async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None, exchange: int = None):
         if self.config.TRADE_MODE == "CASH":
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
-            # 🔥 修正: 買いは「指定なし(空白2文字)」、売りは「保護預り(02)」が正解です！
+            # 🔥 修正: ユーザー様の仰る通り「買い=02」「売り=空白2文字」が正解でした！
             if side == "2":
-                fund_type = "  "  # 買いの時は指定なし(半角スペース2文字)
+                fund_type = "02"  # 買いの時は保護預り(02)に指定
             else:
-                fund_type = "02"  # 売りの時は保護預り(02)から売る
+                fund_type = "  "  # 売りの時は指定なし(半角スペース2つ)
                 
         else:
             cash_margin = 3 if is_close else 2
@@ -171,10 +170,13 @@ class KabuAPI:
             deliv_type = 0
             fund_type = "  "
 
+        # 🔥 指定された市場(引数)があればそれ使い、無ければ設定ファイルの値(9=SOR)を使う
+        target_exchange = exchange if exchange is not None else self.config.EXCHANGE
+
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
             "Symbol": str(symbol),
-            "Exchange": int(self.config.EXCHANGE),
+            "Exchange": int(target_exchange),
             "SecurityType": 1,
             "Side": str(side),
             "CashMargin": cash_margin,
@@ -199,10 +201,10 @@ class KabuAPI:
         trade_type_str = "現物" if self.config.TRADE_MODE == "CASH" else ("信用返済" if is_close else "信用新規")
         
         if not self.config.IS_PRODUCTION:
-            logger.info(f"🧪 [シミュレーター] 発注スキップ [{trade_type_str}]: {action} {symbol} {qty}株 (成行)")
+            logger.info(f"🧪 [シミュレーター] 発注スキップ [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
             return {"Result": 0, "OrderId": "SIM_" + str(int(time.time()))}
 
-        logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行)")
+        logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
 # --- ポジション管理 ---
@@ -214,6 +216,7 @@ class Position:
     take_profit_price: float
     stop_loss_price: float
     hold_id: str = None
+    exchange: int = 1  # 🔥 買った時の市場コードを記憶するためのプロパティを追加
 
 class PortfolioManager:
     def __init__(self, config: Config, api: KabuAPI):
@@ -221,12 +224,13 @@ class PortfolioManager:
         self.api = api
         self.positions: Dict[str, Position] = {}
 
-    def add_position(self, symbol: str, qty: int, entry_price: float, hold_id: str = None):
+    # 🔥 引数に exchange を追加
+    def add_position(self, symbol: str, qty: int, entry_price: float, hold_id: str = None, exchange: int = 1):
         tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
         sl = entry_price * (1 - self.config.STOP_LOSS_PCT)
-        self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, hold_id)
+        self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, hold_id, exchange)
         mode_str = "現物" if self.config.TRADE_MODE == "CASH" else "信用"
-        logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円)")
+        logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円 / 市場: {exchange})")
         logger.info(f"🎯 バリア設定 -> 利確: {tp:,.1f}円 / 損切: {sl:,.1f}円")
 
     async def sync_positions(self):
@@ -243,10 +247,11 @@ class PortfolioManager:
             qty = p.get("HoldQty", 0)
             entry_price = p.get("Price", 0)
             hold_id = p.get("HoldID")
+            exchange = p.get("Exchange", self.config.EXCHANGE) # 🔥 APIから取得した市場情報を読み取る
             
             if qty > 0 and symbol:
-                self.add_position(symbol, qty, entry_price, hold_id)
-                logger.info(f"📥 既存ポジションを認識しました: {symbol}")
+                self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                logger.info(f"📥 既存ポジションを認識しました: {symbol} (市場: {exchange})")
 
     async def check_barriers(self):
         for symbol, pos in list(self.positions.items()):
@@ -272,7 +277,8 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
-        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id)
+        # 🔥 決済注文を出す時、記憶していた市場コード(pos.exchange)を使って注文を出す！
+        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=pos.exchange)
         if res and res.get("Result") == 0:
             logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
             del self.positions[pos.symbol]
@@ -413,7 +419,8 @@ async def main():
                 
                 if res and res.get("Result") == 0:
                     logger.info(f"✅ エントリー注文送信成功")
-                    portfolio.add_position(sig['symbol'], qty, current_price, None)
+                    # 🔥 買った時の市場(config.EXCHANGE)をPortfolioManagerに記憶させる
+                    portfolio.add_position(sig['symbol'], qty, current_price, None, config.EXCHANGE)
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
