@@ -159,7 +159,6 @@ class KabuAPI:
     async def get_positions(self, product: int = 0):
         return await self._request("GET", "positions", params={"product": product})
 
-    # 🔥 追加: 現在出ている「注文一覧」を取得するAPI
     async def get_orders(self, product: int = 0):
         params = {"product": product} if product != 0 else {}
         return await self._request("GET", "orders", params=params)
@@ -217,26 +216,34 @@ class KabuAPI:
         logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
-# --- 未約定の注文を取得する関数 ---
-async def get_active_orders(api: KabuAPI):
+# --- 未約定の注文を取得する関数 (ログ出力フラグを追加) ---
+async def get_active_orders(api: KabuAPI, log: bool = True):
     active_count = 0
     active_symbols = []
+    active_details = []
     orders = await api.get_orders()
     if orders:
         for order in orders:
             state = order.get("State")
             order_qty = order.get("OrderQty", 0)
             cum_qty = order.get("CumQty", 0)
+            side = order.get("Side")
             
-            # 🔥 修正: 待機中だけでなく「市場の板に並んでいる状態(State:3)」も拾うため、
-            # 終了(State:5)しておらず、まだ全て約定していない注文をアクティブとみなす
             if state != 5 and cum_qty < order_qty:
                 symbol = order.get("Symbol")
                 active_count += 1
                 if symbol:
                     active_symbols.append(symbol)
-                logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol} (State: {state}, 注文数: {order_qty}, 約定済: {cum_qty})")
-    return active_count, active_symbols
+                    active_details.append({
+                        "symbol": symbol,
+                        "state": state,
+                        "order_qty": order_qty,
+                        "cum_qty": cum_qty,
+                        "side": side
+                    })
+                if log:
+                    logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol} (State: {state}, 注文数: {order_qty}, 約定済: {cum_qty})")
+    return active_count, active_symbols, active_details
 
 # --- ポジション管理 ---
 @dataclass
@@ -286,9 +293,12 @@ class PortfolioManager:
             if qty > 0 and symbol:
                 if symbol not in self.positions:
                     self.add_position(symbol, qty, entry_price, hold_id, exchange)
-                    logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange})")
+                    # 🔥 約定を検知した時の分かりやすいログ
+                    if not is_startup:
+                        logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol}")
+                    else:
+                        logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange})")
                 else:
-                    # 🔥 追加: 予約中の注文が約定してHoldIDが付与されたら、正式な価格に更新する
                     pos = self.positions[symbol]
                     if pos.hold_id is None and hold_id is not None:
                         pos.hold_id = hold_id
@@ -404,11 +414,10 @@ async def main():
 
     portfolio = PortfolioManager(config, api)
     
-    # 起動時の残高確認
     await portfolio.sync_positions(is_startup=True)
 
-    # 🔥 追加: 現在出ている「未約定の注文」を確認
-    active_orders_count, active_order_symbols = await get_active_orders(api)
+    # 起動時のみログを出して予約中の注文を確認
+    active_orders_count, active_order_symbols, _ = await get_active_orders(api, log=True)
 
     try:
         now = datetime.now()
@@ -426,12 +435,10 @@ async def main():
                     logger.info(f"🚫 [見送り] {sig['name']} ({sig['symbol']}) は既に保有中のため追加購入しません(重複防止)。")
                     continue
                     
-                # 🔥 追加: すでに「予約中」の注文がある銘柄の二重発注を防止
                 if sig['symbol'] in active_order_symbols:
                     logger.info(f"🚫 [見送り] {sig['name']} ({sig['symbol']}) は現在「注文中(予約中)」のため追加購入しません。")
                     continue
                     
-                # 🔥 修正: 最大保有枠のカウントに「注文中の数」も含める
                 if len(portfolio.positions) + active_orders_count >= config.MAX_POSITIONS:
                     logger.warning(f"🚫 最大保有数(保有 {len(portfolio.positions)} + 注文中 {active_orders_count} = 最大 {config.MAX_POSITIONS})に達しているため、新規エントリーを見送ります。")
                     break
@@ -474,18 +481,18 @@ async def main():
                 
                 if res and res.get("Result") == 0:
                     logger.info(f"✅ エントリー注文送信成功")
-                    portfolio.add_position(sig['symbol'], qty, current_price, None, config.EXCHANGE)
+                    # 🔥 修正: 発注直後はまだ「約定待ち」なので、positionsには入れず予約注文として扱う
                     active_orders_count += 1
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
         has_force_closed_today = False
         
-        # 🔥 修正: 予約中の注文が1つでもある場合、約定を待つために監視ループに突入する
         if portfolio.positions or active_orders_count > 0:
             logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
             
-            sync_counter = 0 # 定期的に証券口座の情報を同期するためのカウンター
+            sync_counter = 0 
+            last_logged_active_prices = {}
             
             while True:
                 now = datetime.now()
@@ -505,17 +512,27 @@ async def main():
                         logger.info(f"📦 現在の持ち越し銘柄数: {len(portfolio.positions)}銘柄 (スイングモードで翌日に持ち越します)")
                     break
 
-                # 🔥 追加: 15秒に1回、証券口座の残高を再確認して、約定した予約注文を正式に拾い上げる
                 sync_counter += 1
                 if sync_counter >= 3:
                     await portfolio.sync_positions(is_startup=False)
                     sync_counter = 0
 
+                # 🔥 修正: 未約定の注文を取得し（ログは抑制）、株価が動いた時だけ「約定待ち」として表示する
+                active_count, _, active_details = await get_active_orders(api, log=False)
+                for detail in active_details:
+                    sym = detail['symbol']
+                    board = await api.get_board(sym, config.EXCHANGE)
+                    if board:
+                        current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+                        if current_price and current_price != last_logged_active_prices.get(sym):
+                            action = "買い" if detail['side'] == "2" else "決済"
+                            logger.info(f"⏳ {sym} 約定待ち({action})... 現在値:{current_price:,.1f}円 (注文:{detail['order_qty']}株 / 約定済:{detail['cum_qty']}株)")
+                            last_logged_active_prices[sym] = current_price
+
+                # 既に約定した保有ポジションのバリア監視
                 await portfolio.check_barriers()
                 
                 if not portfolio.positions and config.TRADE_STYLE == "day":
-                    # 🔥 修正: 本当に未約定の注文もゼロになったかを確認してからループを抜ける
-                    active_count, _ = await get_active_orders(api)
                     if active_count == 0:
                         logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。")
                         break
