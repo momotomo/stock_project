@@ -5,6 +5,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import cross_val_predict
 from sklearn.preprocessing import RobustScaler
 import csv
 from datetime import datetime
@@ -168,13 +169,25 @@ def generate_signals():
         
         clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
         
-        # 1. 明日の上昇確率
+        # 1. 明日の上昇確率 と メタラベリング
         y_train_tom = historical_data['Target_Class']
         if len(np.unique(y_train_tom)) > 1:
+            # 【1人目のAI】上がるか下がるかの方向性を予測
             clf.fit(X_scaled, y_train_tom)
             prob_up = clf.predict_proba(latest_X_scaled)[0][1]
+            
+            # 🔥 最終ステップ: メタラベリング（交差検証による確信度の予測）
+            # 過去のデータで「1人目のAIの予測が当たったか(1)外れたか(0)」を判定し、それを学習ラベルとする
+            oos_preds = cross_val_predict(clf, X_scaled, y_train_tom, cv=4)
+            meta_labels = (oos_preds == y_train_tom).astype(int)
+            
+            # 【2人目のAI】1人目の予測が当たる「確信度」を予測
+            clf_meta = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+            clf_meta.fit(X_scaled, meta_labels)
+            meta_confidence = clf_meta.predict_proba(latest_X_scaled)[0][1]
         else:
             prob_up = 0.0
+            meta_confidence = 0.0
             
         # 2. 全スパンのトリプルバリア予測
         tb_results = {}
@@ -215,6 +228,7 @@ def generate_signals():
             "短期スコア": float(short_score * 100),
             "中長期スコア": float(long_score * 100),
             "明日の上昇確率": float(prob_up * 100),
+            "メタ確信度": float(meta_confidence * 100),
             "1W 利確(>3%)": float(tb_results.get('1W', 0) * 100),
             "2W 利確(>5%)": float(tb_results.get('2W', 0) * 100),
             "1M 利確(>10%)": float(tb_results.get('1M', 0) * 100),

@@ -169,7 +169,7 @@ class KabuAPI:
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
-            # 💡 信用口座ありの場合、現物買い(2)は「AA」、売り(1)は「指定なし」
+            # 信用口座ありの場合、現物買い(2)は「AA」、売り(1)は「指定なし」
             if side == "2":
                 fund_type = "AA"  
             else:
@@ -341,8 +341,7 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
-        # 🔥 最重要バグ修正: 現物取引(CASH)の売りは「新規注文」扱いのため、建玉の市場ではなく設定市場(SOR=9等)を使う！
-        # 信用取引(MARGIN)の返済の時のみ、建玉の市場(pos.exchange)を指定する。
+        # 信用取引(MARGIN)の返済の時のみ建玉の市場を指定し、現物(CASH)売りは設定市場(SOR=9等)を使う
         target_exchange = pos.exchange if self.config.TRADE_MODE == "MARGIN" else self.config.EXCHANGE
         
         res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
@@ -354,14 +353,12 @@ class PortfolioManager:
 
 # --- AI連携モジュール ---
 def get_ticker_mapping() -> dict:
-    # 🔥 修正: ハードコーディングを廃止し、外部ファイル(tickers.txt)からのみ読み込む
     mapping = {}
     if os.path.exists("tickers.txt"):
         with open("tickers.txt", "r", encoding="utf-8") as f:
             for line in f:
                 if ',' in line:
                     name, tk = line.split(',', 1)
-                    # カブコムAPIの仕様に合わせて「.T」を取り除いたコード番号だけを抽出
                     mapping[name.strip()] = tk.replace(".T", "").strip()
     else:
         logger.error("tickers.txt が見つかりません。対象銘柄を読み込めません。")
@@ -377,8 +374,6 @@ def load_ai_signals(config: Config) -> List[dict]:
         reader = csv.DictReader(f)
         
         target_col = None
-        
-        # 🔥 修正: app.pyと同じ「短期スコア」や「中長期スコア」を指定できるように機能追加！
         if config.TARGET_HORIZON == "短期":
             target_col = "短期スコア"
         elif config.TARGET_HORIZON == "中長期":
@@ -406,7 +401,10 @@ def load_ai_signals(config: Config) -> List[dict]:
             if prob >= config.ENTRY_THRESHOLD_PROB:
                 name = row.get('銘柄名', '')
                 code = mapping.get(name)
-                if code: signals.append({'name': name, 'symbol': code, 'prob': prob})
+                # 🔥 ステップ3: メタラベリングによる「確信度」の読み込み
+                meta_conf = float(row.get('メタ確信度', prob)) 
+                
+                if code: signals.append({'name': name, 'symbol': code, 'prob': prob, 'confidence': meta_conf})
                 
     signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
     return signals
@@ -464,6 +462,7 @@ async def main():
                 qty = 0
                 if config.LOT_CALC_MODE == "FIXED":
                     qty = config.FIXED_LOT_SIZE
+                
                 elif config.LOT_CALC_MODE == "AUTO":
                     available_cash = 0
                     if config.TRADE_MODE == "CASH":
@@ -479,11 +478,50 @@ async def main():
                     budget_per_trade = (available_cash * config.AUTO_INVEST_RATIO) / config.MAX_POSITIONS
                     max_shares = int(budget_per_trade / current_price)
                     qty = (max_shares // 100) * 100 
-
                     logger.info(f"💰 ロット自動計算: 余力={available_cash:,.0f}円 -> 割当予算={budget_per_trade:,.0f}円 -> 算出ロット={qty}株")
 
+                elif config.LOT_CALC_MODE == "KELLY":
+                    # 🔥 ステップ3: ケリー基準による動的ロット計算
+                    available_cash = 0
+                    if config.TRADE_MODE == "CASH":
+                        wallet = await api.get_wallet_cash()
+                        if wallet: available_cash = wallet.get("StockAccountWallet", 0)
+                    else:
+                        wallet = await api.get_wallet_margin(sig['symbol'], config.EXCHANGE)
+                        if wallet: available_cash = wallet.get("MarginAccountWallet", 0)
+                    
+                    if not available_cash:
+                        available_cash = 1000000
+                        
+                    # 1. ペイオフレシオ (利確幅 / 損切幅)
+                    b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
+                    
+                    # 2. 勝率 p (メタラベリングの確信度)
+                    p = sig['confidence'] / 100.0
+                    
+                    # 3. ケリー公式: f* = p - (1 - p) / b
+                    if b > 0:
+                        kelly_f = p - ((1.0 - p) / b)
+                    else:
+                        kelly_f = 0.0
+                        
+                    # 4. ハーフ・ケリー（安全のため、全額の半額だけをベットするプロの定石）
+                    half_kelly = kelly_f / 2.0
+                    
+                    # 5. 上限の適用（どれだけ自信があってもAUTO_INVEST_RATIOを超えない）
+                    invest_ratio = max(0.0, min(half_kelly, config.AUTO_INVEST_RATIO))
+                    
+                    if invest_ratio > 0:
+                        budget_per_trade = available_cash * invest_ratio
+                        max_shares = int(budget_per_trade / current_price)
+                        qty = (max_shares // 100) * 100 
+                        logger.info(f"🧠 ケリー基準計算: 勝率(確信度)={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
+                    else:
+                        logger.warning(f"⚠️ ケリー基準がマイナス({kelly_f:.2f})のため、{sig['symbol']} は「期待値が低い(リスク高)」と判断し見送ります。")
+                        qty = 0
+
                 if qty == 0:
-                    logger.warning(f"⚠️ 資金不足（算出ロット0株）のため、{sig['symbol']} のエントリーを見送ります。")
+                    logger.warning(f"⚠️ 資金不足 または 条件未達 のため、{sig['symbol']} のエントリーを見送ります。")
                     continue
 
                 res = await api.send_order(sig['symbol'], side="2", qty=qty, is_close=False)
