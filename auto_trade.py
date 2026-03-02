@@ -14,7 +14,6 @@ from typing import Dict, List
 # =========================================================
 
 # --- ログ設定 ---
-# logsフォルダを作成し、日付ごとのログファイルを出力する
 os.makedirs("logs", exist_ok=True)
 log_filename = f"logs/auto_trade_{datetime.now().strftime('%Y%m%d')}.log"
 
@@ -22,8 +21,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'), # ログファイルへの出力
-        logging.StreamHandler()                              # コンソールへの出力
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
@@ -160,13 +159,17 @@ class KabuAPI:
     async def get_positions(self, product: int = 0):
         return await self._request("GET", "positions", params={"product": product})
 
+    # 🔥 追加: 現在出ている「注文一覧」を取得するAPI
+    async def get_orders(self, product: int = 0):
+        params = {"product": product} if product != 0 else {}
+        return await self._request("GET", "orders", params=params)
+
     async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None, exchange: int = None):
         if self.config.TRADE_MODE == "CASH":
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
-            # 💡 信用口座ありの場合、現物買い(2)は「AA」、売り(1)は「指定なし」
             if side == "2":
                 fund_type = "AA"  
             else:
@@ -214,6 +217,23 @@ class KabuAPI:
         logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
+# --- 未約定の注文を取得する関数 ---
+async def get_active_orders(api: KabuAPI):
+    active_count = 0
+    active_symbols = []
+    orders = await api.get_orders()
+    if orders:
+        for order in orders:
+            state = order.get("State")
+            # State 1: 待機(受付済), 2: 処理中(発注中), 4: 訂正取消送信中
+            if state in [1, 2, 4]:
+                symbol = order.get("Symbol")
+                active_count += 1
+                if symbol:
+                    active_symbols.append(symbol)
+                logger.info(f"⏳ 未約定(予約中)の注文を認識しました: {symbol} (State: {state})")
+    return active_count, active_symbols
+
 # --- ポジション管理 ---
 @dataclass
 class Position:
@@ -224,7 +244,7 @@ class Position:
     stop_loss_price: float
     hold_id: str = None
     exchange: int = 1
-    last_logged_price: float = 0.0  # 🔥 最後にログ出力した価格を記憶しておく変数を追加
+    last_logged_price: float = 0.0
 
 class PortfolioManager:
     def __init__(self, config: Config, api: KabuAPI):
@@ -240,13 +260,16 @@ class PortfolioManager:
         logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円 / 市場: {exchange})")
         logger.info(f"🎯 バリア設定 -> 利確: {tp:,.1f}円 / 損切: {sl:,.1f}円")
 
-    async def sync_positions(self):
-        logger.info("🔄 前日からの持ち越しポジション（残高）を確認中...")
+    async def sync_positions(self, is_startup=False):
+        if is_startup:
+            logger.info("🔄 持ち越しポジション（残高）を確認中...")
+            
         product = 1 if self.config.TRADE_MODE == "CASH" else 2
         positions_data = await self.api.get_positions(product=product)
         
         if not positions_data:
-            logger.info("保有しているポジションはありませんでした。")
+            if is_startup:
+                logger.info("保有しているポジションはありませんでした。")
             return
 
         for p in positions_data:
@@ -257,8 +280,18 @@ class PortfolioManager:
             exchange = p.get("Exchange", self.config.EXCHANGE)
             
             if qty > 0 and symbol:
-                self.add_position(symbol, qty, entry_price, hold_id, exchange)
-                logger.info(f"📥 既存ポジションを認識しました: {symbol} (市場: {exchange})")
+                if symbol not in self.positions:
+                    self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                    logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange})")
+                else:
+                    # 🔥 追加: 予約中の注文が約定してHoldIDが付与されたら、正式な価格に更新する
+                    pos = self.positions[symbol]
+                    if pos.hold_id is None and hold_id is not None:
+                        pos.hold_id = hold_id
+                        pos.entry_price = entry_price
+                        pos.take_profit_price = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
+                        pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
+                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(正確な取得単価: {entry_price:,.1f}円)")
 
     async def check_barriers(self):
         for symbol, pos in list(self.positions.items()):
@@ -274,7 +307,6 @@ class PortfolioManager:
 
             if current_price is None: continue
             
-            # 🔥 価格が前回ログに出力した時と「変化」している場合のみ出力する
             if current_price != pos.last_logged_price:
                 logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
                 pos.last_logged_price = current_price
@@ -368,7 +400,11 @@ async def main():
 
     portfolio = PortfolioManager(config, api)
     
-    await portfolio.sync_positions()
+    # 起動時の残高確認
+    await portfolio.sync_positions(is_startup=True)
+
+    # 🔥 追加: 現在出ている「未約定の注文」を確認
+    active_orders_count, active_order_symbols = await get_active_orders(api)
 
     try:
         now = datetime.now()
@@ -386,8 +422,14 @@ async def main():
                     logger.info(f"🚫 [見送り] {sig['name']} ({sig['symbol']}) は既に保有中のため追加購入しません(重複防止)。")
                     continue
                     
-                if len(portfolio.positions) >= config.MAX_POSITIONS:
-                    logger.warning(f"🚫 最大保有銘柄数({config.MAX_POSITIONS})に達しているため、新規エントリーを見送ります。")
+                # 🔥 追加: すでに「予約中」の注文がある銘柄の二重発注を防止
+                if sig['symbol'] in active_order_symbols:
+                    logger.info(f"🚫 [見送り] {sig['name']} ({sig['symbol']}) は現在「注文中(予約中)」のため追加購入しません。")
+                    continue
+                    
+                # 🔥 修正: 最大保有枠のカウントに「注文中の数」も含める
+                if len(portfolio.positions) + active_orders_count >= config.MAX_POSITIONS:
+                    logger.warning(f"🚫 最大保有数(保有 {len(portfolio.positions)} + 注文中 {active_orders_count} = 最大 {config.MAX_POSITIONS})に達しているため、新規エントリーを見送ります。")
                     break
 
                 logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']}) - 確率: {sig['prob']}%")
@@ -429,13 +471,18 @@ async def main():
                 if res and res.get("Result") == 0:
                     logger.info(f"✅ エントリー注文送信成功")
                     portfolio.add_position(sig['symbol'], qty, current_price, None, config.EXCHANGE)
+                    active_orders_count += 1
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
         has_force_closed_today = False
         
-        if portfolio.positions:
+        # 🔥 修正: 予約中の注文が1つでもある場合、約定を待つために監視ループに突入する
+        if portfolio.positions or active_orders_count > 0:
             logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
+            
+            sync_counter = 0 # 定期的に証券口座の情報を同期するためのカウンター
+            
             while True:
                 now = datetime.now()
                 
@@ -454,11 +501,20 @@ async def main():
                         logger.info(f"📦 現在の持ち越し銘柄数: {len(portfolio.positions)}銘柄 (スイングモードで翌日に持ち越します)")
                     break
 
+                # 🔥 追加: 15秒に1回、証券口座の残高を再確認して、約定した予約注文を正式に拾い上げる
+                sync_counter += 1
+                if sync_counter >= 3:
+                    await portfolio.sync_positions(is_startup=False)
+                    sync_counter = 0
+
                 await portfolio.check_barriers()
                 
                 if not portfolio.positions and config.TRADE_STYLE == "day":
-                    logger.info("📉 全てのポジションの決済が完了しました。")
-                    break
+                    # 🔥 修正: 本当に未約定の注文もゼロになったかを確認してからループを抜ける
+                    active_count, _ = await get_active_orders(api)
+                    if active_count == 0:
+                        logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。")
+                        break
 
                 await asyncio.sleep(5)
 
