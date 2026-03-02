@@ -136,7 +136,8 @@ def perform_login():
     print(f"🎊 ログイン完了。メイン画面の起動をさらに {FIXED_WAIT} 秒間待ちます。")
     for i in range(FIXED_WAIT):
         time.sleep(10)
-        print(f"...最終起動待機中 ({ (i+1)*10 }/{FIXED_WAIT}秒経過)")
+        if (i + 1) % 10 == 0:
+            print(f"...最終起動待機中 ({i + 1}/{FIXED_WAIT}秒経過)")
     
     print("✅ すべての準備が整いました。")
 
