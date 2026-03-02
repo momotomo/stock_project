@@ -534,8 +534,13 @@ async def main():
                 
                 if not portfolio.positions and config.TRADE_STYLE == "day":
                     if active_count == 0:
-                        logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。")
-                        break
+                        # 🔥 追加: 終了する前に「すれ違いで約定した直後ではないか」念のため最終確認をする
+                        await portfolio.sync_positions(is_startup=False)
+                        
+                        # 最終確認しても本当に持っていなかった場合のみ終了する
+                        if not portfolio.positions:
+                            logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。")
+                            break
 
                 await asyncio.sleep(5)
 
