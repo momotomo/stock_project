@@ -88,8 +88,21 @@ def main():
         time.sleep(10)
 
         # 3. AI予測バッチの実行 (シグナル生成)
-        logger.info("\n▶️ [STEP 2] daily_batch.py を実行...")
-        subprocess.run([sys.executable, "daily_batch.py"], check=True)
+        logger.info("\n▶️ [STEP 2] daily_batch.py の実行判定...")
+        
+        # 今日すでに実行されたかを recommendations.csv の更新日時でチェック
+        run_batch = True
+        rec_file = "recommendations.csv"
+        if os.path.exists(rec_file):
+            mtime = os.path.getmtime(rec_file)
+            mdate = datetime.fromtimestamp(mtime).date()
+            if mdate == datetime.now().date():
+                logger.info(f"✅ 本日のAI予測データ({rec_file})は作成済みのため、AI予測バッチ処理をスキップします。")
+                run_batch = False
+        
+        if run_batch:
+            logger.info("🤖 本日のAI予測バッチを実行します。時間がかかる場合があります...")
+            subprocess.run([sys.executable, "daily_batch.py"], check=True)
 
         # 4. 自動売買エンジンの実行（発注・監視）
         logger.info("\n▶️ [STEP 3] auto_trade.py を実行...")
