@@ -2,7 +2,7 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+import lightgbm as lgb
 from sklearn.preprocessing import RobustScaler
 import os
 import plotly.express as px
@@ -16,7 +16,6 @@ warnings.simplefilter('ignore', ResourceWarning)
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
 
 def get_tickers():
-    """外部ファイル(tickers.txt)から監視リストを読み込む関数"""
     tickers = {}
     if os.path.exists("tickers.txt"):
         with open("tickers.txt", "r", encoding="utf-8") as f:
@@ -26,7 +25,6 @@ def get_tickers():
                     tickers[name.strip()] = ticker.strip()
     return tickers
 
-# --- Secrets読込バックアップ機能 ---
 def get_secret(key):
     if key in st.secrets:
         return st.secrets[key]
@@ -44,7 +42,6 @@ def get_secret(key):
             pass
     return None
 
-# --- 分析・特徴量作成関数（共通化） ---
 @st.cache_data(show_spinner=False)
 def get_macro_data():
     macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret"}
@@ -60,7 +57,6 @@ def get_macro_data():
     except Exception:
         return pd.DataFrame()
 
-# 🔥 フラクショナル・ディファレンス（分数次階差）の計算関数
 def calc_fractional_diff(series, d=0.5, window=20):
     weights = [1.0]
     for k in range(1, window):
@@ -77,15 +73,11 @@ def get_stock_features(ticker, macro_returns):
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
-    
-    # 🟢 ステップ1-A: フラクショナル・ディファレンス (トレンドと定常性の両立)
     data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
     
-    # ATR（ボラティリティの算出）
     tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
     data['ATR'] = tr.rolling(14).mean() / data['Close']
     
-    # 🟢 ステップ1-B: ボラティリティによる正規化 (ノイズの排除)
     data['Disparity_5'] = (data['Close'] / data['Close'].rolling(5).mean()) - 1
     data['Disparity_25'] = (data['Close'] / data['Close'].rolling(25).mean()) - 1
     
@@ -141,11 +133,10 @@ def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
             labels[i] = 0
     return labels
 
-st.title("🚀 AI株価スクリーニングダッシュボード")
+st.title("🚀 AI株価スクリーニングダッシュボード (LightGBM版)")
 
 tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 バックテスト (検証)"])
 
-# --- サイドバー設定 ---
 st.sidebar.header("⚙️ 分析銘柄の設定")
 TICKERS_FILE = "tickers.txt"
 
@@ -153,14 +144,12 @@ def load_tickers_text():
     if os.path.exists(TICKERS_FILE):
         with open(TICKERS_FILE, "r", encoding="utf-8") as f:
             return f.read()
-    return "トヨタ自動車, 7203.T\n三菱UFJ, 8306.T\nソニーG, 6758.T\nソフトバンクG, 9984.T\n任天堂, 7974.T"
+    return "トヨタ自動車, 7203.T\n三菱UFJ, 8306.T"
 
 ticker_input = st.sidebar.text_area(
     "監視リスト", value=load_tickers_text(), height=300,
     help="1行に1銘柄ずつ「銘柄名, ティッカー」の形式で入力"
 )
-
-st.sidebar.write("デバッグ用:", st.secrets.keys())
 
 if st.sidebar.button("💾 監視リストを保存・同期", use_container_width=True):
     with open(TICKERS_FILE, "w", encoding="utf-8") as f:
@@ -183,12 +172,9 @@ if st.sidebar.button("💾 監視リストを保存・同期", use_container_wid
     else:
         st.sidebar.warning("✅ ローカルに保存しました（クラウド同期未設定）")
 
-# ==========================================
-# タブ1：今日の分析 ＆ AIおすすめ
-# ==========================================
 with tab1:
     st.subheader("🌟 AIが選ぶ本日のおすすめ銘柄 (自動更新)")
-    st.write("設定された銘柄のチャートをAIがスキャンし、目的に合わせたトップ銘柄を厳選しています。")
+    st.write("設定された銘柄のチャートをLightGBMがスキャンし、トップ銘柄を厳選しています。")
     
     rec_file = 'recommendations.csv'
     if os.path.exists(rec_file) and os.path.getsize(rec_file) > 0:
@@ -201,7 +187,7 @@ with tab1:
                 cols_s = st.columns(3)
                 for i, (_, row) in enumerate(short_top.iterrows()):
                     with cols_s[i]:
-                        st.info(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n短期期待値: **{row.get('短期スコア', 0):.1f}%**\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
+                        st.info(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n短期期待値: **{row.get('短期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
             
             st.markdown("### 🔭 中長期取引向け（1ヶ月〜1年）トップ3")
             if "中長期スコア" in df_rec.columns:
@@ -209,7 +195,7 @@ with tab1:
                 cols_l = st.columns(3)
                 for i, (_, row) in enumerate(long_top.iterrows()):
                     with cols_l[i]:
-                        st.success(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n中長期期待値: **{row.get('中長期スコア', 0):.1f}%**\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
+                        st.success(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n中長期期待値: **{row.get('中長期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
                     
             with st.expander("👉 スキャン対象の全データを詳しく見る"):
                 st.dataframe(df_rec, hide_index=True, use_container_width=True)
@@ -217,8 +203,6 @@ with tab1:
             st.error(f"おすすめデータの読み込みに失敗しました: {e}")
 
     st.subheader("🔍 あなたの監視リストの手動分析（全スパン）")
-    
-    # 常に tickers.txt の最新のリストを読み込んで使用する
     tickers = get_tickers()
     
     if st.button("🚀 監視銘柄の最新分析を実行", type="primary") and tickers:
@@ -226,13 +210,12 @@ with tab1:
         tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
         pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
 
-        with st.spinner('データを取得し、AIモデルを学習しています...'):
+        with st.spinner('データを取得し、LightGBMを学習しています...'):
             macro_returns = get_macro_data()
             for name, ticker in tickers.items():
                 data = get_stock_features(ticker, macro_returns)
                 if data is None: continue
                 
-                # 特徴量リストを「定常化・正規化」された高度なものに更新
                 features = [
                     'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
                     'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
@@ -253,7 +236,7 @@ with tab1:
                 X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=features)
                 latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[features]), index=latest_data.index, columns=features)
                 
-                clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
                 y_train_tom = historical_data['Target_Class']
                 if len(np.unique(y_train_tom)) > 1:
                     clf.fit(X_scaled, y_train_tom)
@@ -261,7 +244,7 @@ with tab1:
                 else:
                     prob_up = 0.0
                 
-                reg = RandomForestRegressor(n_estimators=100, max_depth=5, random_state=42)
+                reg = lgb.LGBMRegressor(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
                 reg.fit(X_scaled, historical_data['Target_Price'])
                 pred_price = reg.predict(latest_X_scaled)[0]
                 
@@ -292,17 +275,12 @@ with tab1:
         if results:
             df_res = pd.DataFrame(results).sort_values("明日の上昇確率", ascending=False)
             st.write("### 📊 本日の分析結果（全スパン）")
-            
             cfg = {"現在価格": st.column_config.NumberColumn(format="¥%.1f"), "予測価格": st.column_config.NumberColumn(format="¥%.1f")}
             for col in df_res.columns:
                 if "確率" in col or "利確" in col:
                     cfg[col] = st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
-            
             st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True)
 
-# ==========================================
-# タブ2：過去の予測推移
-# ==========================================
 with tab2:
     st.write("### 📈 AI予測の過去の推移")
     csv_file = 'prediction_history.csv'
@@ -327,18 +305,14 @@ with tab2:
                 
                 st.markdown("---")
                 st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
-                
                 tickers_dict = get_tickers()
                 selected_ticker = tickers_dict.get(selected_stock, "")
                 default_lot = 100 if selected_ticker.endswith(".T") else 1
                 
                 col_sim1, col_sim2, col_sim3 = st.columns(3)
-                with col_sim1:
-                    sim_threshold = st.slider("買い条件（明日の上昇確率 ％以上）", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
-                with col_sim2:
-                    sim_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="tab2_cash")
-                with col_sim3:
-                    sim_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1, key="tab2_lot")
+                with col_sim1: sim_threshold = st.slider("買い条件", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
+                with col_sim2: sim_initial_cash = st.number_input("初期資金", value=1000000, step=100000, key="tab2_cash")
+                with col_sim3: sim_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1, key="tab2_lot")
                 
                 cash = sim_initial_cash
                 sim_history = []
@@ -347,47 +321,32 @@ with tab2:
                     current_date = df_s.iloc[i]['Date']
                     current_price = df_s.iloc[i]['今日の終値']
                     current_prob = df_s.iloc[i]['明日の上昇確率']
-                    
                     profit = 0
                     executed = False
                     
                     if i < len(df_s) - 1:
                         next_price = df_s.iloc[i+1]['今日の終値']
                         required_cash = current_price * sim_lot_size
-                        
                         if current_prob >= sim_threshold and cash >= required_cash:
                             profit = (next_price - current_price) * sim_lot_size
                             cash += profit
                             executed = True
                             
                     sim_history.append({
-                        'Date': current_date,
-                        '今日の終値': current_price,
-                        '明日の上昇確率': current_prob,
-                        'シグナル': "買い" if executed else "-",
-                        '損益(円)': profit if executed else 0,
-                        '仮想累積資産(円)': cash
+                        'Date': current_date, '今日の終値': current_price, '明日の上昇確率': current_prob,
+                        'シグナル': "買い" if executed else "-", '損益(円)': profit if executed else 0, '仮想累積資産(円)': cash
                     })
                 
                 df_sim = pd.DataFrame(sim_history)
-                
-                fig2 = px.line(df_sim, x='Date', y='仮想累積資産(円)', title=f"{selected_stock} の仮想累積資産推移 (円)", markers=True)
+                fig2 = px.line(df_sim, x='Date', y='仮想累積資産(円)', title=f"{selected_stock} の仮想累積資産推移", markers=True)
                 fig2.add_hline(y=sim_initial_cash, line_dash="dash", line_color="gray", annotation_text="初期資金")
                 st.plotly_chart(fig2, use_container_width=True)
                 
-                st.write("#### データ詳細（最新順）")
-                st.dataframe(df_sim.sort_values('Date', ascending=False), hide_index=True, use_container_width=True)
         except Exception as e:
             st.error(f"履歴データの読み込みエラー: {e}")
-    else:
-        st.info("まだ履歴データがありません。自動実行が開始されるまでお待ちください。")
 
-# ==========================================
-# タブ3：バックテスト (検証)
-# ==========================================
 with tab3:
-    st.write("### 📊 AIシグナルによる運用シミュレーション")
-    
+    st.write("### 📊 AIシグナルによる運用シミュレーション (Purged Walk-Forward)")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -397,14 +356,13 @@ with tab3:
             bt_stock_name = st.selectbox("検証する銘柄", list(tickers_dict.keys()), key="bt_stock")
             bt_ticker = tickers_dict[bt_stock_name]
             default_lot = 100 if str(bt_ticker).endswith(".T") else 1
-            bt_lot_size = st.number_input("1回の購入株数（単元株数）", value=default_lot, step=1)
+            bt_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1)
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
-            bt_threshold = st.slider("買い条件（明日の上昇確率が何％以上で買うか）", min_value=50, max_value=80, value=55, step=1)
-            
+            bt_threshold = st.slider("買い条件（確率％）", min_value=50, max_value=80, value=55, step=1)
         with col2:
             bt_tp = st.number_input("利確幅（％）", value=5.0, step=1.0) / 100.0
             bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
-            bt_hold_days = st.number_input("最大保有日数（強制決済）", value=5, step=1)
+            bt_hold_days = st.number_input("最大保有日数", value=5, step=1)
 
         @st.cache_data(show_spinner=False)
         def run_purged_walk_forward_cv(ticker, hold_days):
@@ -418,15 +376,10 @@ with tab3:
                 'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
             ]
             data_features = data.dropna(subset=features + ['Target_Class'])
-            
             if len(data_features) <= 300: return None, None
             
-            # 🔥 🟢 ステップ2: Purged Walk-Forward Cross Validation（パージング付きウォークフォワード検証）
-            # 過去5年間のデータを4つに分割し、境界線の「カンニング（リーケージ）」を防ぐために
-            # 最大保有日数分(hold_days)のデータを意図的に「パージ（捨てる）」してからテストを行います。
             n_splits = 4 
             purge_days = int(hold_days) + 1 
-            
             test_probs_all = pd.Series(dtype=float)
             test_data_all = pd.DataFrame()
             
@@ -435,16 +388,12 @@ with tab3:
             
             for i in range(n_splits):
                 train_end = (i + 1) * fold_size
-                test_start = train_end + purge_days # 🔥 情報漏洩を防ぐためパージ期間を空ける！
+                test_start = train_end + purge_days
                 test_end = test_start + fold_size if i < n_splits - 1 else len(data_features)
-                
                 if test_start >= len(data_features): break
                 
-                train_idx = indices[:train_end]
-                test_idx = indices[test_start:test_end]
-                
-                train_data = data_features.iloc[train_idx]
-                test_data = data_features.iloc[test_idx]
+                train_data = data_features.iloc[indices[:train_end]]
+                test_data = data_features.iloc[indices[test_start:test_end]]
                 
                 X_train = train_data[features]
                 y_train = train_data['Target_Class']
@@ -454,7 +403,7 @@ with tab3:
                 X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
                 X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=features)
                 
-                clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
                 clf.fit(X_train_scaled, y_train)
                 
                 probs = clf.predict_proba(X_test_scaled)[:, 1]
@@ -469,11 +418,8 @@ with tab3:
 
             if test_data is not None and test_probs is not None:
                 cash = bt_initial_cash
-                position = 0
-                entry_price = 0
-                days_held = 0
-                trades = []
-                history = []
+                position = 0; entry_price = 0; days_held = 0
+                trades = []; history = []
                 
                 initial_price = test_data['Close'].iloc[0]
                 bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
@@ -490,10 +436,7 @@ with tab3:
                         if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
                             profit = position * (current_price - entry_price)
                             cash += position * current_price
-                            trades.append({
-                                '決済日': current_date.strftime('%Y-%m-%d'),
-                                '損益(円)': int(profit),
-                            })
+                            trades.append({'決済日': current_date.strftime('%Y-%m-%d'), '損益(円)': int(profit)})
                             position = 0; entry_price = 0; days_held = 0
                     
                     if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
@@ -508,7 +451,6 @@ with tab3:
                 
                 history_df = pd.DataFrame(history)
                 trades_df = pd.DataFrame(trades)
-                
                 final_equity = history_df.iloc[-1]['AI戦略の資産']
                 total_profit = final_equity - bt_initial_cash
                 profit_pct = (total_profit / bt_initial_cash) * 100
@@ -517,14 +459,11 @@ with tab3:
                     
                 st.write("---")
                 if trades_df.empty and bh_shares == 0:
-                    st.warning(f"⚠️ 初期資金（{bt_initial_cash}円）が足りず、一度も購入できませんでした。")
+                    st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
                 
                 mcol1, mcol2, mcol3, mcol4 = st.columns(4)
                 mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
                 mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
                 mcol3.metric("勝率", f"{win_rate:.1f}%")
                 mcol4.metric("取引回数", f"{len(trades_df)}回")
-                
                 st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）"), use_container_width=True)
-            else:
-                st.warning("データ不足のためバックテストを実行できません。")

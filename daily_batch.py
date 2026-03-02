@@ -1,251 +1,521 @@
+import asyncio
+import time
+import logging
+import aiohttp
+import csv
 import os
 import yaml
-import logging
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import cross_val_predict
-from sklearn.preprocessing import RobustScaler
-import csv
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Dict, List
 
 # =========================================================
-# AI予測バッチ処理 (daily_batch.py) - 高度アーキテクチャ・外部リスト対応版
+# kabuステーション 自動取引エンジン (通知機能なし・ローカル完結版)
 # =========================================================
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
+# --- ログ設定 ---
+os.makedirs("logs", exist_ok=True)
+log_filename = f"logs/auto_trade_{datetime.now().strftime('%Y%m%d')}.log"
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
-# --- 分析・特徴量作成関数（app.pyと完全同期） ---
-def get_macro_data():
-    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret"}
-    try:
-        macro_df = yf.download(list(macro_tickers.keys()), period="5y", progress=False)
-        if isinstance(macro_df.columns, pd.MultiIndex):
-            macro_data = macro_df.xs('Close', level=0, axis=1) if 'Close' in macro_df.columns.levels[0] else macro_df
+# --- システム設定 (Config) ---
+class Config:
+    def __init__(self):
+        self.config_file = "settings.yml"
+        self.load_config()
+
+    def load_config(self):
+        default_config = {
+            "IS_PRODUCTION": False,
+            "API_PASSWORD": "YOUR_API_PASSWORD",
+            "TRADE_PASSWORD": "YOUR_TRADE_PASSWORD",
+            "EXCHANGE": 9,
+            "TRADE_STYLE": "day",             
+            "TARGET_HORIZON": "短期",         
+            "TRADE_MODE": "CASH",
+            "ACCOUNT_TYPE": 4,
+            "MAX_POSITIONS": 1,
+            "LOT_CALC_MODE": "KELLY", 
+            "FIXED_LOT_SIZE": 100,
+            "AUTO_INVEST_RATIO": 0.3,
+            "ENTRY_THRESHOLD_PROB": 55.0,
+            "TAKE_PROFIT_PCT": 0.05,
+            "STOP_LOSS_PCT": 0.05
+        }
+
+        if not os.path.exists(self.config_file):
+            self.config_data = default_config
         else:
-            macro_data = macro_df['Close']
-        macro_returns = np.log(macro_data / macro_data.shift(1)).rename(columns=macro_tickers)
-        macro_returns.index = pd.to_datetime(macro_returns.index).map(lambda x: x.replace(tzinfo=None).normalize())
-        return macro_returns
-    except Exception as e:
-        logger.warning(f"マクロデータの取得に失敗しました: {e}")
-        return pd.DataFrame()
+            try:
+                with open(self.config_file, 'r', encoding='utf-8') as f:
+                    self.config_data = yaml.safe_load(f)
+                logger.info(f"⚙️ 設定ファイル '{self.config_file}' を読み込みました。")
+            except Exception as e:
+                logger.error(f"❌ 設定ファイルの読み込みに失敗しました。デフォルト設定を使用します: {e}")
+                self.config_data = default_config
 
-def calc_fractional_diff(series, d=0.5, window=20):
-    weights = [1.0]
-    for k in range(1, window):
-        weights.append(-weights[-1] * (d - k + 1) / k)
-    weights = np.array(weights)[::-1]
-    return series.rolling(window).apply(lambda x: np.dot(weights, x), raw=True)
+        self.IS_PRODUCTION = self.config_data.get("IS_PRODUCTION", default_config["IS_PRODUCTION"])
+        self.PORT = 18080 if self.IS_PRODUCTION else 18081
+        self.API_URL = f"http://localhost:{self.PORT}/kabusapi"
+        
+        self.API_PASSWORD = str(self.config_data.get("API_PASSWORD", default_config["API_PASSWORD"]))
+        self.TRADE_PASSWORD = str(self.config_data.get("TRADE_PASSWORD", default_config["TRADE_PASSWORD"]))
+        self.EXCHANGE = int(self.config_data.get("EXCHANGE", default_config["EXCHANGE"]))
+        
+        self.TRADE_STYLE = self.config_data.get("TRADE_STYLE", default_config["TRADE_STYLE"])
+        self.TARGET_HORIZON = str(self.config_data.get("TARGET_HORIZON", default_config["TARGET_HORIZON"]))
 
-def get_stock_features(ticker, macro_returns):
-    data = yf.download(ticker, period="5y", progress=False)
-    if data.empty: return None
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
-    data = data.loc[:, ~data.columns.duplicated()].copy()
-    data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
-    
-    # 基本リターン
-    data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
-    
-    # 🟢 ステップ1-A: フラクショナル・ディファレンス
-    data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
-    
-    # ATR（ボラティリティの算出）
-    tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
-    data['ATR'] = tr.rolling(14).mean() / data['Close']
-    
-    # 🟢 ステップ1-B: ボラティリティによる正規化
-    data['Disparity_5'] = (data['Close'] / data['Close'].rolling(5).mean()) - 1
-    data['Disparity_25'] = (data['Close'] / data['Close'].rolling(25).mean()) - 1
-    
-    data['Log_Return_Norm'] = data['Log_Return'] / (data['ATR'] + 1e-9)
-    data['Disparity_5_Norm'] = data['Disparity_5'] / (data['ATR'] + 1e-9)
-    data['Disparity_25_Norm'] = data['Disparity_25'] / (data['ATR'] + 1e-9)
-    
-    data['SMA_Cross'] = (data['Close'].rolling(5).mean() / data['Close'].rolling(25).mean()) - 1
-    
-    delta = data['Close'].diff()
-    up, down = delta.clip(lower=0), -1 * delta.clip(upper=0)
-    ema_up, ema_down = up.ewm(com=13, adjust=False).mean(), down.ewm(com=13, adjust=False).mean()
-    data['RSI_14'] = 100 - (100 / (1 + (ema_up / ema_down)))
-    
-    std_20 = data['Close'].rolling(20).std()
-    ma_20 = data['Close'].rolling(20).mean()
-    data['BB_PctB'] = (data['Close'] - (ma_20 - 2*std_20)) / (4*std_20 + 1e-9)
-    data['BB_Bandwidth'] = (4*std_20) / (data['Close'].rolling(25).mean() + 1e-9)
-    data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
-    data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
-    
-    data.replace([np.inf, -np.inf], np.nan, inplace=True)
-    if not macro_returns.empty: data = data.join(macro_returns)
-    for col in ['USDJPY_Ret', 'SP500_Ret']:
-        if col not in data.columns: data[col] = 0.0
-    data[['USDJPY_Ret', 'SP500_Ret']] = data[['USDJPY_Ret', 'SP500_Ret']].ffill().fillna(0)
-    
-    # ターゲット（明日上がるか）
-    data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-    return data
+        self.TRADE_MODE = self.config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
+        self.ACCOUNT_TYPE = int(self.config_data.get("ACCOUNT_TYPE", default_config["ACCOUNT_TYPE"]))
+        
+        self.MAX_POSITIONS = self.config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
+        self.LOT_CALC_MODE = self.config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
+        self.FIXED_LOT_SIZE = self.config_data.get("FIXED_LOT_SIZE", default_config["FIXED_LOT_SIZE"])
+        self.AUTO_INVEST_RATIO = float(self.config_data.get("AUTO_INVEST_RATIO", default_config["AUTO_INVEST_RATIO"]))
+        
+        self.ENTRY_THRESHOLD_PROB = float(self.config_data.get("ENTRY_THRESHOLD_PROB", default_config["ENTRY_THRESHOLD_PROB"]))
+        self.TAKE_PROFIT_PCT = float(self.config_data.get("TAKE_PROFIT_PCT", default_config["TAKE_PROFIT_PCT"]))
+        self.STOP_LOSS_PCT = float(self.config_data.get("STOP_LOSS_PCT", default_config["STOP_LOSS_PCT"]))
 
-def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
-    vals = prices.values
-    n = len(vals)
-    labels = np.full(n, np.nan)
-    for i in range(n - horizon):
-        p0 = vals[i]
-        ub = p0 * (1 + pt_pct)
-        lb = p0 * (1 - sl_pct)
-        path = vals[i+1 : i+1+horizon]
-        hit_ub = np.where(path >= ub)[0]
-        hit_lb = np.where(path <= lb)[0]
-        first_ub = hit_ub[0] if len(hit_ub) > 0 else horizon + 1
-        first_lb = hit_lb[0] if len(hit_lb) > 0 else horizon + 1
-        if first_ub == (horizon + 1) and first_lb == (horizon + 1):
-            labels[i] = 0
-        elif first_ub < first_lb:
-            labels[i] = 1
-        elif first_lb < first_ub:
-            labels[i] = -1
+# --- トークンバケット ---
+class TokenBucket:
+    def __init__(self, capacity: int, fill_rate: float):
+        self.capacity = capacity
+        self.tokens = capacity
+        self.fill_rate = fill_rate
+        self.last_fill = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def consume(self, amount: int = 1):
+        async with self.lock:
+            while True:
+                now = time.monotonic()
+                elapsed = now - self.last_fill
+                self.tokens = min(self.capacity, self.tokens + elapsed * self.fill_rate)
+                self.last_fill = now
+                if self.tokens >= amount:
+                    self.tokens -= amount
+                    return
+                await asyncio.sleep(0.1)
+
+# --- APIクライアント ---
+class KabuAPI:
+    def __init__(self, config: Config):
+        self.config = config
+        self.token = None
+        self.session = None
+        self.bucket = TokenBucket(capacity=5, fill_rate=5.0)
+
+    async def start_session(self):
+        self.session = aiohttp.ClientSession()
+
+    async def close_session(self):
+        if self.session:
+            await self.session.close()
+
+    async def _request(self, method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
+        await self.bucket.consume()
+        url = f"{self.config.API_URL}/{endpoint}"
+        headers = {"X-API-KEY": self.token} if self.token else {}
+        
+        try:
+            async with self.session.request(method, url, headers=headers, json=data, params=params) as response:
+                if response.status != 200:
+                    error_text = await response.text()
+                    logger.error(f"API HTTP Error {response.status} at {endpoint}: {error_text}")
+                response.raise_for_status()
+                return await response.json()
+        except Exception as e:
+            logger.error(f"API Request Exception ({endpoint}): {e}")
+            return None
+
+    async def get_token(self):
+        data = {"APIPassword": self.config.API_PASSWORD}
+        res = await self._request("POST", "token", data=data)
+        if res and "Token" in res:
+            self.token = res["Token"]
+            logger.info("✅ トークン取得成功")
         else:
-            labels[i] = 0
-    return labels
+            logger.error("❌ トークン取得失敗")
 
-def get_tickers():
-    # 🔥 修正: ハードコーディングを廃止し、外部ファイル(tickers.txt)からのみ読み込む
-    tickers = {}
+    async def get_board(self, symbol: str, exchange: int):
+        return await self._request("GET", f"board/{symbol}@1")
+
+    async def get_wallet_cash(self):
+        return await self._request("GET", "wallet/cash")
+
+    async def get_wallet_margin(self, symbol: str, exchange: int):
+        return await self._request("GET", f"wallet/margin/{symbol}@1")
+
+    async def get_positions(self, product: int = 0):
+        return await self._request("GET", "positions", params={"product": product})
+
+    async def get_orders(self, product: int = 0):
+        params = {"product": product} if product != 0 else {}
+        return await self._request("GET", "orders", params=params)
+
+    async def send_order(self, symbol: str, side: str, qty: int, price: float = 0, is_close: bool = False, hold_id: str = None, exchange: int = None):
+        if self.config.TRADE_MODE == "CASH":
+            cash_margin = 1
+            margin_trade_type = 1 
+            deliv_type = 2 if side == "2" else 0
+            fund_type = "AA" if side == "2" else "  "  
+        else:
+            cash_margin = 3 if is_close else 2
+            margin_trade_type = 1 
+            deliv_type = 0
+            fund_type = "  "
+
+        target_exchange = exchange if exchange is not None else self.config.EXCHANGE
+
+        order_data = {
+            "Password": self.config.TRADE_PASSWORD,
+            "Symbol": str(symbol),
+            "Exchange": int(target_exchange),
+            "SecurityType": 1,
+            "Side": str(side),
+            "CashMargin": cash_margin,
+            "MarginTradeType": margin_trade_type, 
+            "MarginPremiumUnit": 1, 
+            "DelivType": deliv_type,
+            "FundType": fund_type, 
+            "AccountType": self.config.ACCOUNT_TYPE,
+            "Qty": int(qty),
+            "Price": int(price) if price == 0 else float(price),
+            "ExpireDay": 0,
+            "FrontOrderType": 10
+        }
+
+        if self.config.TRADE_MODE == "MARGIN" and is_close:
+            if hold_id:
+                order_data["ClosePositions"] = [{"HoldID": hold_id, "Qty": int(qty)}]
+            else:
+                logger.warning("⚠️ 信用返済ですが建玉ID(HoldID)が指定されていません")
+
+        action = "買" if side == "2" else "売"
+        trade_type_str = "現物" if self.config.TRADE_MODE == "CASH" else ("信用返済" if is_close else "信用新規")
+        
+        if not self.config.IS_PRODUCTION:
+            logger.info(f"🧪 [シミュレーター] 発注スキップ [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
+            return {"Result": 0, "OrderId": "SIM_" + str(int(time.time()))}
+
+        logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
+        return await self._request("POST", "sendorder", data=order_data)
+
+# --- 未約定の注文を取得する関数 (ログ出力フラグを追加) ---
+async def get_active_orders(api: KabuAPI, log: bool = True):
+    active_count = 0
+    active_symbols = []
+    active_details = []
+    orders = await api.get_orders()
+    if orders:
+        for order in orders:
+            state = order.get("State")
+            order_qty = order.get("OrderQty", 0)
+            cum_qty = order.get("CumQty", 0)
+            side = order.get("Side")
+            
+            if state != 5 and cum_qty < order_qty:
+                symbol = order.get("Symbol")
+                active_count += 1
+                if symbol:
+                    active_symbols.append(symbol)
+                    active_details.append({
+                        "symbol": symbol,
+                        "state": state,
+                        "order_qty": order_qty,
+                        "cum_qty": cum_qty,
+                        "side": side
+                    })
+                if log:
+                    logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol} (State: {state}, 注文数: {order_qty}, 約定済: {cum_qty})")
+    return active_count, active_symbols, active_details
+
+# --- ポジション管理 ---
+@dataclass
+class Position:
+    symbol: str
+    qty: int
+    entry_price: float
+    take_profit_price: float
+    stop_loss_price: float
+    highest_price: float = 0.0  # 🔥 トレールストップ用: 保有中の最高値
+    hold_id: str = None
+    exchange: int = 1
+    last_logged_price: float = 0.0
+
+class PortfolioManager:
+    def __init__(self, config: Config, api: KabuAPI):
+        self.config = config
+        self.api = api
+        self.positions: Dict[str, Position] = {}
+
+    def add_position(self, symbol: str, qty: int, entry_price: float, hold_id: str = None, exchange: int = 1):
+        tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
+        sl = entry_price * (1 - self.config.STOP_LOSS_PCT)
+        self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, entry_price, hold_id, exchange)
+        mode_str = "現物" if self.config.TRADE_MODE == "CASH" else "信用"
+        logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円 / 市場: {exchange})")
+
+    async def sync_positions(self, is_startup=False):
+        if is_startup:
+            logger.info("🔄 持ち越しポジション（残高）を確認中...")
+            
+        product = 1 if self.config.TRADE_MODE == "CASH" else 2
+        positions_data = await self.api.get_positions(product=product)
+        
+        if not positions_data:
+            if is_startup:
+                logger.info("保有しているポジションはありませんでした。")
+            return
+
+        found_positions = False
+        for p in positions_data:
+            symbol = p.get("Symbol")
+            
+            leaves_qty = int(p.get("LeavesQty", 0) or 0)
+            hold_qty = int(p.get("HoldQty", 0) or 0)
+            qty = leaves_qty + hold_qty
+            
+            entry_price = float(p.get("Price", 0) or 0)
+            hold_id = p.get("HoldID")
+            exchange = p.get("Exchange", self.config.EXCHANGE)
+            
+            if qty > 0 and symbol:
+                found_positions = True
+                if symbol not in self.positions:
+                    self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                    if not is_startup:
+                        logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol}")
+                    else:
+                        logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange})")
+                else:
+                    pos = self.positions[symbol]
+                    if pos.hold_id is None and hold_id is not None:
+                        pos.hold_id = hold_id
+                        pos.entry_price = entry_price
+                        pos.highest_price = entry_price
+                        pos.take_profit_price = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
+                        pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
+                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(正確な取得単価: {entry_price:,.1f}円)")
+        
+        if is_startup and not found_positions and len(positions_data) > 0:
+            logger.info("保有しているポジションはありませんでした。")
+
+    async def check_barriers(self):
+        for symbol, pos in list(self.positions.items()):
+            board = await self.api.get_board(symbol, self.config.EXCHANGE)
+            if not board: continue
+            
+            current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+            
+            if not self.config.IS_PRODUCTION and current_price is None:
+                import random
+                fluctuation = pos.entry_price * random.uniform(-0.1, 0.1)
+                current_price = pos.entry_price + fluctuation
+
+            if current_price is None: continue
+
+            # 🔥 究極の機能：トレーリングストップ（利益を逃さない仕組み）
+            if current_price > pos.highest_price:
+                pos.highest_price = current_price
+                
+                # 買値を上回っている場合、損切ラインを「現在値 - 損切幅」に引き上げていく
+                if current_price > pos.entry_price:
+                    new_sl = current_price * (1 - self.config.STOP_LOSS_PCT)
+                    if new_sl > pos.stop_loss_price:
+                        pos.stop_loss_price = new_sl
+                        logger.info(f"✨ トレール発動！ {symbol} が最高値を更新。損切ラインを {new_sl:,.1f}円 に引き上げました。")
+            
+            if current_price != pos.last_logged_price:
+                pos.last_logged_price = current_price
+
+            # トレールラインに触れた時だけ決済
+            if current_price <= pos.stop_loss_price:
+                if current_price > pos.entry_price:
+                    logger.warning(f"📈 トレール利確！ {symbol} の決済（売り）を実行します。")
+                    logger.info(f"💰 {symbol} が引き上げたトレールライン({pos.stop_loss_price:,.1f}円)を割り込んだため、利益確定の決済を行いました！ 売却価格(目安): {current_price:,.1f}円")
+                else:
+                    logger.error(f"📉 損切バリア到達！ {symbol} の決済（売り）を実行します。")
+                    logger.info(f"🛡️ {symbol} が損切バリアに到達したため、損失を抑えるために決済を行いました。 売却価格(目安): {current_price:,.1f}円")
+                await self.execute_exit(pos)
+
+    async def execute_exit(self, pos: Position):
+        target_exchange = pos.exchange if self.config.TRADE_MODE == "MARGIN" else self.config.EXCHANGE
+        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
+        if res and res.get("Result") == 0:
+            logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
+            del self.positions[pos.symbol]
+        else:
+            logger.error(f"❌ 決済注文失敗: {res}")
+
+# --- AI連携モジュール ---
+def get_ticker_mapping() -> dict:
+    mapping = {}
     if os.path.exists("tickers.txt"):
         with open("tickers.txt", "r", encoding="utf-8") as f:
             for line in f:
                 if ',' in line:
-                    name, ticker = line.split(',', 1)
-                    tickers[name.strip()] = ticker.strip()
-    else:
-        logger.error("tickers.txt が見つからないため、分析をスキップします。")
-    return tickers
+                    name, tk = line.split(',', 1)
+                    mapping[name.strip()] = tk.replace(".T", "").strip()
+    return mapping
 
-def generate_signals():
-    logger.info("🧠 AI予測バッチ処理(高度化モデル)を開始します...")
+def load_ai_signals(config: Config) -> List[dict]:
+    signals = []
+    if not os.path.exists('recommendations.csv'): return signals
+    mapping = get_ticker_mapping()
     
-    tickers = get_tickers()
-    if not tickers:
-        logger.error("処理対象の銘柄がないため終了します。")
-        return
+    with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f)
+        
+        target_col = None
+        if config.TARGET_HORIZON == "短期": target_col = "短期スコア"
+        elif config.TARGET_HORIZON == "中長期": target_col = "中長期スコア"
+        else: target_col = "明日の上昇確率"
+                    
+        if target_col not in reader.fieldnames: return signals
 
-    macro_returns = get_macro_data()
+        for row in reader:
+            try: prob = float(row.get(target_col, 0))
+            except ValueError: prob = 0.0
+                
+            if prob >= config.ENTRY_THRESHOLD_PROB:
+                name = row.get('銘柄名', '')
+                code = mapping.get(name)
+                meta_conf = float(row.get('メタ確信度', prob)) 
+                if code: signals.append({'name': name, 'symbol': code, 'prob': prob, 'confidence': meta_conf})
+                
+    signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
+    return signals
+
+# --- メインループ ---
+async def main():
+    config = Config()
+    logger.info(f"=== 自動取引エンジン起動 (モード: {config.TRADE_STYLE.upper()}) ===")
     
-    tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
-    pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
-    
-    # 🔥 AIの視力矯正（正規化・定常化済み）特徴量
-    features = [
-        'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
-        'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
-        'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
-    ]
+    api = KabuAPI(config)
+    await api.start_session()
+    await api.get_token()
+    if not api.token: return
 
-    results = []
+    portfolio = PortfolioManager(config, api)
+    await portfolio.sync_positions(is_startup=True)
+    active_orders_count, active_order_symbols, _ = await get_active_orders(api, log=True)
 
-    for name, ticker in tickers.items():
-        logger.info(f"[{name}] のデータを取得・分析中...")
-        data = get_stock_features(ticker, macro_returns)
-        if data is None: continue
-        
-        data_features = data.dropna(subset=features)
-        if len(data_features) <= 100: continue
-        
-        latest_data = data_features.iloc[[-1]]
-        current_price = latest_data['Close'].values[0]
-        historical_data = data_features.dropna(subset=['Target_Class'])
-        
-        if len(historical_data) <= 100: continue
-        
-        X_raw = historical_data[features]
-        scaler = RobustScaler()
-        X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=features)
-        latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[features]), index=latest_data.index, columns=features)
-        
-        clf = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-        
-        # 1. 明日の上昇確率 と メタラベリング
-        y_train_tom = historical_data['Target_Class']
-        if len(np.unique(y_train_tom)) > 1:
-            # 【1人目のAI】上がるか下がるかの方向性を予測
-            clf.fit(X_scaled, y_train_tom)
-            prob_up = clf.predict_proba(latest_X_scaled)[0][1]
-            
-            # 🔥 最終ステップ: メタラベリング（交差検証による確信度の予測）
-            # 過去のデータで「1人目のAIの予測が当たったか(1)外れたか(0)」を判定し、それを学習ラベルとする
-            oos_preds = cross_val_predict(clf, X_scaled, y_train_tom, cv=4)
-            meta_labels = (oos_preds == y_train_tom).astype(int)
-            
-            # 【2人目のAI】1人目の予測が当たる「確信度」を予測
-            clf_meta = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-            clf_meta.fit(X_scaled, meta_labels)
-            meta_confidence = clf_meta.predict_proba(latest_X_scaled)[0][1]
+    try:
+        now = datetime.now()
+        if config.TRADE_STYLE == "day" and (now.hour > 14 or (now.hour == 14 and now.minute >= 30)):
+            logger.info("🕒 14:30を過ぎているため、本日の新規エントリーは見送ります（デイトレモード）。")
+            signals = []
         else:
-            prob_up = 0.0
-            meta_confidence = 0.0
-            
-        # 2. 全スパンのトリプルバリア予測
-        tb_results = {}
-        for h_key, h_days in tb_horizons.items():
-            target_col = f'Target_TB_{h_key}'
-            data[target_col] = calc_triple_barrier(data['Close'], h_days, pt_sl[h_key], pt_sl[h_key])
-            valid_idx = data[data[target_col].notna()].index.intersection(X_raw.index)
-            if len(valid_idx) > 100:
-                y_train_tb = data.loc[valid_idx, target_col]
-                if len(np.unique(y_train_tb)) > 1:
-                    clf.fit(X_scaled.loc[valid_idx], y_train_tb)
-                    cls = list(clf.classes_)
-                    tb_results[h_key] = clf.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
-                else: tb_results[h_key] = 0.0
-            else: tb_results[h_key] = 0.0
-            
-        # 🔥 短期スコア・中長期スコアの算出（加重平均）
-        short_score = (prob_up * 0.4) + (tb_results.get('1W', 0) * 0.3) + (tb_results.get('2W', 0) * 0.2) + (tb_results.get('1M', 0) * 0.1)
-        long_score = (tb_results.get('1M', 0) * 0.2) + (tb_results.get('3M', 0) * 0.3) + (tb_results.get('6M', 0) * 0.3) + (tb_results.get('1Y', 0) * 0.2)
-        
-        # おすすめ理由の生成
-        reasons = []
-        if short_score > 0.6: reasons.append("短期的な上昇モメンタムが非常に強いです。")
-        elif short_score > 0.55: reasons.append("短期的なテクニカル指標が好転しています。")
-        
-        if long_score > 0.6: reasons.append("中長期でのトレンド転換・上昇サインが点灯しています。")
-        elif long_score > 0.55: reasons.append("中長期的な下値支持線からの反発が見込めます。")
-        
-        if data_features['RSI_14'].iloc[-1] < 30: reasons.append("RSIが売られすぎ水準にあり、反発が期待できます。")
-        elif data_features['RSI_14'].iloc[-1] > 70: reasons.append("高値圏にあり、利益確定売りに注意が必要です。")
-        
-        if len(reasons) == 0: reasons.append("目立ったテクニカル指標の偏りはありません。")
+            signals = load_ai_signals(config)
 
-        # 結果を辞書にまとめる
-        res_dict = {
-            "銘柄名": name,
-            "今日の終値": float(current_price),
-            "短期スコア": float(short_score * 100),
-            "中長期スコア": float(long_score * 100),
-            "明日の上昇確率": float(prob_up * 100),
-            "メタ確信度": float(meta_confidence * 100),
-            "1W 利確(>3%)": float(tb_results.get('1W', 0) * 100),
-            "2W 利確(>5%)": float(tb_results.get('2W', 0) * 100),
-            "1M 利確(>10%)": float(tb_results.get('1M', 0) * 100),
-            "3M 利確(>20%)": float(tb_results.get('3M', 0) * 100),
-            "6M 利確(>30%)": float(tb_results.get('6M', 0) * 100),
-            "1Y 利確(>50%)": float(tb_results.get('1Y', 0) * 100),
-            "おすすめ理由": " ".join(reasons)
-        }
-        results.append(res_dict)
+        if not signals:
+            logger.info("😴 本日は新規エントリー条件を満たす銘柄はありませんでした。")
+        else:
+            for sig in signals:
+                if sig['symbol'] in portfolio.positions: continue
+                if sig['symbol'] in active_order_symbols: continue
+                if len(portfolio.positions) + active_orders_count >= config.MAX_POSITIONS:
+                    logger.warning(f"🚫 最大保有数({config.MAX_POSITIONS})に達しているため、新規エントリーを見送ります。")
+                    break
 
-    if results:
-        # CSVファイルへ出力
-        df_res = pd.DataFrame(results)
-        df_res.to_csv('recommendations.csv', index=False, encoding='utf-8-sig')
-        logger.info("✅ 本日のAI予測バッチが完了し、recommendations.csv を更新しました。")
-    else:
-        logger.warning("⚠️ 予測結果が生成されませんでした。")
+                logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']}) - 確率: {sig['prob']}%")
+                board = await api.get_board(sig['symbol'], config.EXCHANGE)
+                current_price = board.get("CurrentPrice") or board.get("PreviousClose") if board else 2000.0
+
+                qty = 0
+                if config.LOT_CALC_MODE == "FIXED":
+                    qty = config.FIXED_LOT_SIZE
+                elif config.LOT_CALC_MODE == "AUTO":
+                    avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
+                    qty = (int((avail * config.AUTO_INVEST_RATIO) / config.MAX_POSITIONS / current_price) // 100) * 100 
+                elif config.LOT_CALC_MODE == "KELLY":
+                    avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
+                    b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
+                    p = sig['confidence'] / 100.0
+                    kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
+                    invest_ratio = max(0.0, min(kelly_f / 2.0, config.AUTO_INVEST_RATIO))
+                    
+                    if invest_ratio > 0:
+                        qty = (int((avail * invest_ratio) / current_price) // 100) * 100 
+                        logger.info(f"🧠 ケリー基準計算: 勝率(確信度)={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
+                    else:
+                        logger.warning(f"⚠️ ケリー基準がマイナスのため見送ります。")
+                        qty = 0
+
+                if qty == 0: continue
+
+                res = await api.send_order(sig['symbol'], side="2", qty=qty, is_close=False)
+                
+                if res and res.get("Result") == 0:
+                    logger.info(f"✅ エントリー注文送信成功")
+                    active_orders_count += 1
+                else:
+                    logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
+        
+        has_force_closed_today = False
+        if portfolio.positions or active_orders_count > 0:
+            logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
+            sync_counter = 0 
+            last_logged_active_prices = {}
+            
+            while True:
+                now = datetime.now()
+                if config.TRADE_STYLE == "day" and now.hour == 14 and now.minute >= 50:
+                    if not has_force_closed_today:
+                        logger.warning("⏰ 14:50 を回りました！デイトレモードのため、全保有銘柄を強制決済(成行売)します！")
+                        for sym, pos in list(portfolio.positions.items()):
+                            await portfolio.execute_exit(pos)
+                        has_force_closed_today = True
+                    break
+                    
+                if now.hour >= 15:
+                    logger.info("🌙 15:00を回りました。本日の市場監視を終了します。")
+                    break
+
+                sync_counter += 1
+                if sync_counter >= 3:
+                    await portfolio.sync_positions(is_startup=False)
+                    sync_counter = 0
+
+                active_count, _, active_details = await get_active_orders(api, log=False)
+                for detail in active_details:
+                    sym = detail['symbol']
+                    board = await api.get_board(sym, config.EXCHANGE)
+                    if board:
+                        current_price = board.get("CurrentPrice") or board.get("PreviousClose")
+                        if current_price and current_price != last_logged_active_prices.get(sym):
+                            last_logged_active_prices[sym] = current_price
+
+                await portfolio.check_barriers()
+                
+                if not portfolio.positions and config.TRADE_STYLE == "day":
+                    if active_count == 0:
+                        await portfolio.sync_positions(is_startup=False)
+                        if not portfolio.positions: break
+
+                await asyncio.sleep(5)
+
+    except KeyboardInterrupt:
+        logger.info("システムを停止します...")
+    finally:
+        await api.close_session()
 
 if __name__ == "__main__":
-    generate_signals()
+    import sys
+    if sys.platform == "win32" and sys.version_info < (3, 14):
+        try:
+            asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        except AttributeError:
+            pass
+    asyncio.run(main())
