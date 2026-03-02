@@ -225,13 +225,17 @@ async def get_active_orders(api: KabuAPI):
     if orders:
         for order in orders:
             state = order.get("State")
-            # State 1: 待機(受付済), 2: 処理中(発注中), 4: 訂正取消送信中
-            if state in [1, 2, 4]:
+            order_qty = order.get("OrderQty", 0)
+            cum_qty = order.get("CumQty", 0)
+            
+            # 🔥 修正: 待機中だけでなく「市場の板に並んでいる状態(State:3)」も拾うため、
+            # 終了(State:5)しておらず、まだ全て約定していない注文をアクティブとみなす
+            if state != 5 and cum_qty < order_qty:
                 symbol = order.get("Symbol")
                 active_count += 1
                 if symbol:
                     active_symbols.append(symbol)
-                logger.info(f"⏳ 未約定(予約中)の注文を認識しました: {symbol} (State: {state})")
+                logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol} (State: {state}, 注文数: {order_qty}, 約定済: {cum_qty})")
     return active_count, active_symbols
 
 # --- ポジション管理 ---
