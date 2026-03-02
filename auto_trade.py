@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (auto_trade.py) - 統合本番仕様
+# kabuステーション 自動取引エンジン (auto_trade.py) - 高度化・完全版
 # =========================================================
 
 # --- ログ設定 ---
@@ -40,7 +40,7 @@ class Config:
             "TRADE_PASSWORD": "YOUR_TRADE_PASSWORD",
             "EXCHANGE": 9,
             "TRADE_STYLE": "day",             
-            "TARGET_HORIZON": "明日",         
+            "TARGET_HORIZON": "短期",         
             "TRADE_MODE": "CASH",
             "ACCOUNT_TYPE": 4,
             "MAX_POSITIONS": 1,
@@ -169,6 +169,7 @@ class KabuAPI:
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
             
+            # 信用口座ありの場合、現物買い(2)は「AA」、売り(1)は「指定なし」
             if side == "2":
                 fund_type = "AA"  
             else:
@@ -216,7 +217,7 @@ class KabuAPI:
         logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
-# --- 未約定の注文を取得する関数 ---
+# --- 未約定の注文を取得する関数 (ログ出力フラグを追加) ---
 async def get_active_orders(api: KabuAPI, log: bool = True):
     active_count = 0
     active_symbols = []
@@ -287,7 +288,6 @@ class PortfolioManager:
         for p in positions_data:
             symbol = p.get("Symbol")
             
-            # 🔥 究極の修正: APIの仕様では実際の保有数は「LeavesQty」に格納されます
             leaves_qty = int(p.get("LeavesQty", 0) or 0)
             hold_qty = int(p.get("HoldQty", 0) or 0)
             qty = leaves_qty + hold_qty
@@ -313,7 +313,6 @@ class PortfolioManager:
                         pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
                         logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(正確な取得単価: {entry_price:,.1f}円)")
         
-        # 認識できる株が1つもなかった時のログを補完
         if is_startup and not found_positions and len(positions_data) > 0:
             logger.info("保有しているポジションはありませんでした。")
 
@@ -331,7 +330,6 @@ class PortfolioManager:
 
             if current_price is None: continue
             
-            # 🔥 修正: 監視中の現在値更新ログを非表示（変数への記憶のみ行う）
             if current_price != pos.last_logged_price:
                 pos.last_logged_price = current_price
 
@@ -343,7 +341,10 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
-        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=pos.exchange)
+        # 信用取引(MARGIN)の返済の時のみ建玉の市場を指定し、現物(CASH)売りは設定市場(SOR=9等)を使う
+        target_exchange = pos.exchange if self.config.TRADE_MODE == "MARGIN" else self.config.EXCHANGE
+        
+        res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
         if res and res.get("Result") == 0:
             logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
             del self.positions[pos.symbol]
@@ -353,38 +354,26 @@ class PortfolioManager:
 # --- AI連携モジュール ---
 def get_ticker_mapping() -> dict:
     mapping = {}
-    pool = {
-        "トヨタ自動車": "7203.T", "ソニーG": "6758.T", "三菱UFJ": "8306.T",
-        "キーエンス": "6861.T", "NTT": "9432.T", "ファーストリテイリング": "9983.T",
-        "東京エレクトロン": "8035.T", "信越化学": "4063.T", "三井住友FG": "8316.T",
-        "日立製作所": "6501.T", "伊藤忠商事": "8001.T", "KDDI": "9433.T",
-        "ホンダ": "7267.T", "三菱商事": "8058.T", "ソフトバンクG": "9984.T",
-        "任天堂": "7974.T", "オリックス": "8591.T", "ANA": "9202.T", "三井物産": "8031.T",
-        "ダイキン工業": "6367.T", "武田薬品": "4502.T", "リクルートHD": "6098.T",
-        "みずほFG": "8411.T", "村田製作所": "6981.T", "デンソー": "6902.T",
-        "ファナック": "6954.T", "アステラス製薬": "4503.T", "セブン＆アイ": "3382.T",
-        "第一三共": "4568.T", "コマツ": "6301.T", "丸紅": "8002.T"
-    }
     if os.path.exists("tickers.txt"):
         with open("tickers.txt", "r", encoding="utf-8") as f:
             for line in f:
                 if ',' in line:
                     name, tk = line.split(',', 1)
-                    pool[name.strip()] = tk.strip()
-    for name, tk in pool.items():
-        mapping[name] = tk.replace(".T", "").strip()
+                    mapping[name.strip()] = tk.replace(".T", "").strip()
+    else:
+        logger.error("tickers.txt が見つかりません。対象銘柄を読み込めません。")
     return mapping
 
 def load_ai_signals(config: Config) -> List[dict]:
     signals = []
     if not os.path.exists('recommendations.csv'): return signals
+    
     mapping = get_ticker_mapping()
+    
     with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         
         target_col = None
-        
-        # 🔥 修正: app.pyと同じ「短期スコア」や「中長期スコア」を指定できるように機能追加！
         if config.TARGET_HORIZON == "短期":
             target_col = "短期スコア"
         elif config.TARGET_HORIZON == "中長期":
@@ -412,7 +401,10 @@ def load_ai_signals(config: Config) -> List[dict]:
             if prob >= config.ENTRY_THRESHOLD_PROB:
                 name = row.get('銘柄名', '')
                 code = mapping.get(name)
-                if code: signals.append({'name': name, 'symbol': code, 'prob': prob})
+                # 🔥 ステップ3: メタラベリングによる「確信度」の読み込み
+                meta_conf = float(row.get('メタ確信度', prob)) 
+                
+                if code: signals.append({'name': name, 'symbol': code, 'prob': prob, 'confidence': meta_conf})
                 
     signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
     return signals
@@ -470,6 +462,7 @@ async def main():
                 qty = 0
                 if config.LOT_CALC_MODE == "FIXED":
                     qty = config.FIXED_LOT_SIZE
+                
                 elif config.LOT_CALC_MODE == "AUTO":
                     available_cash = 0
                     if config.TRADE_MODE == "CASH":
@@ -485,11 +478,50 @@ async def main():
                     budget_per_trade = (available_cash * config.AUTO_INVEST_RATIO) / config.MAX_POSITIONS
                     max_shares = int(budget_per_trade / current_price)
                     qty = (max_shares // 100) * 100 
-
                     logger.info(f"💰 ロット自動計算: 余力={available_cash:,.0f}円 -> 割当予算={budget_per_trade:,.0f}円 -> 算出ロット={qty}株")
 
+                elif config.LOT_CALC_MODE == "KELLY":
+                    # 🔥 ステップ3: ケリー基準による動的ロット計算
+                    available_cash = 0
+                    if config.TRADE_MODE == "CASH":
+                        wallet = await api.get_wallet_cash()
+                        if wallet: available_cash = wallet.get("StockAccountWallet", 0)
+                    else:
+                        wallet = await api.get_wallet_margin(sig['symbol'], config.EXCHANGE)
+                        if wallet: available_cash = wallet.get("MarginAccountWallet", 0)
+                    
+                    if not available_cash:
+                        available_cash = 1000000
+                        
+                    # 1. ペイオフレシオ (利確幅 / 損切幅)
+                    b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
+                    
+                    # 2. 勝率 p (メタラベリングの確信度)
+                    p = sig['confidence'] / 100.0
+                    
+                    # 3. ケリー公式: f* = p - (1 - p) / b
+                    if b > 0:
+                        kelly_f = p - ((1.0 - p) / b)
+                    else:
+                        kelly_f = 0.0
+                        
+                    # 4. ハーフ・ケリー（安全のため、全額の半額だけをベットするプロの定石）
+                    half_kelly = kelly_f / 2.0
+                    
+                    # 5. 上限の適用（どれだけ自信があってもAUTO_INVEST_RATIOを超えない）
+                    invest_ratio = max(0.0, min(half_kelly, config.AUTO_INVEST_RATIO))
+                    
+                    if invest_ratio > 0:
+                        budget_per_trade = available_cash * invest_ratio
+                        max_shares = int(budget_per_trade / current_price)
+                        qty = (max_shares // 100) * 100 
+                        logger.info(f"🧠 ケリー基準計算: 勝率(確信度)={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
+                    else:
+                        logger.warning(f"⚠️ ケリー基準がマイナス({kelly_f:.2f})のため、{sig['symbol']} は「期待値が低い(リスク高)」と判断し見送ります。")
+                        qty = 0
+
                 if qty == 0:
-                    logger.warning(f"⚠️ 資金不足（算出ロット0株）のため、{sig['symbol']} のエントリーを見送ります。")
+                    logger.warning(f"⚠️ 資金不足 または 条件未達 のため、{sig['symbol']} のエントリーを見送ります。")
                     continue
 
                 res = await api.send_order(sig['symbol'], side="2", qty=qty, is_close=False)
@@ -538,7 +570,6 @@ async def main():
                     if board:
                         current_price = board.get("CurrentPrice") or board.get("PreviousClose")
                         if current_price and current_price != last_logged_active_prices.get(sym):
-                            # 🔥 修正: 予約中(約定待ち)の現在値更新ログも非表示
                             last_logged_active_prices[sym] = current_price
 
                 await portfolio.check_barriers()
