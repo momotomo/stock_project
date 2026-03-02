@@ -8,3 +8,4 @@ PyGithub
 joblib
 altair
 lightgbm
+requests
