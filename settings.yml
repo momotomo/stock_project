@@ -34,7 +34,7 @@ FUND_TYPE: "21"
 MAX_POSITIONS: 1
 
 # ロット数の計算モード。「FIXED」で固定株数、「AUTO」で口座残高から自動計算します
-LOT_CALC_MODE: "AUTO"
+LOT_CALC_MODE: "KELLY"
 
 # 「FIXED」モード時の1回のエントリーで購入する株数（例：100なら1単元）
 FIXED_LOT_SIZE: 100
