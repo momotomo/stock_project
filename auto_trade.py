@@ -331,8 +331,8 @@ class PortfolioManager:
 
             if current_price is None: continue
             
+            # 🔥 修正: 監視中の現在値更新ログを非表示（変数への記憶のみ行う）
             if current_price != pos.last_logged_price:
-                logger.info(f"👀 {symbol} 監視中... 現在値:{current_price:,.1f}円 (利確目標:{pos.take_profit_price:,.1f}円 / 損切防衛:{pos.stop_loss_price:,.1f}円)")
                 pos.last_logged_price = current_price
 
             if current_price >= pos.take_profit_price:
@@ -383,7 +383,13 @@ def load_ai_signals(config: Config) -> List[dict]:
         reader = csv.DictReader(f)
         
         target_col = None
-        if config.TARGET_HORIZON == "明日":
+        
+        # 🔥 修正: app.pyと同じ「短期スコア」や「中長期スコア」を指定できるように機能追加！
+        if config.TARGET_HORIZON == "短期":
+            target_col = "短期スコア"
+        elif config.TARGET_HORIZON == "中長期":
+            target_col = "中長期スコア"
+        elif config.TARGET_HORIZON == "明日":
             target_col = "明日の上昇確率"
         else:
             for col in reader.fieldnames:
@@ -391,8 +397,8 @@ def load_ai_signals(config: Config) -> List[dict]:
                     target_col = col
                     break
                     
-        if not target_col:
-            logger.error(f"❌ ターゲット期間 '{config.TARGET_HORIZON}' に対応するデータ列が見つかりません。")
+        if not target_col or target_col not in reader.fieldnames:
+            logger.error(f"❌ ターゲット期間 '{config.TARGET_HORIZON}' に対応するデータ列 '{target_col}' がCSVに見つかりません。")
             return signals
             
         logger.info(f"📊 エントリー基準指標: 【 {target_col} 】を使用します。")
@@ -532,8 +538,7 @@ async def main():
                     if board:
                         current_price = board.get("CurrentPrice") or board.get("PreviousClose")
                         if current_price and current_price != last_logged_active_prices.get(sym):
-                            action = "買い" if detail['side'] == "2" else "決済"
-                            logger.info(f"⏳ {sym} 約定待ち({action})... 現在値:{current_price:,.1f}円 (注文:{detail['order_qty']}株 / 約定済:{detail['cum_qty']}株)")
+                            # 🔥 修正: 予約中(約定待ち)の現在値更新ログも非表示
                             last_logged_active_prices[sym] = current_price
 
                 await portfolio.check_barriers()
