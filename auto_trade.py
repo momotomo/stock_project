@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (通知機能なし・ローカル完結版)
+# kabuステーション 自動取引エンジン (信用2銘柄・通知なし・1日1回終了版)
 # =========================================================
 
 # --- ログ設定 ---
@@ -41,9 +41,9 @@ class Config:
             "EXCHANGE": 9,
             "TRADE_STYLE": "day",             
             "TARGET_HORIZON": "短期",         
-            "TRADE_MODE": "CASH",
+            "TRADE_MODE": "MARGIN",
             "ACCOUNT_TYPE": 4,
-            "MAX_POSITIONS": 1,
+            "MAX_POSITIONS": 2,
             "LOT_CALC_MODE": "KELLY", 
             "FIXED_LOT_SIZE": 100,
             "AUTO_INVEST_RATIO": 0.3,
@@ -211,7 +211,7 @@ class KabuAPI:
         logger.info(f"🚀 発注リクエスト送信 [{trade_type_str}]: {action} {symbol} {qty}株 (成行) [市場: {target_exchange}]")
         return await self._request("POST", "sendorder", data=order_data)
 
-# --- 未約定の注文を取得する関数 (ログ出力フラグを追加) ---
+# --- 未約定の注文を取得する関数 ---
 async def get_active_orders(api: KabuAPI, log: bool = True):
     active_count = 0
     active_symbols = []
@@ -237,7 +237,7 @@ async def get_active_orders(api: KabuAPI, log: bool = True):
                         "side": side
                     })
                 if log:
-                    logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol} (State: {state}, 注文数: {order_qty}, 約定済: {cum_qty})")
+                    logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol}")
     return active_count, active_symbols, active_details
 
 # --- ポジション管理 ---
@@ -248,7 +248,7 @@ class Position:
     entry_price: float
     take_profit_price: float
     stop_loss_price: float
-    highest_price: float = 0.0  # 🔥 トレールストップ用: 保有中の最高値
+    highest_price: float = 0.0  
     hold_id: str = None
     exchange: int = 1
     last_logged_price: float = 0.0
@@ -281,11 +281,9 @@ class PortfolioManager:
         found_positions = False
         for p in positions_data:
             symbol = p.get("Symbol")
-            
             leaves_qty = int(p.get("LeavesQty", 0) or 0)
             hold_qty = int(p.get("HoldQty", 0) or 0)
             qty = leaves_qty + hold_qty
-            
             entry_price = float(p.get("Price", 0) or 0)
             hold_id = p.get("HoldID")
             exchange = p.get("Exchange", self.config.EXCHANGE)
@@ -325,11 +323,9 @@ class PortfolioManager:
 
             if current_price is None: continue
 
-            # 🔥 究極の機能：トレーリングストップ（利益を逃さない仕組み）
+            # 🔥 トレーリングストップ
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
-                
-                # 買値を上回っている場合、損切ラインを「現在値 - 損切幅」に引き上げていく
                 if current_price > pos.entry_price:
                     new_sl = current_price * (1 - self.config.STOP_LOSS_PCT)
                     if new_sl > pos.stop_loss_price:
@@ -343,10 +339,8 @@ class PortfolioManager:
             if current_price <= pos.stop_loss_price:
                 if current_price > pos.entry_price:
                     logger.warning(f"📈 トレール利確！ {symbol} の決済（売り）を実行します。")
-                    logger.info(f"💰 {symbol} が引き上げたトレールライン({pos.stop_loss_price:,.1f}円)を割り込んだため、利益確定の決済を行いました！ 売却価格(目安): {current_price:,.1f}円")
                 else:
                     logger.error(f"📉 損切バリア到達！ {symbol} の決済（売り）を実行します。")
-                    logger.info(f"🛡️ {symbol} が損切バリアに到達したため、損失を抑えるために決済を行いました。 売却価格(目安): {current_price:,.1f}円")
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
@@ -376,7 +370,6 @@ def load_ai_signals(config: Config) -> List[dict]:
     
     with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        
         target_col = None
         if config.TARGET_HORIZON == "短期": target_col = "短期スコア"
         elif config.TARGET_HORIZON == "中長期": target_col = "中長期スコア"
@@ -419,14 +412,17 @@ async def main():
         else:
             signals = load_ai_signals(config)
 
+        # 🚀 朝イチのエントリー処理（最大枠が埋まるまで順番に発注）
         if not signals:
             logger.info("😴 本日は新規エントリー条件を満たす銘柄はありませんでした。")
         else:
             for sig in signals:
                 if sig['symbol'] in portfolio.positions: continue
                 if sig['symbol'] in active_order_symbols: continue
+                
+                # 枠が埋まっていれば終了
                 if len(portfolio.positions) + active_orders_count >= config.MAX_POSITIONS:
-                    logger.warning(f"🚫 最大保有数({config.MAX_POSITIONS})に達しているため、新規エントリーを見送ります。")
+                    logger.warning(f"🚫 最大保有数({config.MAX_POSITIONS}銘柄)に達したため、これ以上の新規エントリーを見送ります。")
                     break
 
                 logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']}) - 確率: {sig['prob']}%")
@@ -442,15 +438,18 @@ async def main():
                 elif config.LOT_CALC_MODE == "KELLY":
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
-                    p = sig['confidence'] / 100.0
+                    
+                    # 🔥 修正: 厳しすぎる「メタ確信度」の代わりに、メインAIの予測確率をケリー基準の勝率として採用
+                    p = sig['prob'] / 100.0
+                    
                     kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
                     invest_ratio = max(0.0, min(kelly_f / 2.0, config.AUTO_INVEST_RATIO))
                     
                     if invest_ratio > 0:
                         qty = (int((avail * invest_ratio) / current_price) // 100) * 100 
-                        logger.info(f"🧠 ケリー基準計算: 勝率(確信度)={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
+                        logger.info(f"🧠 ケリー基準計算: 勝率={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
                     else:
-                        logger.warning(f"⚠️ ケリー基準がマイナスのため見送ります。")
+                        logger.warning(f"⚠️ ケリー基準がマイナスのため見送ります。(勝率: {p*100:.1f}%)")
                         qty = 0
 
                 if qty == 0: continue
@@ -463,6 +462,7 @@ async def main():
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
+        # 🚀 監視ループ（決済が終われば終了。回転売買はしない）
         has_force_closed_today = False
         if portfolio.positions or active_orders_count > 0:
             logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
@@ -477,7 +477,9 @@ async def main():
                         for sym, pos in list(portfolio.positions.items()):
                             await portfolio.execute_exit(pos)
                         has_force_closed_today = True
-                    break
+                    # 決済処理が終わったら終了
+                    if len(portfolio.positions) == 0:
+                        break
                     
                 if now.hour >= 15:
                     logger.info("🌙 15:00を回りました。本日の市場監視を終了します。")
@@ -499,10 +501,13 @@ async def main():
 
                 await portfolio.check_barriers()
                 
+                # 全ポジションが決済されたら、本日のプログラムは終了
                 if not portfolio.positions and config.TRADE_STYLE == "day":
                     if active_count == 0:
                         await portfolio.sync_positions(is_startup=False)
-                        if not portfolio.positions: break
+                        if not portfolio.positions:
+                            logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。本日の取引を終了します。")
+                            break
 
                 await asyncio.sleep(5)
 
