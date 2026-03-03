@@ -10,7 +10,7 @@ import csv
 from datetime import datetime
 
 # =========================================================
-# AI予測バッチ処理 (daily_batch.py) - LightGBM・通知なし完全版
+# AI予測バッチ処理 (daily_batch.py) - 高度特徴量＆メタラベリング版
 # =========================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 
 # --- 分析・特徴量作成関数 ---
 def get_macro_data():
-    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret"}
+    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret", "1306.T": "TOPIX_Ret"}
     try:
         macro_df = yf.download(list(macro_tickers.keys()), period="5y", progress=False)
         if isinstance(macro_df.columns, pd.MultiIndex):
@@ -47,17 +47,13 @@ def get_stock_features(ticker, macro_returns):
     data = data.loc[:, ~data.columns.duplicated()].copy()
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
-    # 基本リターン
+    # 既存の特徴量
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
-    
-    # 🟢 フラクショナル・ディファレンス
     data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
     
-    # ATR（ボラティリティの算出）
     tr = pd.concat([data['High']-data['Low'], abs(data['High']-data['Close'].shift()), abs(data['Low']-data['Close'].shift())], axis=1).max(axis=1)
     data['ATR'] = tr.rolling(14).mean() / data['Close']
     
-    # 🟢 ボラティリティによる正規化
     data['Disparity_5'] = (data['Close'] / data['Close'].rolling(5).mean()) - 1
     data['Disparity_25'] = (data['Close'] / data['Close'].rolling(25).mean()) - 1
     
@@ -78,12 +74,36 @@ def get_stock_features(ticker, macro_returns):
     data['BB_Bandwidth'] = (4*std_20) / (data['Close'].rolling(25).mean() + 1e-9)
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
     data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
+
+    # =========================================================
+    # 🔥 DeepResearch提案: 高度な特徴量空間の拡張
+    # =========================================================
     
+    # 🟢 1. EMA差分比率 (日中の実体ロウソク足の勢いをトレンドで正規化)
+    ema_20_val = data['Close'].ewm(span=20, adjust=False).mean()
+    data['EMA_Diff_Ratio'] = (data['Close'] - data['Open']) / (ema_20_val + 1e-9)
+
+    # 🟢 2. ダイバージェンスの定量化 (MACDと価格の傾きの乖離)
+    price_slope = data['Close'].diff(5)
+    macd_slope = data['MACD_Norm'].diff(5)
+    data['MACD_Div'] = np.where(np.sign(price_slope) != np.sign(macd_slope), 1, 0) * macd_slope
+
+    # 🟢 3. 動的ラグ特徴量 (昨日・一昨日のテクニカルの記憶)
+    lag_cols = ['Log_Return_Norm', 'RSI_14', 'MACD_Norm']
+    for col in lag_cols:
+        data[f'{col}_Lag1'] = data[col].shift(1)
+        data[f'{col}_Lag2'] = data[col].shift(2)
+
+    # 欠損値とマクロデータの結合
     data.replace([np.inf, -np.inf], np.nan, inplace=True)
     if not macro_returns.empty: data = data.join(macro_returns)
-    for col in ['USDJPY_Ret', 'SP500_Ret']:
+    for col in ['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']:
         if col not in data.columns: data[col] = 0.0
-    data[['USDJPY_Ret', 'SP500_Ret']] = data[['USDJPY_Ret', 'SP500_Ret']].ffill().fillna(0)
+    data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']] = data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']].ffill().fillna(0)
+    
+    # 🟢 5. TOPIX相対強度 (Relative Strength: 業績の良さの代替指標)
+    data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
+    data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
     # ターゲット（明日上がるか）
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
@@ -120,12 +140,10 @@ def get_tickers():
                 if ',' in line:
                     name, ticker = line.split(',', 1)
                     tickers[name.strip()] = ticker.strip()
-    else:
-        logger.error("tickers.txt が見つからないため、分析をスキップします。")
     return tickers
 
 def generate_signals():
-    logger.info("🧠 AI予測バッチ処理(LightGBMモデル)を開始します...")
+    logger.info("🧠 AI予測バッチ処理(高度特徴量・LightGBMモデル)を開始します...")
     
     tickers = get_tickers()
     if not tickers:
@@ -136,20 +154,40 @@ def generate_signals():
     
     tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
     pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
-    
+
+    # =========================================================
+    # 🔥 全銘柄データの事前一括取得 (横断的Zスコア計算のため)
+    # =========================================================
+    stock_data_dict = {}
+    for name, ticker in tickers.items():
+        logger.info(f"[{name}] のデータを取得中...")
+        data = get_stock_features(ticker, macro_returns)
+        if data is not None:
+            stock_data_dict[name] = data
+
+    # 🟢 4. 横断的Zスコア (全銘柄の中で今のRSIが相対的にどの位置にあるか)
+    if stock_data_dict:
+        rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
+        rsi_mean = rsi_df.mean(axis=1)
+        rsi_std = rsi_df.std(axis=1)
+        
+        for name in stock_data_dict.keys():
+            # 相場全体の過熱感から、この銘柄単体の過熱感のズレをZスコア化
+            stock_data_dict[name]['RSI_Z_Score'] = (stock_data_dict[name]['RSI_14'] - rsi_mean) / (rsi_std + 1e-9)
+
+    # 拡張された25個の最強特徴量セット
     features = [
         'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
         'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
-        'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
+        'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
+        'EMA_Diff_Ratio', 'MACD_Div', 'Log_Return_Norm_Lag1', 'Log_Return_Norm_Lag2',
+        'RSI_14_Lag1', 'RSI_14_Lag2', 'MACD_Norm_Lag1', 'MACD_Norm_Lag2', 'RSI_Z_Score',
+        'Excess_Return', 'Excess_Return_20d'
     ]
 
     results = []
 
-    for name, ticker in tickers.items():
-        logger.info(f"[{name}] のデータを取得・分析中...")
-        data = get_stock_features(ticker, macro_returns)
-        if data is None: continue
-        
+    for name, data in stock_data_dict.items():
         data_features = data.dropna(subset=features)
         if len(data_features) <= 100: continue
         
@@ -164,7 +202,6 @@ def generate_signals():
         X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=features)
         latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[features]), index=latest_data.index, columns=features)
         
-        # 🔥 最強AI LightGBM に換装
         clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
         
         # 1. 明日の上昇確率とメタラベリング（確信度）
@@ -173,10 +210,9 @@ def generate_signals():
             clf.fit(X_scaled, y_train_tom)
             prob_up = clf.predict_proba(latest_X_scaled)[0][1]
             
-            # 🔥 メタラベリング（確信度）の計算
+            # メタラベリング（確信度）
             oos_preds = cross_val_predict(clf, X_scaled, y_train_tom, cv=4)
             meta_labels = (oos_preds == y_train_tom).astype(int)
-            
             clf_meta = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
             clf_meta.fit(X_scaled, meta_labels)
             meta_confidence = clf_meta.predict_proba(latest_X_scaled)[0][1]
@@ -199,18 +235,15 @@ def generate_signals():
                 else: tb_results[h_key] = 0.0
             else: tb_results[h_key] = 0.0
             
-        # 短期スコア・中長期スコアの算出（加重平均）
         short_score = (prob_up * 0.4) + (tb_results.get('1W', 0) * 0.3) + (tb_results.get('2W', 0) * 0.2) + (tb_results.get('1M', 0) * 0.1)
         long_score = (tb_results.get('1M', 0) * 0.2) + (tb_results.get('3M', 0) * 0.3) + (tb_results.get('6M', 0) * 0.3) + (tb_results.get('1Y', 0) * 0.2)
         
-        # おすすめ理由の生成
         reasons = []
         if short_score > 0.6: reasons.append("短期的な上昇モメンタムが非常に強いです。")
         elif short_score > 0.55: reasons.append("短期的なテクニカル指標が好転しています。")
-        if long_score > 0.6: reasons.append("中長期でのトレンド転換・上昇サインが点灯しています。")
-        elif long_score > 0.55: reasons.append("中長期的な下値支持線からの反発が見込めます。")
-        if data_features['RSI_14'].iloc[-1] < 30: reasons.append("RSIが売られすぎ水準にあり、反発が期待できます。")
-        elif data_features['RSI_14'].iloc[-1] > 70: reasons.append("高値圏にあり、利益確定売りに注意が必要です。")
+        if latest_data['MACD_Div'].values[0] > 0: reasons.append("MACDにポジティブなダイバージェンス(上昇サイン)が発生しています。")
+        if latest_data['RSI_Z_Score'].values[0] < -1.0: reasons.append("市場全体と比較して相対的に売られすぎており、反発妙味があります。")
+        if latest_data['Excess_Return_20d'].values[0] > 0.05: reasons.append("TOPIXを明確にアウトパフォームしており、強い業績期待や資金流入が推測されます。")
         if len(reasons) == 0: reasons.append("目立ったテクニカル指標の偏りはありません。")
 
         # 結果を辞書にまとめる
@@ -220,7 +253,7 @@ def generate_signals():
             "短期スコア": float(short_score * 100),
             "中長期スコア": float(long_score * 100),
             "明日の上昇確率": float(prob_up * 100),
-            "メタ確信度": float(meta_confidence * 100), # 🔥 ケリー基準に必要な確信度
+            "メタ確信度": float(meta_confidence * 100),
             "1W 利確(>3%)": float(tb_results.get('1W', 0) * 100),
             "2W 利確(>5%)": float(tb_results.get('2W', 0) * 100),
             "1M 利確(>10%)": float(tb_results.get('1M', 0) * 100),
@@ -232,7 +265,6 @@ def generate_signals():
         results.append(res_dict)
 
     if results:
-        # CSVファイルへ出力（通知は一切行わずファイル保存のみ）
         df_res = pd.DataFrame(results)
         df_res.to_csv('recommendations.csv', index=False, encoding='utf-8-sig')
         logger.info("✅ 本日のAI予測バッチが完了し、recommendations.csv を更新しました。")

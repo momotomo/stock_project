@@ -44,7 +44,7 @@ def get_secret(key):
 
 @st.cache_data(show_spinner=False)
 def get_macro_data():
-    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret"}
+    macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret", "1306.T": "TOPIX_Ret"}
     try:
         macro_df = yf.download(list(macro_tickers.keys()), period="5y", progress=False)
         if isinstance(macro_df.columns, pd.MultiIndex):
@@ -72,6 +72,7 @@ def get_stock_features(ticker, macro_returns):
     data = data.loc[:, ~data.columns.duplicated()].copy()
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
+    # 既存の特徴量
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
     data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
     
@@ -98,16 +99,59 @@ def get_stock_features(ticker, macro_returns):
     data['BB_Bandwidth'] = (4*std_20) / (data['Close'].rolling(25).mean() + 1e-9)
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
     data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
+
+    # =========================================================
+    # 🔥 DeepResearch提案: 高度な特徴量空間の拡張
+    # =========================================================
+    
+    # 🟢 1. EMA差分比率
+    ema_20_val = data['Close'].ewm(span=20, adjust=False).mean()
+    data['EMA_Diff_Ratio'] = (data['Close'] - data['Open']) / (ema_20_val + 1e-9)
+
+    # 🟢 2. ダイバージェンスの定量化
+    price_slope = data['Close'].diff(5)
+    macd_slope = data['MACD_Norm'].diff(5)
+    data['MACD_Div'] = np.where(np.sign(price_slope) != np.sign(macd_slope), 1, 0) * macd_slope
+
+    # 🟢 3. 動的ラグ特徴量
+    lag_cols = ['Log_Return_Norm', 'RSI_14', 'MACD_Norm']
+    for col in lag_cols:
+        data[f'{col}_Lag1'] = data[col].shift(1)
+        data[f'{col}_Lag2'] = data[col].shift(2)
     
     data.replace([np.inf, -np.inf], np.nan, inplace=True)
     if not macro_returns.empty: data = data.join(macro_returns)
-    for col in ['USDJPY_Ret', 'SP500_Ret']:
+    for col in ['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']:
         if col not in data.columns: data[col] = 0.0
-    data[['USDJPY_Ret', 'SP500_Ret']] = data[['USDJPY_Ret', 'SP500_Ret']].ffill().fillna(0)
+    data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']] = data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']].ffill().fillna(0)
+    
+    # 🟢 5. TOPIX相対強度 (Relative Strength: 業績の良さの代替指標)
+    data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
+    data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
     data['Target_Price'] = data['Close'].shift(-1)
     return data
+
+@st.cache_data(show_spinner=False)
+def fetch_and_prepare_all_data(tickers_dict):
+    """全銘柄を一括取得し、横断的Zスコアを計算して返す関数"""
+    macro_returns = get_macro_data()
+    stock_data_dict = {}
+    for name, ticker in tickers_dict.items():
+        data = get_stock_features(ticker, macro_returns)
+        if data is not None:
+            stock_data_dict[name] = data
+            
+    # 🟢 4. 横断的Zスコア (Cross-Sectional Z-Score)
+    if stock_data_dict:
+        rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
+        rsi_mean = rsi_df.mean(axis=1)
+        rsi_std = rsi_df.std(axis=1)
+        for name in stock_data_dict.keys():
+            stock_data_dict[name]['RSI_Z_Score'] = (stock_data_dict[name]['RSI_14'] - rsi_mean) / (rsi_std + 1e-9)
+            
+    return stock_data_dict
 
 @st.cache_data
 def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
@@ -133,7 +177,17 @@ def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
             labels[i] = 0
     return labels
 
-st.title("🚀 AI株価スクリーニングダッシュボード (LightGBM版)")
+# 拡張された最強特徴量セット (計25個)
+EXTENDED_FEATURES = [
+    'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
+    'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
+    'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
+    'EMA_Diff_Ratio', 'MACD_Div', 'Log_Return_Norm_Lag1', 'Log_Return_Norm_Lag2',
+    'RSI_14_Lag1', 'RSI_14_Lag2', 'MACD_Norm_Lag1', 'MACD_Norm_Lag2', 'RSI_Z_Score',
+    'Excess_Return', 'Excess_Return_20d'
+]
+
+st.title("🚀 AI株価スクリーニングダッシュボード (LightGBM高度化版)")
 
 tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 バックテスト (検証)"])
 
@@ -210,19 +264,14 @@ with tab1:
         tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
         pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
 
-        with st.spinner('データを取得し、LightGBMを学習しています...'):
-            macro_returns = get_macro_data()
+        with st.spinner('データを一括取得し、高度特徴量空間(Zスコア等)を構築しています...'):
+            stock_data_dict = fetch_and_prepare_all_data(tickers)
+            
             for name, ticker in tickers.items():
-                data = get_stock_features(ticker, macro_returns)
+                data = stock_data_dict.get(name)
                 if data is None: continue
                 
-                features = [
-                    'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
-                    'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
-                    'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
-                ]
-                
-                data_features = data.dropna(subset=features)
+                data_features = data.dropna(subset=EXTENDED_FEATURES)
                 if len(data_features) <= 100: continue
                 
                 latest_data = data_features.iloc[[-1]]
@@ -231,10 +280,10 @@ with tab1:
                 
                 if len(historical_data) <= 100: continue
                 
-                X_raw = historical_data[features]
+                X_raw = historical_data[EXTENDED_FEATURES]
                 scaler = RobustScaler()
-                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=features)
-                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[features]), index=latest_data.index, columns=features)
+                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=EXTENDED_FEATURES)
+                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[EXTENDED_FEATURES]), index=latest_data.index, columns=EXTENDED_FEATURES)
                 
                 clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
                 y_train_tom = historical_data['Target_Class']
@@ -274,7 +323,7 @@ with tab1:
 
         if results:
             df_res = pd.DataFrame(results).sort_values("明日の上昇確率", ascending=False)
-            st.write("### 📊 本日の分析結果（全スパン）")
+            st.write("### 📊 本日の分析結果（高度特徴量版）")
             cfg = {"現在価格": st.column_config.NumberColumn(format="¥%.1f"), "予測価格": st.column_config.NumberColumn(format="¥%.1f")}
             for col in df_res.columns:
                 if "確率" in col or "利確" in col:
@@ -346,7 +395,7 @@ with tab2:
             st.error(f"履歴データの読み込みエラー: {e}")
 
 with tab3:
-    st.write("### 📊 AIシグナルによる運用シミュレーション (Purged Walk-Forward)")
+    st.write("### 📊 高度特徴量による運用シミュレーション (Purged Walk-Forward)")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -365,17 +414,13 @@ with tab3:
             bt_hold_days = st.number_input("最大保有日数", value=5, step=1)
 
         @st.cache_data(show_spinner=False)
-        def run_purged_walk_forward_cv(ticker, hold_days):
-            macro_returns = get_macro_data()
-            data = get_stock_features(ticker, macro_returns)
+        def run_purged_walk_forward_cv(ticker_name, hold_days, _tickers_dict):
+            # 常にキャッシュされた全銘柄データを取得(Zスコア利用のため)
+            stock_data_dict = fetch_and_prepare_all_data(_tickers_dict)
+            data = stock_data_dict.get(ticker_name)
             if data is None: return None, None
             
-            features = [
-                'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
-                'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
-                'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret'
-            ]
-            data_features = data.dropna(subset=features + ['Target_Class'])
+            data_features = data.dropna(subset=EXTENDED_FEATURES + ['Target_Class'])
             if len(data_features) <= 300: return None, None
             
             n_splits = 4 
@@ -395,13 +440,13 @@ with tab3:
                 train_data = data_features.iloc[indices[:train_end]]
                 test_data = data_features.iloc[indices[test_start:test_end]]
                 
-                X_train = train_data[features]
+                X_train = train_data[EXTENDED_FEATURES]
                 y_train = train_data['Target_Class']
-                X_test = test_data[features]
+                X_test = test_data[EXTENDED_FEATURES]
                 
                 scaler = RobustScaler()
-                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=features)
-                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=features)
+                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=EXTENDED_FEATURES)
+                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=EXTENDED_FEATURES)
                 
                 clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
                 clf.fit(X_train_scaled, y_train)
@@ -413,8 +458,8 @@ with tab3:
             return test_data_all, test_probs_all
 
         if st.button("🔄 厳密な実戦シミュレーションを実行 (Purged CV)", type="primary"):
-            with st.spinner('過去5年間を通じたパージング付きウォークフォワード検証を実行中...'):
-                test_data, test_probs = run_purged_walk_forward_cv(bt_ticker, bt_hold_days)
+            with st.spinner('過去5年間を通じた高度特徴量でのウォークフォワード検証を実行中...'):
+                test_data, test_probs = run_purged_walk_forward_cv(bt_stock_name, bt_hold_days, tickers_dict)
 
             if test_data is not None and test_probs is not None:
                 cash = bt_initial_cash
