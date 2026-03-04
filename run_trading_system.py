@@ -1,37 +1,35 @@
 import sys
-import time
 import subprocess
-import psutil
-import os
-import yaml
-from datetime import datetime
-import jpholiday
+import time
 import logging
+import psutil
+import yaml
+import os
 
 # =========================================================
-# 自動取引システム 統合実行ランナー (プロセス名修正版)
-# ---------------------------------------------------------
-# 【役割】
-# 1. 営業日判定（テストモード時は休日でも続行）
-# 2. auto_login.py / daily_batch.py / auto_trade.py の順次実行
-# 3. 終了後、kabuステーション(KabuS.exe)を確実にクローズ
+# 自動取引システム 統合実行ランナー (Kaggle API直結版)
 # =========================================================
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-def is_market_open():
-    """今日が市場の営業日（平日かつ祝日以外）かどうかを判定"""
-    now = datetime.now()
-    if now.weekday() >= 5: return False # 土日
-    if jpholiday.is_holiday(now): return False # 祝日
-    if (now.month == 12 and now.day == 31) or (now.month == 1 and now.day <= 3): return False # 年末年始
-    return True
+CONFIG_PATH = "settings.yml"
+
+# ⚠️ 【重要】ここにあなたのKaggleノートブックのURLの一部（ID）を入力してください
+# 例： https://www.kaggle.com/code/taro/stock-ai だったら "taro/stock-ai" と書く
+KAGGLE_NOTEBOOK_SLUG = "tokkatokka/stock-ai-trainer"
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        logger.error(f"❌ 設定ファイルの読み込みエラー: {e}")
+        return None
 
 def kill_kabu_station():
     """kabuステーションのプロセス(KabuS.exe)を確実に終了させる"""
     logger.info("🧹 kabuステーションのプロセスを確認・終了します...")
-    # 最新バージョンのプロセス名「KabuS.exe」に対応
     target_name = "KabuS.exe"
     killed_count = 0
     
@@ -51,72 +49,84 @@ def kill_kabu_station():
     else:
         logger.info(f"ℹ️ 起動中の {target_name} は見つかりませんでした。")
 
+# 🔥 変更：Git Pullではなく、Kaggle APIから直接モデルをダウンロードする関数
+def download_models_from_kaggle():
+    """Kaggleから最新のAIモデルを直接ダウンロードする"""
+    logger.info(f"🌐 Kaggleから最新のAIモデルをダウンロードします ({KAGGLE_NOTEBOOK_SLUG})...")
+    
+    # ダウンロード先の models フォルダを作成（なければ）
+    os.makedirs("models", exist_ok=True)
+    
+    try:
+        # Kaggle APIを使ってOutputファイルを models フォルダにダウンロード＆解凍
+        result = subprocess.run(
+            ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models", "--unzip"],
+            capture_output=True, text=True, check=True
+        )
+        logger.info(f"✅ Kaggleモデルのダウンロード完了:\n{result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Kaggleからのダウンロードエラー:\n{e.stderr.strip()}")
+        logger.error("👉 ヒント: コマンドプロンプトで 'pip install kaggle' が実行されているか、'~/.kaggle/kaggle.json' が正しく配置されているか確認してください。")
+    except FileNotFoundError:
+        logger.error("❌ 'kaggle' コマンドが見つかりません。'pip install kaggle' を実行してください。")
+
 def main():
     logger.info("=========================================")
     logger.info("🌅 自動取引システム 統合ランナー起動")
     logger.info("=========================================")
     
-    # settings.yml から本番/検証モードを読み取る
-    is_production = False
-    if os.path.exists("settings.yml"):
-        try:
-            with open("settings.yml", "r", encoding="utf-8") as f:
-                conf = yaml.safe_load(f)
-                is_production = conf.get("IS_PRODUCTION", False)
-        except Exception as e:
-            logger.warning(f"⚠️ 設定ファイルの読み取りに失敗しました: {e}")
+    config = load_config()
+    is_production = config.get("IS_PRODUCTION", False) if config else False
 
-    # --- 休場日チェック ---
-    if not is_market_open():
-        if is_production:
-            logger.info("😴 本日は市場の休場日です。本番モードのため、安全のため終了します。")
-            return
-        else:
-            logger.info("🧪 本日は休場日ですが、テストモード(IS_PRODUCTION: false)のため実行を継続します。")
+    if is_production:
+        logger.info("🔴 【警告】本番モード(IS_PRODUCTION=True)で起動しています。実際の資金が動きます。")
     else:
-        logger.info("🟢 本日は営業日です。システムを通常稼働させます。")
+        logger.info("🟢 【安全】検証モード(IS_PRODUCTION=False)で起動しています。シミュレーターで動作します。")
 
     try:
-        # 1. 起動前のお掃除（昨日の残骸があれば落とす）
+        # 1. 起動前のお掃除
         kill_kabu_station()
 
-        # 2. 自動ログインの実行
-        logger.info("\n▶️ [STEP 1] auto_login.py を実行...")
+        # 🔥 変更：2. 最新のAIモデルをKaggleからダウンロード
+        logger.info("\n▶️ [STEP 1] 最新AIモデルのダウンロード (Kaggle API)...")
+        download_models_from_kaggle()
+
+        # 3. 自動ログインの実行
+        logger.info("\n▶️ [STEP 2] auto_login.py を実行...")
         subprocess.run([sys.executable, "auto_login.py"], check=True)
         
-        # ログイン完了後、APIサーバーが安定するまで少し待機
         time.sleep(10)
 
-        # 3. AI予測バッチの実行 (シグナル生成)
-        logger.info("\n▶️ [STEP 2] daily_batch.py の実行判定...")
-        
-        # 今日すでに実行されたかを recommendations.csv の更新日時でチェック
+        # 4. AI予測バッチの実行 (シグナル生成)
+        logger.info("\n▶️ [STEP 3] daily_batch.py の実行判定...")
         run_batch = True
-        rec_file = "recommendations.csv"
-        if os.path.exists(rec_file):
-            mtime = os.path.getmtime(rec_file)
-            mdate = datetime.fromtimestamp(mtime).date()
-            if mdate == datetime.now().date():
-                logger.info(f"✅ 本日のAI予測データ({rec_file})は作成済みのため、AI予測バッチ処理をスキップします。")
-                run_batch = False
         
+        if is_production:
+            from datetime import datetime
+            now = datetime.now()
+            if now.weekday() >= 5: 
+                logger.info("💤 本日は休日（土日）のため、バッチ処理と自動売買をスキップします。")
+                run_batch = False
+
         if run_batch:
             logger.info("🤖 本日のAI予測バッチを実行します。時間がかかる場合があります...")
             subprocess.run([sys.executable, "daily_batch.py"], check=True)
 
-        # 4. 自動売買エンジンの実行（発注・監視）
-        logger.info("\n▶️ [STEP 3] auto_trade.py を実行...")
+        # 5. 自動売買エンジンの実行（発注・監視）
+        logger.info("\n▶️ [STEP 4] auto_trade.py を実行...")
         subprocess.run([sys.executable, "auto_trade.py"], check=True)
 
     except subprocess.CalledProcessError as e:
         logger.error(f"\n❌ スクリプト実行エラー: {e}")
+        logger.error(f"   実行コマンド: {' '.join(e.cmd)}")
+        if e.stdout: logger.error(f"   標準出力: {e.stdout}")
+        if e.stderr: logger.error(f"   標準エラー: {e.stderr}")
     except Exception as e:
         logger.error(f"\n❌ 予期せぬエラーが発生しました: {e}")
     finally:
-        # 5. 最後にお片付け（kabuステーションを終了してメモリを解放）
-        logger.info("\n🏁 本日の全タスクが完了しました。お片付けをします。")
-        kill_kabu_station()
-        logger.info("=== 統合ランナー終了 ===")
+        logger.info("\n=========================================")
+        logger.info("🏁 統合ランナーの処理がすべて完了しました")
+        logger.info("=========================================")
 
 if __name__ == "__main__":
     main()

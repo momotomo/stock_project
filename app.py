@@ -3,16 +3,16 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
+import joblib
 from sklearn.preprocessing import RobustScaler
 import os
 import plotly.express as px
 from github import Github
 import warnings
 
-# 無害な警告を非表示にする
 warnings.simplefilter('ignore', ResourceWarning)
 
-# ページ設定
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
 
 def get_tickers():
@@ -72,7 +72,6 @@ def get_stock_features(ticker, macro_returns):
     data = data.loc[:, ~data.columns.duplicated()].copy()
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
-    # 既存の特徴量
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
     data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
     
@@ -100,20 +99,13 @@ def get_stock_features(ticker, macro_returns):
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
     data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
 
-    # =========================================================
-    # 🔥 DeepResearch提案: 高度な特徴量空間の拡張
-    # =========================================================
-    
-    # 🟢 1. EMA差分比率
     ema_20_val = data['Close'].ewm(span=20, adjust=False).mean()
     data['EMA_Diff_Ratio'] = (data['Close'] - data['Open']) / (ema_20_val + 1e-9)
 
-    # 🟢 2. ダイバージェンスの定量化
     price_slope = data['Close'].diff(5)
     macd_slope = data['MACD_Norm'].diff(5)
     data['MACD_Div'] = np.where(np.sign(price_slope) != np.sign(macd_slope), 1, 0) * macd_slope
 
-    # 🟢 3. 動的ラグ特徴量
     lag_cols = ['Log_Return_Norm', 'RSI_14', 'MACD_Norm']
     for col in lag_cols:
         data[f'{col}_Lag1'] = data[col].shift(1)
@@ -125,17 +117,15 @@ def get_stock_features(ticker, macro_returns):
         if col not in data.columns: data[col] = 0.0
     data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']] = data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']].ffill().fillna(0)
     
-    # 🟢 5. TOPIX相対強度 (Relative Strength: 業績の良さの代替指標)
     data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
     data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-    data['Target_Price'] = data['Close'].shift(-1)
+    data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
     return data
 
 @st.cache_data(show_spinner=False)
 def fetch_and_prepare_all_data(tickers_dict):
-    """全銘柄を一括取得し、横断的Zスコアを計算して返す関数"""
     macro_returns = get_macro_data()
     stock_data_dict = {}
     for name, ticker in tickers_dict.items():
@@ -143,7 +133,6 @@ def fetch_and_prepare_all_data(tickers_dict):
         if data is not None:
             stock_data_dict[name] = data
             
-    # 🟢 4. 横断的Zスコア (Cross-Sectional Z-Score)
     if stock_data_dict:
         rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
         rsi_mean = rsi_df.mean(axis=1)
@@ -153,32 +142,7 @@ def fetch_and_prepare_all_data(tickers_dict):
             
     return stock_data_dict
 
-@st.cache_data
-def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
-    vals = prices.values
-    n = len(vals)
-    labels = np.full(n, np.nan)
-    for i in range(n - horizon):
-        p0 = vals[i]
-        ub = p0 * (1 + pt_pct)
-        lb = p0 * (1 - sl_pct)
-        path = vals[i+1 : i+1+horizon]
-        hit_ub = np.where(path >= ub)[0]
-        hit_lb = np.where(path <= lb)[0]
-        first_ub = hit_ub[0] if len(hit_ub) > 0 else horizon + 1
-        first_lb = hit_lb[0] if len(hit_lb) > 0 else horizon + 1
-        if first_ub == (horizon + 1) and first_lb == (horizon + 1):
-            labels[i] = 0
-        elif first_ub < first_lb:
-            labels[i] = 1
-        elif first_lb < first_ub:
-            labels[i] = -1
-        else:
-            labels[i] = 0
-    return labels
-
-# 拡張された最強特徴量セット (計25個)
-EXTENDED_FEATURES = [
+ALL_FEATURES = [
     'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
     'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
     'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
@@ -187,9 +151,9 @@ EXTENDED_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-st.title("🚀 AI株価スクリーニングダッシュボード (LightGBM高度化版)")
+st.title("🚀 AI株価スクリーニング (Kaggleメタラベリング連携版)")
 
-tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 バックテスト (検証)"])
+tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 短期取引シミュレーション (検証)"])
 
 st.sidebar.header("⚙️ 分析銘柄の設定")
 TICKERS_FILE = "tickers.txt"
@@ -227,108 +191,117 @@ if st.sidebar.button("💾 監視リストを保存・同期", use_container_wid
         st.sidebar.warning("✅ ローカルに保存しました（クラウド同期未設定）")
 
 with tab1:
-    st.subheader("🌟 AIが選ぶ本日のおすすめ銘柄 (自動更新)")
-    st.write("設定された銘柄のチャートをLightGBMがスキャンし、トップ銘柄を厳選しています。")
+    st.subheader("🌟 Kaggle AIが選ぶ本日のおすすめ銘柄")
+    st.write("毎朝Kaggleで学習された最新のモデルを使い、1秒でランキングと確率を弾き出します。")
     
     rec_file = 'recommendations.csv'
     if os.path.exists(rec_file) and os.path.getsize(rec_file) > 0:
         try:
             df_rec = pd.read_csv(rec_file)
             
-            st.markdown("### ⚡ 短期取引向け（明日〜2週間）トップ3")
+            if '順位' not in df_rec.columns:
+                df_rec.insert(0, '順位', range(1, len(df_rec) + 1))
+            
+            st.markdown("### ⚡ 本日のAI推奨トップ3")
             if "短期スコア" in df_rec.columns:
-                short_top = df_rec.sort_values(by="短期スコア", ascending=False).head(3)
+                short_top = df_rec.head(3)
                 cols_s = st.columns(3)
                 for i, (_, row) in enumerate(short_top.iterrows()):
                     with cols_s[i]:
-                        st.info(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n短期期待値: **{row.get('短期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
+                        with st.container(border=True):
+                            st.markdown(f"#### 👑 第{row['順位']}位：{row['銘柄名']}")
+                            st.metric("現在値", f"¥{row.get('今日の終値', 0):.1f}")
+                            st.metric("総合スコア (相対)", f"{row.get('短期スコア', 0):.1f}")
+                            if 'メタ確信度' in df_rec.columns:
+                                st.metric("メタ確信度(厳格)", f"{row.get('メタ確信度', 0):.1f}%")
+                            else:
+                                st.metric("絶対上昇確率", f"{row.get('明日の上昇確率', 0):.1f}%")
+                            st.caption(f"💡 AIの評価: {row.get('おすすめ理由', '')}")
             
-            st.markdown("### 🔭 中長期取引向け（1ヶ月〜1年）トップ3")
-            if "中長期スコア" in df_rec.columns:
-                long_top = df_rec.sort_values(by="中長期スコア", ascending=False).head(3)
-                cols_l = st.columns(3)
-                for i, (_, row) in enumerate(long_top.iterrows()):
-                    with cols_l[i]:
-                        st.success(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n中長期期待値: **{row.get('中長期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
-                    
-            with st.expander("👉 スキャン対象の全データを詳しく見る"):
+            with st.expander("👉 スキャン対象の全データを詳しく見る (AIの評価順)"):
                 st.dataframe(df_rec, hide_index=True, use_container_width=True)
         except Exception as e:
             st.error(f"おすすめデータの読み込みに失敗しました: {e}")
 
-    st.subheader("🔍 あなたの監視リストの手動分析（全スパン）")
+    st.subheader("🔍 あなたの監視リストの手動推論（超・軽量版）")
     tickers = get_tickers()
     
-    if st.button("🚀 監視銘柄の最新分析を実行", type="primary") and tickers:
-        results = []
-        tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
-        pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
+    if st.button("🚀 最新データで爆速推論を実行", type="primary") and tickers:
+        with st.spinner('Kaggle産モデルをロードし、瞬時に推論を実行中...'):
+            try:
+                ranker_model = joblib.load('models/ranker_model.pkl')
+                classifier_model = joblib.load('models/classifier_model.pkl')
+                meta_model = joblib.load('models/meta_model.pkl')
+                scaler = joblib.load('models/scaler.pkl')
+                selected_features = joblib.load('models/selected_features.pkl')
+            except Exception as e:
+                st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                st.stop()
 
-        with st.spinner('データを一括取得し、高度特徴量空間(Zスコア等)を構築しています...'):
             stock_data_dict = fetch_and_prepare_all_data(tickers)
             
-            for name, ticker in tickers.items():
-                data = stock_data_dict.get(name)
-                if data is None: continue
+            df_all = []
+            for name, data in stock_data_dict.items():
+                data['Ticker'] = name
+                df_all.append(data)
                 
-                data_features = data.dropna(subset=EXTENDED_FEATURES)
-                if len(data_features) <= 100: continue
+            if df_all:
+                df_panel = pd.concat(df_all).sort_index()
+                df_panel = df_panel.dropna(subset=ALL_FEATURES)
                 
-                latest_data = data_features.iloc[[-1]]
-                current_price = latest_data['Close'].values[0]
-                historical_data = data_features.dropna(subset=['Target_Class', 'Target_Price'])
-                
-                if len(historical_data) <= 100: continue
-                
-                X_raw = historical_data[EXTENDED_FEATURES]
-                scaler = RobustScaler()
-                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=EXTENDED_FEATURES)
-                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[EXTENDED_FEATURES]), index=latest_data.index, columns=EXTENDED_FEATURES)
-                
-                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                y_train_tom = historical_data['Target_Class']
-                if len(np.unique(y_train_tom)) > 1:
-                    clf.fit(X_scaled, y_train_tom)
-                    prob_up = clf.predict_proba(latest_X_scaled)[0][1]
-                else:
-                    prob_up = 0.0
-                
-                reg = lgb.LGBMRegressor(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                reg.fit(X_scaled, historical_data['Target_Price'])
-                pred_price = reg.predict(latest_X_scaled)[0]
-                
-                tb_results = {}
-                for h_key, h_days in tb_horizons.items():
-                    target_col = f'Target_TB_{h_key}'
-                    data[target_col] = calc_triple_barrier(data['Close'], h_days, pt_sl[h_key], pt_sl[h_key])
-                    valid_idx = data[data[target_col].notna()].index.intersection(X_raw.index)
-                    if len(valid_idx) > 100:
-                        y_train_tb = data.loc[valid_idx, target_col]
-                        if len(np.unique(y_train_tb)) > 1:
-                            clf.fit(X_scaled.loc[valid_idx], y_train_tb)
-                            cls = list(clf.classes_)
-                            tb_results[h_key] = clf.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
-                        else: tb_results[h_key] = 0.0
-                    else: tb_results[h_key] = 0.0
-                
-                res_dict = {
-                    "銘柄名": name,
-                    "現在価格": float(current_price),
-                    "予測価格": float(pred_price),
-                    "明日の上昇確率": float(prob_up * 100)
-                }
-                for k in tb_horizons.keys():
-                    res_dict[f"{k} 利確(>{int(pt_sl[k]*100)}%)"] = float(tb_results[k] * 100)
-                results.append(res_dict)
+                if len(df_panel) > 0:
+                    latest_date = df_panel.index.max()
+                    latest_df = df_panel[df_panel.index == latest_date].copy()
+                    
+                    X_latest_raw = latest_df[ALL_FEATURES]
+                    X_latest_scaled = pd.DataFrame(scaler.transform(X_latest_raw), index=X_latest_raw.index, columns=ALL_FEATURES)
+                    X_latest_sel = X_latest_scaled[selected_features]
+                    
+                    latest_df['Ranking_Score'] = ranker_model.predict(X_latest_sel)
+                    base_prob = classifier_model.predict_proba(X_latest_sel)[:, 1]
+                    latest_df['Prob_Up'] = base_prob
+                    
+                    X_meta_latest = X_latest_sel.copy()
+                    X_meta_latest['Base_Prob'] = base_prob
+                    latest_df['Meta_Prob'] = meta_model.predict_proba(X_meta_latest)[:, 1]
+                    
+                    min_s = latest_df['Ranking_Score'].min()
+                    max_s = latest_df['Ranking_Score'].max()
+                    if max_s > min_s:
+                        latest_df['Normalized_Score'] = (latest_df['Ranking_Score'] - min_s) / (max_s - min_s) * 100
+                    else:
+                        latest_df['Normalized_Score'] = 50.0
+                        
+                    latest_df = latest_df.sort_values(by='Ranking_Score', ascending=False)
+                    
+                    results = []
+                    for i, (idx, row) in enumerate(latest_df.iterrows()):
+                        res_dict = {
+                            "順位": int(i + 1),
+                            "銘柄名": row['Ticker'],
+                            "現在価格": float(row['Close']),
+                            "相対スコア(ランキング)": float(row['Normalized_Score']),
+                            "ベース上昇確率(1人目)": float(row['Prob_Up'] * 100),
+                            "メタ確信度(2人目)": float(row['Meta_Prob'] * 100)
+                        }
+                        results.append(res_dict)
 
-        if results:
-            df_res = pd.DataFrame(results).sort_values("明日の上昇確率", ascending=False)
-            st.write("### 📊 本日の分析結果（高度特徴量版）")
-            cfg = {"現在価格": st.column_config.NumberColumn(format="¥%.1f"), "予測価格": st.column_config.NumberColumn(format="¥%.1f")}
-            for col in df_res.columns:
-                if "確率" in col or "利確" in col:
-                    cfg[col] = st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
-            st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True)
+            if results:
+                df_res = pd.DataFrame(results)
+                st.success(f"✅ Kaggleモデルでの推論が完了しました！ (使用アルゴリズム: LGBMRanker & XGBoost & Meta-LightGBM)")
+                
+                st.write("### 📊 本日の相場に最適化された相対ランキング")
+                cfg = {
+                    "順位": st.column_config.NumberColumn(format="%d位"),
+                    "現在価格": st.column_config.NumberColumn(format="¥%.1f"), 
+                    "相対スコア(ランキング)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
+                    "ベース上昇確率(1人目)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                    "メタ確信度(2人目)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
+                }
+                st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True, height=212)
+                st.markdown("<br><br><br>", unsafe_allow_html=True)
+            else:
+                st.warning("データが不足しているため分析できませんでした。")
 
 with tab2:
     st.write("### 📈 AI予測の過去の推移")
@@ -343,14 +316,13 @@ with tab2:
                 df_s['Date'] = pd.to_datetime(df_s['Date'])
                 df_s = df_s.sort_values('Date').reset_index(drop=True)
                 
-                available_cols = ['明日の上昇確率']
-                for col in ['1W 利確(>3%)', '2W 利確(>5%)', '1M 利確(>10%)', '3M 利確(>20%)', '6M 利確(>30%)', '1Y 利確(>50%)']:
-                    if col in df_s.columns:
-                        available_cols.append(col)
+                available_cols = ['明日の上昇確率', '短期スコア', 'メタ確信度']
+                cols_to_plot = [c for c in available_cols if c in df_s.columns]
                         
-                fig = px.line(df_s, x='Date', y=available_cols, title=f"{selected_stock} の予測確率推移", markers=True)
-                fig.update_layout(yaxis_range=[0, 100], yaxis_title="確率 (%)")
-                st.plotly_chart(fig, use_container_width=True)
+                if cols_to_plot:
+                    fig = px.line(df_s, x='Date', y=cols_to_plot, title=f"{selected_stock} の予測スコア推移", markers=True)
+                    fig.update_layout(yaxis_range=[0, 100], yaxis_title="スコア / 確率 (%)")
+                    st.plotly_chart(fig, use_container_width=True)
                 
                 st.markdown("---")
                 st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
@@ -359,7 +331,7 @@ with tab2:
                 default_lot = 100 if selected_ticker.endswith(".T") else 1
                 
                 col_sim1, col_sim2, col_sim3 = st.columns(3)
-                with col_sim1: sim_threshold = st.slider("買い条件", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
+                with col_sim1: sim_threshold = st.slider("買い条件(スコア)", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
                 with col_sim2: sim_initial_cash = st.number_input("初期資金", value=1000000, step=100000, key="tab2_cash")
                 with col_sim3: sim_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1, key="tab2_lot")
                 
@@ -369,7 +341,12 @@ with tab2:
                 for i in range(len(df_s)):
                     current_date = df_s.iloc[i]['Date']
                     current_price = df_s.iloc[i]['今日の終値']
-                    current_prob = df_s.iloc[i]['明日の上昇確率']
+                    
+                    current_prob = 0
+                    if 'メタ確信度' in df_s.columns: current_prob = df_s.iloc[i]['メタ確信度']
+                    elif '短期スコア' in df_s.columns: current_prob = df_s.iloc[i]['短期スコア']
+                    elif '明日の上昇確率' in df_s.columns: current_prob = df_s.iloc[i]['明日の上昇確率']
+                    
                     profit = 0
                     executed = False
                     
@@ -382,7 +359,7 @@ with tab2:
                             executed = True
                             
                     sim_history.append({
-                        'Date': current_date, '今日の終値': current_price, '明日の上昇確率': current_prob,
+                        'Date': current_date, '今日の終値': current_price, '判断スコア': current_prob,
                         'シグナル': "買い" if executed else "-", '損益(円)': profit if executed else 0, '仮想累積資産(円)': cash
                     })
                 
@@ -395,7 +372,8 @@ with tab2:
             st.error(f"履歴データの読み込みエラー: {e}")
 
 with tab3:
-    st.write("### 📊 高度特徴量による運用シミュレーション (Purged Walk-Forward)")
+    st.write("### 📊 短期トレード AI実力検証 (過去シミュレーション)")
+    st.write("Kaggleで学習された最新のメタモデルを使い、**「1日〜数日で決済する短期売買」**を想定した仮想トレードを一瞬で計算します。")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -407,108 +385,95 @@ with tab3:
             default_lot = 100 if str(bt_ticker).endswith(".T") else 1
             bt_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1)
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
-            bt_threshold = st.slider("買い条件（確率％）", min_value=50, max_value=80, value=55, step=1)
+            bt_threshold = st.slider("買い条件（メタ確信度％）", min_value=50, max_value=80, value=55, step=1)
         with col2:
-            bt_tp = st.number_input("利確幅（％）", value=5.0, step=1.0) / 100.0
-            bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
-            bt_hold_days = st.number_input("最大保有日数", value=5, step=1)
+            # 🔥 修正: 短期トレード向けに利確・損切の初期値をタイト(3%)にし、最大保有日数を1日(翌日決済)に設定
+            bt_tp = st.number_input("利確幅（％）", value=3.0, step=1.0) / 100.0
+            bt_sl = st.number_input("損切幅（％）", value=3.0, step=1.0) / 100.0
+            bt_hold_days = st.number_input(
+                "最大保有日数 (短期設定)", 
+                value=1, step=1, 
+                help="1に設定すると「翌日には必ず決済する(1泊2日)」短期トレードシミュレーションになります。デイトレ(日計り)に近い検証が可能です。"
+            )
 
-        @st.cache_data(show_spinner=False)
-        def run_purged_walk_forward_cv(ticker_name, hold_days, _tickers_dict):
-            # 常にキャッシュされた全銘柄データを取得(Zスコア利用のため)
-            stock_data_dict = fetch_and_prepare_all_data(_tickers_dict)
-            data = stock_data_dict.get(ticker_name)
-            if data is None: return None, None
-            
-            data_features = data.dropna(subset=EXTENDED_FEATURES + ['Target_Class'])
-            if len(data_features) <= 300: return None, None
-            
-            n_splits = 4 
-            purge_days = int(hold_days) + 1 
-            test_probs_all = pd.Series(dtype=float)
-            test_data_all = pd.DataFrame()
-            
-            indices = np.arange(len(data_features))
-            fold_size = len(data_features) // (n_splits + 1)
-            
-            for i in range(n_splits):
-                train_end = (i + 1) * fold_size
-                test_start = train_end + purge_days
-                test_end = test_start + fold_size if i < n_splits - 1 else len(data_features)
-                if test_start >= len(data_features): break
-                
-                train_data = data_features.iloc[indices[:train_end]]
-                test_data = data_features.iloc[indices[test_start:test_end]]
-                
-                X_train = train_data[EXTENDED_FEATURES]
-                y_train = train_data['Target_Class']
-                X_test = test_data[EXTENDED_FEATURES]
-                
-                scaler = RobustScaler()
-                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=EXTENDED_FEATURES)
-                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=EXTENDED_FEATURES)
-                
-                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                clf.fit(X_train_scaled, y_train)
-                
-                probs = clf.predict_proba(X_test_scaled)[:, 1]
-                test_probs_all = pd.concat([test_probs_all, pd.Series(probs, index=test_data.index)])
-                test_data_all = pd.concat([test_data_all, test_data])
-                
-            return test_data_all, test_probs_all
+        if st.button("🔄 短期売買シミュレーションを実行", type="primary"):
+            with st.spinner('Kaggleの最新メタAI脳を使って、過去の成績を爆速で計算中...'):
+                try:
+                    clf = joblib.load('models/classifier_model.pkl')
+                    meta_model = joblib.load('models/meta_model.pkl')
+                    scaler = joblib.load('models/scaler.pkl')
+                    selected_features = joblib.load('models/selected_features.pkl')
+                except Exception as e:
+                    st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                    st.stop()
 
-        if st.button("🔄 厳密な実戦シミュレーションを実行 (Purged CV)", type="primary"):
-            with st.spinner('過去5年間を通じた高度特徴量でのウォークフォワード検証を実行中...'):
-                test_data, test_probs = run_purged_walk_forward_cv(bt_stock_name, bt_hold_days, tickers_dict)
-
-            if test_data is not None and test_probs is not None:
-                cash = bt_initial_cash
-                position = 0; entry_price = 0; days_held = 0
-                trades = []; history = []
+                stock_data_dict = fetch_and_prepare_all_data(tickers_dict)
+                data = stock_data_dict.get(bt_stock_name)
                 
-                initial_price = test_data['Close'].iloc[0]
-                bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
-                bh_cash = bt_initial_cash - (bh_shares * initial_price)
-                
-                for i in range(len(test_data)):
-                    current_date = test_data.index[i]
-                    current_price = test_data['Close'].iloc[i]
-                    current_prob = test_probs[i]
-                    
-                    if position > 0:
-                        days_held += 1
-                        ret = (current_price - entry_price) / entry_price
-                        if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
-                            profit = position * (current_price - entry_price)
-                            cash += position * current_price
-                            trades.append({'決済日': current_date.strftime('%Y-%m-%d'), '損益(円)': int(profit)})
-                            position = 0; entry_price = 0; days_held = 0
-                    
-                    if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
-                        required_cash = current_price * bt_lot_size
-                        if cash >= required_cash:
-                            position = bt_lot_size; entry_price = current_price
-                            cash -= required_cash; days_held = 0
-                    
-                    equity = cash + (position * current_price)
-                    bh_equity = bh_cash + (bh_shares * current_price)
-                    history.append({'Date': current_date, 'AI戦略の資産': equity, '放置(ガチホ)の資産': bh_equity})
-                
-                history_df = pd.DataFrame(history)
-                trades_df = pd.DataFrame(trades)
-                final_equity = history_df.iloc[-1]['AI戦略の資産']
-                total_profit = final_equity - bt_initial_cash
-                profit_pct = (total_profit / bt_initial_cash) * 100
-                bh_profit_pct = ((history_df.iloc[-1]['放置(ガチホ)の資産'] - bt_initial_cash) / bt_initial_cash) * 100
-                win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100 if not trades_df.empty else 0
-                    
-                st.write("---")
-                if trades_df.empty and bh_shares == 0:
-                    st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
-                
-                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
-                mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
-                mcol3.metric("勝率", f"{win_rate:.1f}%")
-                mcol4.metric("取引回数", f"{len(trades_df)}回")
-                st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）"), use_container_width=True)
+                if data is not None:
+                    data_features = data.dropna(subset=ALL_FEATURES + ['Target_Class'])
+                    if len(data_features) > 100:
+                        X_raw = data_features[ALL_FEATURES]
+                        X_scaled = pd.DataFrame(scaler.transform(X_raw), index=X_raw.index, columns=ALL_FEATURES)
+                        X_sel = X_scaled[selected_features]
+                        
+                        base_probs = clf.predict_proba(X_sel)[:, 1]
+                        X_meta = X_sel.copy()
+                        X_meta['Base_Prob'] = base_probs
+                        meta_probs = meta_model.predict_proba(X_meta)[:, 1]
+                        
+                        test_data = data_features
+                        test_probs = meta_probs 
+                        
+                        cash = bt_initial_cash
+                        position = 0; entry_price = 0; days_held = 0
+                        trades = []; history = []
+                        
+                        initial_price = test_data['Close'].iloc[0]
+                        bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
+                        bh_cash = bt_initial_cash - (bh_shares * initial_price)
+                        
+                        for i in range(len(test_data)):
+                            current_date = test_data.index[i]
+                            current_price = test_data['Close'].iloc[i]
+                            current_prob = test_probs[i]
+                            
+                            if position > 0:
+                                days_held += 1
+                                ret = (current_price - entry_price) / entry_price
+                                if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
+                                    profit = position * (current_price - entry_price)
+                                    cash += position * current_price
+                                    trades.append({'決済日': current_date.strftime('%Y-%m-%d'), '損益(円)': int(profit)})
+                                    position = 0; entry_price = 0; days_held = 0
+                            
+                            if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
+                                required_cash = current_price * bt_lot_size
+                                if cash >= required_cash:
+                                    position = bt_lot_size; entry_price = current_price
+                                    cash -= required_cash; days_held = 0
+                            
+                            equity = cash + (position * current_price)
+                            bh_equity = bh_cash + (bh_shares * current_price)
+                            history.append({'Date': current_date, 'AI戦略の資産': equity, '放置(ガチホ)の資産': bh_equity})
+                        
+                        history_df = pd.DataFrame(history)
+                        trades_df = pd.DataFrame(trades)
+                        final_equity = history_df.iloc[-1]['AI戦略の資産']
+                        total_profit = final_equity - bt_initial_cash
+                        profit_pct = (total_profit / bt_initial_cash) * 100
+                        bh_profit_pct = ((history_df.iloc[-1]['放置(ガチホ)の資産'] - bt_initial_cash) / bt_initial_cash) * 100
+                        win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100 if not trades_df.empty else 0
+                            
+                        st.write("---")
+                        if trades_df.empty and bh_shares == 0:
+                            st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
+                        
+                        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                        mcol1.metric("短期AI運用 最終資金", f"¥{int(final_equity):,}")
+                        mcol2.metric("短期AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
+                        mcol3.metric("勝率", f"{win_rate:.1f}%")
+                        mcol4.metric("取引回数", f"{len(trades_df)}回")
+                        st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="短期トレード 資産推移の比較"), use_container_width=True)
+                    else:
+                        st.warning("データ数が少なすぎるためシミュレーションできません。")

@@ -9,3 +9,5 @@ joblib
 altair
 lightgbm
 requests
+optuna
+xgboost
