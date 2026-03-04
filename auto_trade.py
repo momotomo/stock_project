@@ -294,7 +294,7 @@ class PortfolioManager:
             if qty > 0 and symbol:
                 found_positions = True
                 if symbol not in self.positions:
-                    self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                    self.add_position(symbol, qty, entry_price, exchange, hold_id)
                     if not is_startup:
                         logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol} (建玉ID: {hold_id})")
                     else:
