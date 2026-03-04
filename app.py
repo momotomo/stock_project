@@ -10,10 +10,14 @@ import os
 import plotly.express as px
 from github import Github
 import warnings
+import subprocess
 
 warnings.simplefilter('ignore', ResourceWarning)
 
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
+
+# ⚠️ 【重要】ここをご自身のKaggleのIDに書き換えてください
+KAGGLE_NOTEBOOK_SLUG = "tokkatokka/stock-ai-trainer"
 
 def get_tickers():
     tickers = {}
@@ -41,6 +45,27 @@ def get_secret(key):
         except Exception:
             pass
     return None
+
+# 🔥 追加：Kaggleからモデルをダウンロードする関数
+def download_models_from_kaggle():
+    os.makedirs("models", exist_ok=True)
+    try:
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        subprocess.run(
+            ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models"],
+            capture_output=True, text=True, check=True, encoding="utf-8", env=env
+        )
+        return True, "✅ モデルのダウンロードが完了しました。"
+    except subprocess.CalledProcessError as e:
+        error_msg = e.stderr.strip() if e.stderr else e.stdout.strip()
+        if "cp932" in error_msg or "multibyte sequence" in error_msg:
+            return True, "✅ モデルのダウンロードが完了しました。"
+        return False, f"❌ Kaggleダウンロードエラー: {error_msg}"
+    except FileNotFoundError:
+        return False, "❌ 'kaggle' コマンドが見つかりません。"
+    except Exception as e:
+        return False, f"❌ 予期せぬエラー: {e}"
 
 @st.cache_data(show_spinner=False)
 def get_macro_data():
@@ -227,7 +252,13 @@ with tab1:
     tickers = get_tickers()
     
     if st.button("🚀 最新データで爆速推論を実行", type="primary") and tickers:
-        with st.spinner('Kaggle産モデルをロードし、瞬時に推論を実行中...'):
+        with st.spinner('Kaggle産モデルをダウンロードし、瞬時に推論を実行中...'):
+            # 🔥 モデルダウンロード処理を追加
+            success, msg = download_models_from_kaggle()
+            if not success:
+                st.error(msg)
+                st.stop()
+
             try:
                 ranker_model = joblib.load('models/ranker_model.pkl')
                 classifier_model = joblib.load('models/classifier_model.pkl')
@@ -235,7 +266,7 @@ with tab1:
                 scaler = joblib.load('models/scaler.pkl')
                 selected_features = joblib.load('models/selected_features.pkl')
             except Exception as e:
-                st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                st.error(f"❌ モデルの読み込みに失敗しました: {e}")
                 st.stop()
 
             stock_data_dict = fetch_and_prepare_all_data(tickers)
@@ -387,7 +418,6 @@ with tab3:
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
             bt_threshold = st.slider("買い条件（メタ確信度％）", min_value=50, max_value=80, value=55, step=1)
         with col2:
-            # 🔥 修正: 短期トレード向けに利確・損切の初期値をタイト(3%)にし、最大保有日数を1日(翌日決済)に設定
             bt_tp = st.number_input("利確幅（％）", value=3.0, step=1.0) / 100.0
             bt_sl = st.number_input("損切幅（％）", value=3.0, step=1.0) / 100.0
             bt_hold_days = st.number_input(
@@ -398,13 +428,19 @@ with tab3:
 
         if st.button("🔄 短期売買シミュレーションを実行", type="primary"):
             with st.spinner('Kaggleの最新メタAI脳を使って、過去の成績を爆速で計算中...'):
+                # 🔥 モデルダウンロード処理を追加
+                success, msg = download_models_from_kaggle()
+                if not success:
+                    st.error(msg)
+                    st.stop()
+
                 try:
                     clf = joblib.load('models/classifier_model.pkl')
                     meta_model = joblib.load('models/meta_model.pkl')
                     scaler = joblib.load('models/scaler.pkl')
                     selected_features = joblib.load('models/selected_features.pkl')
                 except Exception as e:
-                    st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                    st.error(f"❌ モデルの読み込みに失敗しました: {e}")
                     st.stop()
 
                 stock_data_dict = fetch_and_prepare_all_data(tickers_dict)
