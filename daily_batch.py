@@ -10,7 +10,7 @@ from datetime import datetime
 import warnings
 
 # =========================================================
-# AI予測バッチ処理 (daily_batch.py) - 超・軽量 推論専用版
+# AI予測バッチ処理 (daily_batch.py) - メタラベリング対応/推論専用
 # =========================================================
 
 warnings.simplefilter('ignore', ResourceWarning)
@@ -97,7 +97,6 @@ def get_stock_features(ticker, macro_returns):
     data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
     data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
-    # 推論用なのでターゲット計算は不要ですが、欠損値処理の整合性のために残します
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
     data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
     return data
@@ -113,7 +112,7 @@ def get_tickers():
     return tickers
 
 def generate_signals():
-    logger.info("🧠 AI予測バッチ処理(超・軽量推論モード)を開始します...")
+    logger.info("🧠 AI予測バッチ処理(超・軽量推論モード / メタラベリング対応)を開始します...")
     
     tickers = get_tickers()
     if not tickers:
@@ -124,9 +123,10 @@ def generate_signals():
     try:
         ranker_model = joblib.load('models/ranker_model.pkl')
         classifier_model = joblib.load('models/classifier_model.pkl')
+        meta_model = joblib.load('models/meta_model.pkl') # 🔥 メタモデルを追加ロード
         scaler = joblib.load('models/scaler.pkl')
         selected_features = joblib.load('models/selected_features.pkl')
-        logger.info("✅ Kaggle産 学習済みAIモデル(Ranker & XGBoost)の読み込みに成功しました！")
+        logger.info("✅ Kaggle産 学習済みAIモデル(Ranker, XGBoost, Meta-LGBM)の読み込みに成功しました！")
     except Exception as e:
         logger.error(f"❌ モデルファイルが見つかりません。ターミナルで 'git pull' を実行してKaggleからダウンロードしてください。詳細: {e}")
         return
@@ -178,10 +178,18 @@ def generate_signals():
     X_latest_scaled = pd.DataFrame(scaler.transform(X_latest_raw), index=X_latest_raw.index, columns=ALL_FEATURES)
     X_latest_sel = X_latest_scaled[selected_features]
 
-    # --- 4. 爆速推論 (推論だけなら1秒未満で終わります) ---
-    logger.info("⚡ AIによる推論(スコア計算)を実行中...")
+    # --- 4. 爆速推論 (ベースAI ＋ メタAI) ---
+    logger.info("⚡ AIによる推論(メタラベリング確信度計算)を実行中...")
     latest_df['Ranking_Score'] = ranker_model.predict(X_latest_sel)
-    latest_df['Prob_Up'] = classifier_model.predict_proba(X_latest_sel)[:, 1]
+    
+    # ベースAI(1人目: XGBoost)の予測
+    base_prob = classifier_model.predict_proba(X_latest_sel)[:, 1]
+    latest_df['Prob_Up'] = base_prob
+    
+    # メタAI(2人目: LightGBM)の予測（ベースの確率を考慮して、本当に当たるかを審査）
+    X_meta_latest = X_latest_sel.copy()
+    X_meta_latest['Base_Prob'] = base_prob
+    latest_df['Meta_Prob'] = meta_model.predict_proba(X_meta_latest)[:, 1]
 
     # 正規化と出力
     min_score = latest_df['Ranking_Score'].min()
@@ -198,17 +206,18 @@ def generate_signals():
         reasons = []
         if i == 0: reasons.append("👑 本日のAIランキング第1位銘柄です！")
         reasons.append(f"Kaggle最新AIによる相対的強さ第{i+1}位。")
-        if row['Prob_Up'] > 0.6: reasons.append("絶対的な上昇確率(メタ確信度)も高く、強い買いシグナルが点灯しています。")
+        if row['Meta_Prob'] > 0.6: reasons.append("メタAIの審査もクリアし、非常に強い買い確信度を持っています！")
         
-        combo_score = (row['Normalized_Score'] * 0.3) + (row['Prob_Up'] * 100 * 0.7)
+        # 🔥 総合スコアに「メタ確信度」を強く反映させる（ケリー基準などで活用）
+        combo_score = (row['Normalized_Score'] * 0.3) + (row['Meta_Prob'] * 100 * 0.7)
 
         res_dict = {
             "銘柄名": row['Ticker'],
             "今日の終値": float(row['Close']),
             "短期スコア": float(combo_score),
-            "中長期スコア": float(row['Prob_Up'] * 100),
-            "明日の上昇確率": float(row['Prob_Up'] * 100),
-            "メタ確信度": float(row['Prob_Up'] * 100),
+            "中長期スコア": float(row['Prob_Up'] * 100),       # 参考用にベース確率を残す
+            "明日の上昇確率": float(row['Prob_Up'] * 100),     # 参考用にベース確率を残す
+            "メタ確信度": float(row['Meta_Prob'] * 100),       # ★ auto_trade.pyはこれを見る
             "1W 利確(>3%)": 0.0, "2W 利確(>5%)": 0.0, "1M 利確(>10%)": 0.0,
             "3M 利確(>20%)": 0.0, "6M 利確(>30%)": 0.0, "1Y 利確(>50%)": 0.0,
             "おすすめ理由": " ".join(reasons)

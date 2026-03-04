@@ -151,9 +151,9 @@ ALL_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-st.title("🚀 AI株価スクリーニング (Kaggle自動学習 連携版)")
+st.title("🚀 AI株価スクリーニング (Kaggleメタラベリング連携版)")
 
-tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 過去シミュレーション (検証)"])
+tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 短期取引シミュレーション (検証)"])
 
 st.sidebar.header("⚙️ 分析銘柄の設定")
 TICKERS_FILE = "tickers.txt"
@@ -212,7 +212,10 @@ with tab1:
                             st.markdown(f"#### 👑 第{row['順位']}位：{row['銘柄名']}")
                             st.metric("現在値", f"¥{row.get('今日の終値', 0):.1f}")
                             st.metric("総合スコア (相対)", f"{row.get('短期スコア', 0):.1f}")
-                            st.metric("絶対上昇確率", f"{row.get('明日の上昇確率', 0):.1f}%")
+                            if 'メタ確信度' in df_rec.columns:
+                                st.metric("メタ確信度(厳格)", f"{row.get('メタ確信度', 0):.1f}%")
+                            else:
+                                st.metric("絶対上昇確率", f"{row.get('明日の上昇確率', 0):.1f}%")
                             st.caption(f"💡 AIの評価: {row.get('おすすめ理由', '')}")
             
             with st.expander("👉 スキャン対象の全データを詳しく見る (AIの評価順)"):
@@ -228,6 +231,7 @@ with tab1:
             try:
                 ranker_model = joblib.load('models/ranker_model.pkl')
                 classifier_model = joblib.load('models/classifier_model.pkl')
+                meta_model = joblib.load('models/meta_model.pkl')
                 scaler = joblib.load('models/scaler.pkl')
                 selected_features = joblib.load('models/selected_features.pkl')
             except Exception as e:
@@ -254,7 +258,12 @@ with tab1:
                     X_latest_sel = X_latest_scaled[selected_features]
                     
                     latest_df['Ranking_Score'] = ranker_model.predict(X_latest_sel)
-                    latest_df['Prob_Up'] = classifier_model.predict_proba(X_latest_sel)[:, 1]
+                    base_prob = classifier_model.predict_proba(X_latest_sel)[:, 1]
+                    latest_df['Prob_Up'] = base_prob
+                    
+                    X_meta_latest = X_latest_sel.copy()
+                    X_meta_latest['Base_Prob'] = base_prob
+                    latest_df['Meta_Prob'] = meta_model.predict_proba(X_meta_latest)[:, 1]
                     
                     min_s = latest_df['Ranking_Score'].min()
                     max_s = latest_df['Ranking_Score'].max()
@@ -272,24 +281,24 @@ with tab1:
                             "銘柄名": row['Ticker'],
                             "現在価格": float(row['Close']),
                             "相対スコア(ランキング)": float(row['Normalized_Score']),
-                            "絶対上昇確率(メタ確信度)": float(row['Prob_Up'] * 100)
+                            "ベース上昇確率(1人目)": float(row['Prob_Up'] * 100),
+                            "メタ確信度(2人目)": float(row['Meta_Prob'] * 100)
                         }
                         results.append(res_dict)
 
             if results:
                 df_res = pd.DataFrame(results)
-                st.success(f"✅ Kaggleモデルでの推論が完了しました！ (使用アルゴリズム: LGBMRanker & XGBoost)")
+                st.success(f"✅ Kaggleモデルでの推論が完了しました！ (使用アルゴリズム: LGBMRanker & XGBoost & Meta-LightGBM)")
                 
                 st.write("### 📊 本日の相場に最適化された相対ランキング")
                 cfg = {
                     "順位": st.column_config.NumberColumn(format="%d位"),
                     "現在価格": st.column_config.NumberColumn(format="¥%.1f"), 
                     "相対スコア(ランキング)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
-                    "絶対上昇確率(メタ確信度)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
+                    "ベース上昇確率(1人目)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%"),
+                    "メタ確信度(2人目)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
                 }
-                # 6行固定 (ヘッダー+5行) に高さを調整
                 st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True, height=212)
-                # 見切れ防止の余白
                 st.markdown("<br><br><br>", unsafe_allow_html=True)
             else:
                 st.warning("データが不足しているため分析できませんでした。")
@@ -334,7 +343,8 @@ with tab2:
                     current_price = df_s.iloc[i]['今日の終値']
                     
                     current_prob = 0
-                    if '短期スコア' in df_s.columns: current_prob = df_s.iloc[i]['短期スコア']
+                    if 'メタ確信度' in df_s.columns: current_prob = df_s.iloc[i]['メタ確信度']
+                    elif '短期スコア' in df_s.columns: current_prob = df_s.iloc[i]['短期スコア']
                     elif '明日の上昇確率' in df_s.columns: current_prob = df_s.iloc[i]['明日の上昇確率']
                     
                     profit = 0
@@ -362,8 +372,8 @@ with tab2:
             st.error(f"履歴データの読み込みエラー: {e}")
 
 with tab3:
-    st.write("### 📊 Kaggleモデルの実力検証 (過去シミュレーション)")
-    st.write("Kaggleで学習された最新のモデル（XGBoost）を使って、過去5年分のデータに一瞬で予測を当てはめ、仮想トレードを行います。")
+    st.write("### 📊 短期トレード AI実力検証 (過去シミュレーション)")
+    st.write("Kaggleで学習された最新のメタモデルを使い、**「1日〜数日で決済する短期売買」**を想定した仮想トレードを一瞬で計算します。")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -375,16 +385,22 @@ with tab3:
             default_lot = 100 if str(bt_ticker).endswith(".T") else 1
             bt_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1)
             bt_initial_cash = st.number_input("初期資金（円）", value=1000000, step=100000, key="bt_cash")
-            bt_threshold = st.slider("買い条件（確率％）", min_value=50, max_value=80, value=55, step=1)
+            bt_threshold = st.slider("買い条件（メタ確信度％）", min_value=50, max_value=80, value=55, step=1)
         with col2:
-            bt_tp = st.number_input("利確幅（％）", value=5.0, step=1.0) / 100.0
-            bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
-            bt_hold_days = st.number_input("最大保有日数", value=5, step=1)
+            # 🔥 修正: 短期トレード向けに利確・損切の初期値をタイト(3%)にし、最大保有日数を1日(翌日決済)に設定
+            bt_tp = st.number_input("利確幅（％）", value=3.0, step=1.0) / 100.0
+            bt_sl = st.number_input("損切幅（％）", value=3.0, step=1.0) / 100.0
+            bt_hold_days = st.number_input(
+                "最大保有日数 (短期設定)", 
+                value=1, step=1, 
+                help="1に設定すると「翌日には必ず決済する(1泊2日)」短期トレードシミュレーションになります。デイトレ(日計り)に近い検証が可能です。"
+            )
 
-        if st.button("🔄 学習済みAIでのシミュレーションを実行", type="primary"):
-            with st.spinner('Kaggleの最新AI脳を使って、過去の成績を爆速で計算中...'):
+        if st.button("🔄 短期売買シミュレーションを実行", type="primary"):
+            with st.spinner('Kaggleの最新メタAI脳を使って、過去の成績を爆速で計算中...'):
                 try:
                     clf = joblib.load('models/classifier_model.pkl')
+                    meta_model = joblib.load('models/meta_model.pkl')
                     scaler = joblib.load('models/scaler.pkl')
                     selected_features = joblib.load('models/selected_features.pkl')
                 except Exception as e:
@@ -401,10 +417,13 @@ with tab3:
                         X_scaled = pd.DataFrame(scaler.transform(X_raw), index=X_raw.index, columns=ALL_FEATURES)
                         X_sel = X_scaled[selected_features]
                         
-                        # 爆速で全期間を一括推論
-                        probs = clf.predict_proba(X_sel)[:, 1]
+                        base_probs = clf.predict_proba(X_sel)[:, 1]
+                        X_meta = X_sel.copy()
+                        X_meta['Base_Prob'] = base_probs
+                        meta_probs = meta_model.predict_proba(X_meta)[:, 1]
+                        
                         test_data = data_features
-                        test_probs = probs
+                        test_probs = meta_probs 
                         
                         cash = bt_initial_cash
                         position = 0; entry_price = 0; days_held = 0
@@ -451,10 +470,10 @@ with tab3:
                             st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
                         
                         mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                        mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
-                        mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
+                        mcol1.metric("短期AI運用 最終資金", f"¥{int(final_equity):,}")
+                        mcol2.metric("短期AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
                         mcol3.metric("勝率", f"{win_rate:.1f}%")
                         mcol4.metric("取引回数", f"{len(trades_df)}回")
-                        st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）"), use_container_width=True)
+                        st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="短期トレード 資産推移の比較"), use_container_width=True)
                     else:
                         st.warning("データ数が少なすぎるためシミュレーションできません。")
