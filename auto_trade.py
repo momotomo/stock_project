@@ -286,15 +286,18 @@ class PortfolioManager:
             qty = leaves_qty + hold_qty
             entry_price = float(p.get("Price", 0) or 0)
             
-            # 🔥 修正: kabuステーションAPIでは保有ポジションの建玉IDは「ExecutionID」という名前で返ってきます
-            hold_id = p.get("ExecutionID")
+            # APIから建玉IDを取得（念のため文字列に固定）
+            hold_id = str(p.get("ExecutionID", ""))
             
-            exchange = p.get("Exchange", self.config.EXCHANGE)
+            # 🔥 追加・修正: APIからPTS市場(27等)が返ってきても、決済エラーを防ぐため強制的に「設定ファイル(東証等)の市場コード」で上書きします
+            exchange = self.config.EXCHANGE
             
             if qty > 0 and symbol:
                 found_positions = True
                 if symbol not in self.positions:
-                    self.add_position(symbol, qty, entry_price, exchange, hold_id)
+                    # 🔥 修正: 引数の順番を【元通り】に戻します（hold_id が先）。前回の私の指示は忘れてください！
+                    self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                    
                     if not is_startup:
                         logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol} (建玉ID: {hold_id})")
                     else:
