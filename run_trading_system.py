@@ -51,6 +51,19 @@ def kill_kabu_station():
     else:
         logger.info(f"ℹ️ 起動中の {target_name} は見つかりませんでした。")
 
+# 🔥 追加：GitHubから最新のモデルをダウンロードする関数
+def git_pull_latest():
+    """GitHubからKaggleが学習した最新のAIモデルをダウンロードする"""
+    logger.info("🌐 GitHubから最新のAIモデルを受信 (git pull) します...")
+    try:
+        # git pull を実行し、結果を取得する
+        result = subprocess.run(["git", "pull"], capture_output=True, text=True, check=True)
+        logger.info(f"✅ モデルの同期完了:\n{result.stdout.strip()}")
+    except subprocess.CalledProcessError as e:
+        logger.error(f"❌ Git Pull エラー (ローカルの変更が衝突している可能性があります):\n{e.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"⚠️ Gitコマンドが実行できませんでした (Gitがインストールされていないか、リポジトリ外です): {e}")
+
 def main():
     logger.info("=========================================")
     logger.info("🌅 自動取引システム 統合ランナー起動")
@@ -80,19 +93,19 @@ def main():
         # 1. 起動前のお掃除（昨日の残骸があれば落とす）
         kill_kabu_station()
 
-        # 2. 自動ログインの実行
-        logger.info("\n▶️ [STEP 1] auto_login.py を実行...")
+        # 🔥 追加：2. 最新のAIモデルをダウンロード
+        logger.info("\n▶️ [STEP 1] 最新AIモデルのダウンロード (git pull)...")
+        git_pull_latest()
+
+        # 3. 自動ログインの実行 (STEP番号をずらします)
+        logger.info("\n▶️ [STEP 2] auto_login.py を実行...")
         subprocess.run([sys.executable, "auto_login.py"], check=True)
         
         # ログイン完了後、APIサーバーが安定するまで少し待機
         time.sleep(10)
 
-        # 3. AI予測バッチの実行 (シグナル生成)
-        logger.info("\n▶️ [STEP 2] daily_batch.py の実行判定...")
-        
-        # 今日すでに実行されたかを recommendations.csv の更新日時でチェック
-        run_batch = True
-        rec_file = "recommendations.csv"
+        # 4. AI予測バッチの実行 (シグナル生成)
+        logger.info("\n▶️ [STEP 3] daily_batch.py の実行判定...")
         if os.path.exists(rec_file):
             mtime = os.path.getmtime(rec_file)
             mdate = datetime.fromtimestamp(mtime).date()
@@ -104,8 +117,8 @@ def main():
             logger.info("🤖 本日のAI予測バッチを実行します。時間がかかる場合があります...")
             subprocess.run([sys.executable, "daily_batch.py"], check=True)
 
-        # 4. 自動売買エンジンの実行（発注・監視）
-        logger.info("\n▶️ [STEP 3] auto_trade.py を実行...")
+        # 5. 自動売買エンジンの実行（発注・監視）
+        logger.info("\n▶️ [STEP 4] auto_trade.py を実行...")
         subprocess.run([sys.executable, "auto_trade.py"], check=True)
 
     except subprocess.CalledProcessError as e:

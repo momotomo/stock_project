@@ -3,26 +3,17 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
+import xgboost as xgb
+import joblib
 from sklearn.preprocessing import RobustScaler
 import os
 import plotly.express as px
 from github import Github
 import warnings
-import optuna
 
 warnings.simplefilter('ignore', ResourceWarning)
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
-
-def calculate_psi(expected, actual, bins=10):
-    bins_edges = np.linspace(0, 1, bins + 1)
-    expected_percents = np.histogram(expected, bins=bins_edges)[0] / len(expected)
-    actual_percents = np.histogram(actual, bins=bins_edges)[0] / len(actual)
-    expected_percents = np.where(expected_percents == 0, 0.0001, expected_percents)
-    actual_percents = np.where(actual_percents == 0, 0.0001, actual_percents)
-    psi_values = (actual_percents - expected_percents) * np.log(actual_percents / expected_percents)
-    return np.sum(psi_values)
 
 def get_tickers():
     tickers = {}
@@ -151,7 +142,7 @@ def fetch_and_prepare_all_data(tickers_dict):
             
     return stock_data_dict
 
-EXTENDED_FEATURES = [
+ALL_FEATURES = [
     'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
     'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
     'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
@@ -160,9 +151,9 @@ EXTENDED_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-st.title("🚀 AI株価スクリーニングダッシュボード (Optuna自己学習・Ranker版)")
+st.title("🚀 AI株価スクリーニング (Kaggle自動学習 連携版)")
 
-tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 バックテスト (検証)"])
+tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 過去シミュレーション (検証)"])
 
 st.sidebar.header("⚙️ 分析銘柄の設定")
 TICKERS_FILE = "tickers.txt"
@@ -200,24 +191,20 @@ if st.sidebar.button("💾 監視リストを保存・同期", use_container_wid
         st.sidebar.warning("✅ ローカルに保存しました（クラウド同期未設定）")
 
 with tab1:
-    st.subheader("🌟 AIが選ぶ本日のおすすめ銘柄 (自動更新)")
-    st.write("設定された銘柄群をLGBMRankerが横断的に評価し、相対的な「強さ」で順位付けしています。")
+    st.subheader("🌟 Kaggle AIが選ぶ本日のおすすめ銘柄")
+    st.write("毎朝Kaggleで学習された最新のモデルを使い、1秒でランキングと確率を弾き出します。")
     
     rec_file = 'recommendations.csv'
     if os.path.exists(rec_file) and os.path.getsize(rec_file) > 0:
         try:
             df_rec = pd.read_csv(rec_file)
             
-            # 🔥 追加: データの先頭に「順位」列を追加
             if '順位' not in df_rec.columns:
                 df_rec.insert(0, '順位', range(1, len(df_rec) + 1))
             
             st.markdown("### ⚡ 本日のAI推奨トップ3")
             if "短期スコア" in df_rec.columns:
-                # 🔥 修正: 余計な再ソートをやめ、AIが書き出した並び順（Rankerの順位）をそのまま採用する
                 short_top = df_rec.head(3)
-                
-                # 🔥 修正: 見切れを防ぎつつ、プロのダッシュボードのようなカード型UIに変更
                 cols_s = st.columns(3)
                 for i, (_, row) in enumerate(short_top.iterrows()):
                     with cols_s[i]:
@@ -233,11 +220,20 @@ with tab1:
         except Exception as e:
             st.error(f"おすすめデータの読み込みに失敗しました: {e}")
 
-    st.subheader("🔍 あなたの監視リストの手動分析（自己学習・PSI監視）")
+    st.subheader("🔍 あなたの監視リストの手動推論（超・軽量版）")
     tickers = get_tickers()
     
-    if st.button("🚀 監視銘柄の最新分析を実行", type="primary") and tickers:
-        with st.spinner('データを一括取得し、Optunaによる自己学習とドリフト検知を実行中...'):
+    if st.button("🚀 最新データで爆速推論を実行", type="primary") and tickers:
+        with st.spinner('Kaggle産モデルをロードし、瞬時に推論を実行中...'):
+            try:
+                ranker_model = joblib.load('models/ranker_model.pkl')
+                classifier_model = joblib.load('models/classifier_model.pkl')
+                scaler = joblib.load('models/scaler.pkl')
+                selected_features = joblib.load('models/selected_features.pkl')
+            except Exception as e:
+                st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                st.stop()
+
             stock_data_dict = fetch_and_prepare_all_data(tickers)
             
             df_all = []
@@ -247,83 +243,18 @@ with tab1:
                 
             if df_all:
                 df_panel = pd.concat(df_all).sort_index()
-                df_panel = df_panel.dropna(subset=EXTENDED_FEATURES + ['Target_Return', 'Target_Class'])
+                df_panel = df_panel.dropna(subset=ALL_FEATURES)
                 
-                if len(df_panel) > 100:
-                    df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
-                        lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
-                    )
-
+                if len(df_panel) > 0:
                     latest_date = df_panel.index.max()
-                    train_df = df_panel[df_panel.index < latest_date]
-                    latest_df = df_panel[df_panel.index == latest_date]
+                    latest_df = df_panel[df_panel.index == latest_date].copy()
                     
-                    X_train_raw = train_df[EXTENDED_FEATURES]
-                    y_train_rank = train_df['Target_Rank']
-                    y_train_class = train_df['Target_Class']
-                    
-                    scaler = RobustScaler()
-                    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=EXTENDED_FEATURES)
-                    X_latest_scaled = pd.DataFrame(scaler.transform(latest_df[EXTENDED_FEATURES]), index=latest_df.index, columns=EXTENDED_FEATURES)
-                    
-                    group_train = train_df.groupby(level=0).size().values
-                    
-                    fs_model = lgb.LGBMRanker(n_estimators=50, random_state=42, verbose=-1)
-                    fs_model.fit(X_train_scaled, y_train_rank, group=group_train)
-                    importance = pd.Series(fs_model.feature_importances_, index=EXTENDED_FEATURES).sort_values(ascending=False)
-                    top_k = min(int(len(EXTENDED_FEATURES) * 0.8), len(EXTENDED_FEATURES))
-                    selected_features = importance.head(top_k).index.tolist()
-                    
-                    X_train_sel = X_train_scaled[selected_features]
+                    X_latest_raw = latest_df[ALL_FEATURES]
+                    X_latest_scaled = pd.DataFrame(scaler.transform(X_latest_raw), index=X_latest_raw.index, columns=ALL_FEATURES)
                     X_latest_sel = X_latest_scaled[selected_features]
                     
-                    def objective(trial):
-                        params = {
-                            'n_estimators': trial.suggest_int('n_estimators', 50, 100),
-                            'max_depth': trial.suggest_int('max_depth', 3, 6),
-                            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-                            'num_leaves': trial.suggest_int('num_leaves', 10, 30),
-                            'random_state': 42,
-                            'verbose': -1
-                        }
-                        dates = train_df.index.unique()
-                        split_idx = int(len(dates) * 0.8)
-                        split_date = dates[split_idx]
-                        mask_train = train_df.index < split_date
-                        mask_val = train_df.index >= split_date
-                        
-                        X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
-                        g_t = train_df[mask_train].groupby(level=0).size().values
-                        X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
-                        g_v = train_df[mask_val].groupby(level=0).size().values
-                        
-                        if len(g_t) == 0 or len(g_v) == 0: return 0.0
-                        
-                        model = lgb.LGBMRanker(**params)
-                        model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
-                        return model.best_score_['valid_0']['ndcg@1']
-                        
-                    study = optuna.create_study(direction='maximize')
-                    study.optimize(objective, n_trials=5)
-                    
-                    best_params = study.best_params
-                    best_params['random_state'] = 42
-                    best_params['verbose'] = -1
-                    
-                    ranker = lgb.LGBMRanker(**best_params)
-                    ranker.fit(X_train_sel, y_train_rank, group=group_train)
-                    latest_df['Ranking_Score'] = ranker.predict(X_latest_sel)
-                    
-                    clf = lgb.LGBMClassifier(**best_params)
-                    clf.fit(X_train_sel, y_train_class)
-                    latest_df['Prob_Up'] = clf.predict_proba(X_latest_sel)[:, 1]
-                    
-                    train_probs = clf.predict_proba(X_train_sel)[:, 1]
-                    recent_mask = train_df.index >= (train_df.index.max() - pd.Timedelta(days=30))
-                    psi_value = 0
-                    if recent_mask.sum() > 0:
-                        recent_probs = clf.predict_proba(X_train_sel[recent_mask])[:, 1]
-                        psi_value = calculate_psi(train_probs, recent_probs)
+                    latest_df['Ranking_Score'] = ranker_model.predict(X_latest_sel)
+                    latest_df['Prob_Up'] = classifier_model.predict_proba(X_latest_sel)[:, 1]
                     
                     min_s = latest_df['Ranking_Score'].min()
                     max_s = latest_df['Ranking_Score'].max()
@@ -347,14 +278,7 @@ with tab1:
 
             if results:
                 df_res = pd.DataFrame(results)
-                st.success(f"✅ 自己学習(Optuna)と特徴量選択が完了しました！ (最適パラメータ: {best_params})")
-                
-                if psi_value > 0.2:
-                    st.error(f"⚠️ 警告: PSIスコアが {psi_value:.4f} と異常値を示しています。相場環境が激変しているため、AIの予測精度が低下している可能性があります！")
-                elif psi_value > 0.1:
-                    st.warning(f"ℹ️ 注意: PSIスコアが {psi_value:.4f} です。相場の傾向に変化の兆しがあります。")
-                else:
-                    st.info(f"📊 PSIスコア (コンセプトドリフト): {psi_value:.4f} -> 相場は正常・安定しています。")
+                st.success(f"✅ Kaggleモデルでの推論が完了しました！ (使用アルゴリズム: LGBMRanker & XGBoost)")
                 
                 st.write("### 📊 本日の相場に最適化された相対ランキング")
                 cfg = {
@@ -363,10 +287,9 @@ with tab1:
                     "相対スコア(ランキング)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
                     "絶対上昇確率(メタ確信度)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
                 }
-                # 🔥 修正: heightを212px（ヘッダー1行＋データ5行の計6行分）に固定し、コンパクトに表示する
+                # 6行固定 (ヘッダー+5行) に高さを調整
                 st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True, height=212)
-                
-                # 🔥 追加: 表の下に「透明な余白（改行3つ分）」を強制的に挿入し、見切れを完全に防ぐ
+                # 見切れ防止の余白
                 st.markdown("<br><br><br>", unsafe_allow_html=True)
             else:
                 st.warning("データが不足しているため分析できませんでした。")
@@ -439,8 +362,8 @@ with tab2:
             st.error(f"履歴データの読み込みエラー: {e}")
 
 with tab3:
-    st.write("### 📊 単一銘柄ポテンシャル検証 (LGBMClassifier)")
-    st.write("※ここではRankerではなく、従来通りその銘柄が単独で利益を出せるかのシビアな検証を行います。")
+    st.write("### 📊 Kaggleモデルの実力検証 (過去シミュレーション)")
+    st.write("Kaggleで学習された最新のモデル（XGBoost）を使って、過去5年分のデータに一瞬で予測を当てはめ、仮想トレードを行います。")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -458,101 +381,80 @@ with tab3:
             bt_sl = st.number_input("損切幅（％）", value=5.0, step=1.0) / 100.0
             bt_hold_days = st.number_input("最大保有日数", value=5, step=1)
 
-        @st.cache_data(show_spinner=False)
-        def run_purged_walk_forward_cv(ticker_name, hold_days, _tickers_dict):
-            stock_data_dict = fetch_and_prepare_all_data(_tickers_dict)
-            data = stock_data_dict.get(ticker_name)
-            if data is None: return None, None
-            
-            data_features = data.dropna(subset=EXTENDED_FEATURES + ['Target_Class'])
-            if len(data_features) <= 300: return None, None
-            
-            n_splits = 4 
-            purge_days = int(hold_days) + 1 
-            test_probs_all = pd.Series(dtype=float)
-            test_data_all = pd.DataFrame()
-            
-            indices = np.arange(len(data_features))
-            fold_size = len(data_features) // (n_splits + 1)
-            
-            for i in range(n_splits):
-                train_end = (i + 1) * fold_size
-                test_start = train_end + purge_days
-                test_end = test_start + fold_size if i < n_splits - 1 else len(data_features)
-                if test_start >= len(data_features): break
-                
-                train_data = data_features.iloc[indices[:train_end]]
-                test_data = data_features.iloc[indices[test_start:test_end]]
-                
-                X_train = train_data[EXTENDED_FEATURES]
-                y_train = train_data['Target_Class']
-                X_test = test_data[EXTENDED_FEATURES]
-                
-                scaler = RobustScaler()
-                X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train), index=X_train.index, columns=EXTENDED_FEATURES)
-                X_test_scaled = pd.DataFrame(scaler.transform(X_test), index=X_test.index, columns=EXTENDED_FEATURES)
-                
-                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                clf.fit(X_train_scaled, y_train)
-                
-                probs = clf.predict_proba(X_test_scaled)[:, 1]
-                test_probs_all = pd.concat([test_probs_all, pd.Series(probs, index=test_data.index)])
-                test_data_all = pd.concat([test_data_all, test_data])
-                
-            return test_data_all, test_probs_all
+        if st.button("🔄 学習済みAIでのシミュレーションを実行", type="primary"):
+            with st.spinner('Kaggleの最新AI脳を使って、過去の成績を爆速で計算中...'):
+                try:
+                    clf = joblib.load('models/classifier_model.pkl')
+                    scaler = joblib.load('models/scaler.pkl')
+                    selected_features = joblib.load('models/selected_features.pkl')
+                except Exception as e:
+                    st.error("❌ モデルファイルが見つかりません。ターミナルで `git pull` を実行してKaggleからダウンロードしてください。")
+                    st.stop()
 
-        if st.button("🔄 厳密な実戦シミュレーションを実行 (Purged CV)", type="primary"):
-            with st.spinner('過去5年間を通じた高度特徴量でのウォークフォワード検証を実行中...'):
-                test_data, test_probs = run_purged_walk_forward_cv(bt_stock_name, bt_hold_days, tickers_dict)
-
-            if test_data is not None and test_probs is not None:
-                cash = bt_initial_cash
-                position = 0; entry_price = 0; days_held = 0
-                trades = []; history = []
+                stock_data_dict = fetch_and_prepare_all_data(tickers_dict)
+                data = stock_data_dict.get(bt_stock_name)
                 
-                initial_price = test_data['Close'].iloc[0]
-                bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
-                bh_cash = bt_initial_cash - (bh_shares * initial_price)
-                
-                for i in range(len(test_data)):
-                    current_date = test_data.index[i]
-                    current_price = test_data['Close'].iloc[i]
-                    current_prob = test_probs[i]
-                    
-                    if position > 0:
-                        days_held += 1
-                        ret = (current_price - entry_price) / entry_price
-                        if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
-                            profit = position * (current_price - entry_price)
-                            cash += position * current_price
-                            trades.append({'決済日': current_date.strftime('%Y-%m-%d'), '損益(円)': int(profit)})
-                            position = 0; entry_price = 0; days_held = 0
-                    
-                    if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
-                        required_cash = current_price * bt_lot_size
-                        if cash >= required_cash:
-                            position = bt_lot_size; entry_price = current_price
-                            cash -= required_cash; days_held = 0
-                    
-                    equity = cash + (position * current_price)
-                    bh_equity = bh_cash + (bh_shares * current_price)
-                    history.append({'Date': current_date, 'AI戦略の資産': equity, '放置(ガチホ)の資産': bh_equity})
-                
-                history_df = pd.DataFrame(history)
-                trades_df = pd.DataFrame(trades)
-                final_equity = history_df.iloc[-1]['AI戦略の資産']
-                total_profit = final_equity - bt_initial_cash
-                profit_pct = (total_profit / bt_initial_cash) * 100
-                bh_profit_pct = ((history_df.iloc[-1]['放置(ガチホ)の資産'] - bt_initial_cash) / bt_initial_cash) * 100
-                win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100 if not trades_df.empty else 0
-                    
-                st.write("---")
-                if trades_df.empty and bh_shares == 0:
-                    st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
-                
-                mcol1, mcol2, mcol3, mcol4 = st.columns(4)
-                mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
-                mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
-                mcol3.metric("勝率", f"{win_rate:.1f}%")
-                mcol4.metric("取引回数", f"{len(trades_df)}回")
-                st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）"), use_container_width=True)
+                if data is not None:
+                    data_features = data.dropna(subset=ALL_FEATURES + ['Target_Class'])
+                    if len(data_features) > 100:
+                        X_raw = data_features[ALL_FEATURES]
+                        X_scaled = pd.DataFrame(scaler.transform(X_raw), index=X_raw.index, columns=ALL_FEATURES)
+                        X_sel = X_scaled[selected_features]
+                        
+                        # 爆速で全期間を一括推論
+                        probs = clf.predict_proba(X_sel)[:, 1]
+                        test_data = data_features
+                        test_probs = probs
+                        
+                        cash = bt_initial_cash
+                        position = 0; entry_price = 0; days_held = 0
+                        trades = []; history = []
+                        
+                        initial_price = test_data['Close'].iloc[0]
+                        bh_shares = bt_lot_size if bt_initial_cash >= (initial_price * bt_lot_size) else 0
+                        bh_cash = bt_initial_cash - (bh_shares * initial_price)
+                        
+                        for i in range(len(test_data)):
+                            current_date = test_data.index[i]
+                            current_price = test_data['Close'].iloc[i]
+                            current_prob = test_probs[i]
+                            
+                            if position > 0:
+                                days_held += 1
+                                ret = (current_price - entry_price) / entry_price
+                                if ret >= bt_tp or ret <= -bt_sl or days_held >= bt_hold_days or i == len(test_data)-1:
+                                    profit = position * (current_price - entry_price)
+                                    cash += position * current_price
+                                    trades.append({'決済日': current_date.strftime('%Y-%m-%d'), '損益(円)': int(profit)})
+                                    position = 0; entry_price = 0; days_held = 0
+                            
+                            if position == 0 and current_prob >= (bt_threshold / 100.0) and i < len(test_data)-1:
+                                required_cash = current_price * bt_lot_size
+                                if cash >= required_cash:
+                                    position = bt_lot_size; entry_price = current_price
+                                    cash -= required_cash; days_held = 0
+                            
+                            equity = cash + (position * current_price)
+                            bh_equity = bh_cash + (bh_shares * current_price)
+                            history.append({'Date': current_date, 'AI戦略の資産': equity, '放置(ガチホ)の資産': bh_equity})
+                        
+                        history_df = pd.DataFrame(history)
+                        trades_df = pd.DataFrame(trades)
+                        final_equity = history_df.iloc[-1]['AI戦略の資産']
+                        total_profit = final_equity - bt_initial_cash
+                        profit_pct = (total_profit / bt_initial_cash) * 100
+                        bh_profit_pct = ((history_df.iloc[-1]['放置(ガチホ)の資産'] - bt_initial_cash) / bt_initial_cash) * 100
+                        win_rate = len(trades_df[trades_df['損益(円)'] > 0]) / len(trades_df) * 100 if not trades_df.empty else 0
+                            
+                        st.write("---")
+                        if trades_df.empty and bh_shares == 0:
+                            st.warning(f"⚠️ 初期資金が足りず、一度も購入できませんでした。")
+                        
+                        mcol1, mcol2, mcol3, mcol4 = st.columns(4)
+                        mcol1.metric("AI運用 最終資金", f"¥{int(final_equity):,}")
+                        mcol2.metric("AI運用 総損益", f"¥{int(total_profit):,}", f"{profit_pct:.1f}%")
+                        mcol3.metric("勝率", f"{win_rate:.1f}%")
+                        mcol4.metric("取引回数", f"{len(trades_df)}回")
+                        st.plotly_chart(px.line(history_df, x='Date', y=['AI戦略の資産', '放置(ガチホ)の資産'], title="資産推移の比較（エクイティカーブ）"), use_container_width=True)
+                    else:
+                        st.warning("データ数が少なすぎるためシミュレーションできません。")

@@ -4,35 +4,19 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import lightgbm as lgb
-from sklearn.preprocessing import RobustScaler
-import csv
+import xgboost as xgb
+import joblib
 from datetime import datetime
-import optuna
 import warnings
 
 # =========================================================
-# AI予測バッチ処理 (daily_batch.py) - 自己学習(Optuna) & Ranker版
+# AI予測バッチ処理 (daily_batch.py) - 超・軽量 推論専用版
 # =========================================================
 
 warnings.simplefilter('ignore', ResourceWarning)
-# Optunaの探索ログが大量に出るのを防ぐ
-optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
-
-def calculate_psi(expected, actual, bins=10):
-    """PSI (Population Stability Index) を計算し、相場環境の変化を検知する"""
-    bins_edges = np.linspace(0, 1, bins + 1)
-    expected_percents = np.histogram(expected, bins=bins_edges)[0] / len(expected)
-    actual_percents = np.histogram(actual, bins=bins_edges)[0] / len(actual)
-    
-    # 0除算回避
-    expected_percents = np.where(expected_percents == 0, 0.0001, expected_percents)
-    actual_percents = np.where(actual_percents == 0, 0.0001, actual_percents)
-    
-    psi_values = (actual_percents - expected_percents) * np.log(actual_percents / expected_percents)
-    return np.sum(psi_values)
 
 # --- 分析・特徴量作成関数 ---
 def get_macro_data():
@@ -113,7 +97,7 @@ def get_stock_features(ticker, macro_returns):
     data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
     data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
-    # ターゲット計算 (Ranker用とClassifier用)
+    # 推論用なのでターゲット計算は不要ですが、欠損値処理の整合性のために残します
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
     data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
     return data
@@ -129,19 +113,30 @@ def get_tickers():
     return tickers
 
 def generate_signals():
-    logger.info("🧠 AI予測バッチ処理(自己学習Optuna & LGBMRankerモデル)を開始します...")
+    logger.info("🧠 AI予測バッチ処理(超・軽量推論モード)を開始します...")
     
     tickers = get_tickers()
     if not tickers:
         logger.error("処理対象の銘柄がないため終了します。")
         return
 
+    # --- 1. Kaggleで学習済みのモデルをロード ---
+    try:
+        ranker_model = joblib.load('models/ranker_model.pkl')
+        classifier_model = joblib.load('models/classifier_model.pkl')
+        scaler = joblib.load('models/scaler.pkl')
+        selected_features = joblib.load('models/selected_features.pkl')
+        logger.info("✅ Kaggle産 学習済みAIモデル(Ranker & XGBoost)の読み込みに成功しました！")
+    except Exception as e:
+        logger.error(f"❌ モデルファイルが見つかりません。ターミナルで 'git pull' を実行してKaggleからダウンロードしてください。詳細: {e}")
+        return
+
     macro_returns = get_macro_data()
     
-    # 1. パネルデータの構築 (全銘柄横断)
+    # --- 2. 最新データの取得 ---
     stock_data_dict = {}
     for name, ticker in tickers.items():
-        logger.info(f"[{name}] のデータを取得中...")
+        logger.info(f"[{name}] の最新データを取得中...")
         data = get_stock_features(ticker, macro_returns)
         if data is not None:
             stock_data_dict[name] = data
@@ -160,7 +155,7 @@ def generate_signals():
 
     df_panel = pd.concat(df_all).sort_index()
 
-    features = [
+    ALL_FEATURES = [
         'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
         'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
         'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
@@ -169,110 +164,24 @@ def generate_signals():
         'Excess_Return', 'Excess_Return_20d'
     ]
     
-    df_panel = df_panel.dropna(subset=features + ['Target_Return', 'Target_Class'])
-    if len(df_panel) <= 100:
-        logger.error("学習に十分なデータがありません。")
+    df_panel = df_panel.dropna(subset=ALL_FEATURES)
+    if df_panel.empty:
+        logger.error("有効なデータがありません。")
         return
 
-    # 🔥 修正: 順位をそのまま渡すのではなく、LGBMRankerが扱える 0〜4 の「5段階評価」に変換する
-    df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
-        lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
-    )
-
+    # 今日のデータだけを抽出
     latest_date = df_panel.index.max()
-    train_df = df_panel[df_panel.index < latest_date].copy()
     latest_df = df_panel[df_panel.index == latest_date].copy()
     
-    X_train_raw = train_df[features]
-    # 🔥 修正: Target_Return から Target_Rank (整数) に変更
-    y_train_rank = train_df['Target_Rank']
-    y_train_class = train_df['Target_Class']
-    
-    scaler = RobustScaler()
-    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=features)
-    X_latest_scaled = pd.DataFrame(scaler.transform(latest_df[features]), index=latest_df.index, columns=features)
-    
-    # 2. 特徴量選択 (ノイズ除去)
-    logger.info("🔍 特徴量選択 (ノイズ除去) を実行中...")
-    group_train = train_df.groupby(level=0).size().values
-    
-    fs_model = lgb.LGBMRanker(n_estimators=50, random_state=42, verbose=-1)
-    fs_model.fit(X_train_scaled, y_train_rank, group=group_train)
-    
-    importance = pd.Series(fs_model.feature_importances_, index=features).sort_values(ascending=False)
-    top_k = min(int(len(features) * 0.8), len(features))
-    selected_features = importance.head(top_k).index.tolist()
-    logger.info(f"✨ 厳選された特徴量 ({len(selected_features)}/{len(features)})")
-    
-    X_train_sel = X_train_scaled[selected_features]
+    # --- 3. データの前処理（スケーリングと特徴量選択） ---
+    X_latest_raw = latest_df[ALL_FEATURES]
+    X_latest_scaled = pd.DataFrame(scaler.transform(X_latest_raw), index=X_latest_raw.index, columns=ALL_FEATURES)
     X_latest_sel = X_latest_scaled[selected_features]
 
-    # 3. Optuna によるハイパーパラメータ自己学習
-    logger.info("⚙️ Optunaによる自己学習(パラメータ最適化)を実行中...")
-    
-    def objective(trial):
-        params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 150),
-            'max_depth': trial.suggest_int('max_depth', 3, 7),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 10, 50),
-            'subsample': trial.suggest_float('subsample', 0.6, 1.0),
-            'colsample_bytree': trial.suggest_float('colsample_bytree', 0.6, 1.0),
-            'random_state': 42,
-            'verbose': -1
-        }
-        
-        dates = train_df.index.unique()
-        split_idx = int(len(dates) * 0.8)
-        split_date = dates[split_idx]
-        
-        mask_train = train_df.index < split_date
-        mask_val = train_df.index >= split_date
-        
-        X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
-        g_t = train_df[mask_train].groupby(level=0).size().values
-        
-        X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
-        g_v = train_df[mask_val].groupby(level=0).size().values
-        
-        if len(g_t) == 0 or len(g_v) == 0: return 0.0
-        
-        model = lgb.LGBMRanker(**params)
-        model.fit(
-            X_t, y_t, group=g_t, 
-            eval_set=[(X_v, y_v)], eval_group=[g_v],
-            callbacks=[lgb.early_stopping(stopping_rounds=10, verbose=False)]
-        )
-        return model.best_score_['valid_0']['ndcg@1']
-
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=10) 
-    
-    best_params = study.best_params
-    best_params['random_state'] = 42
-    best_params['verbose'] = -1
-    logger.info(f"🏆 今日の相場に最適なパラメータを発見: {best_params}")
-
-    # 4. 最終推論 (Ranker + Classifier)
-    ranker = lgb.LGBMRanker(**best_params)
-    ranker.fit(X_train_sel, y_train_rank, group=group_train)
-    latest_df['Ranking_Score'] = ranker.predict(X_latest_sel)
-    
-    clf = lgb.LGBMClassifier(**best_params)
-    clf.fit(X_train_sel, y_train_class)
-    latest_df['Prob_Up'] = clf.predict_proba(X_latest_sel)[:, 1]
-
-    # 5. コンセプトドリフト監視 (PSI)
-    train_probs = clf.predict_proba(X_train_sel)[:, 1]
-    recent_mask = train_df.index >= (train_df.index.max() - pd.Timedelta(days=30))
-    if recent_mask.sum() > 0:
-        recent_probs = clf.predict_proba(X_train_sel[recent_mask])[:, 1]
-        psi = calculate_psi(train_probs, recent_probs)
-        logger.info(f"📊 コンセプトドリフト監視 (PSIスコア): {psi:.4f}")
-        if psi > 0.2:
-            logger.warning("⚠️ 警告: PSIが0.2を超過しました。相場環境(レジーム)が急変している可能性があります！")
-        elif psi > 0.1:
-            logger.info("ℹ️ 注意: PSIが0.1を超過しました。相場の傾向に変化の兆しがあります。")
+    # --- 4. 爆速推論 (推論だけなら1秒未満で終わります) ---
+    logger.info("⚡ AIによる推論(スコア計算)を実行中...")
+    latest_df['Ranking_Score'] = ranker_model.predict(X_latest_sel)
+    latest_df['Prob_Up'] = classifier_model.predict_proba(X_latest_sel)[:, 1]
 
     # 正規化と出力
     min_score = latest_df['Ranking_Score'].min()
@@ -288,11 +197,9 @@ def generate_signals():
     for i, (idx, row) in enumerate(latest_df.iterrows()):
         reasons = []
         if i == 0: reasons.append("👑 本日のAIランキング第1位銘柄です！")
-        reasons.append(f"Optuna自己学習により、全{len(latest_df)}銘柄中で相対的強さ第{i+1}位と評価されました。")
-        if row['Prob_Up'] > 0.6: reasons.append("絶対的な上昇確率(メタ確信度)も非常に高く、強い買いシグナルが点灯しています。")
+        reasons.append(f"Kaggle最新AIによる相対的強さ第{i+1}位。")
+        if row['Prob_Up'] > 0.6: reasons.append("絶対的な上昇確率(メタ確信度)も高く、強い買いシグナルが点灯しています。")
         
-        # auto_trade用の互換性維持フォーマット
-        # ※ケリー基準計算のため「短期スコア」には上昇確率をベースに重み付けして出力
         combo_score = (row['Normalized_Score'] * 0.3) + (row['Prob_Up'] * 100 * 0.7)
 
         res_dict = {
@@ -311,7 +218,7 @@ def generate_signals():
     if results:
         df_res = pd.DataFrame(results)
         df_res.to_csv('recommendations.csv', index=False, encoding='utf-8-sig')
-        logger.info("✅ 本日のAI予測バッチが完了し、recommendations.csv を更新しました。")
+        logger.info("✅ 推論完了！recommendations.csv を更新しました。")
     else:
         logger.warning("⚠️ 予測結果が生成されませんでした。")
 
