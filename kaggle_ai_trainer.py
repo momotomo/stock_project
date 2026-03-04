@@ -1,7 +1,7 @@
 # ==============================================================================
-# Kaggle専用：AI自動学習＆GitHub転送スクリプト (日経225 + メタラベリング版)
+# Kaggle専用：AI自動学習スクリプト (API直結・GitHub不要版)
 # ==============================================================================
-!pip install yfinance optuna PyGithub xgboost lightgbm beautifulsoup4 lxml -q
+!pip install yfinance optuna xgboost lightgbm -q
 
 import os
 import yfinance as yf
@@ -13,57 +13,41 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.model_selection import TimeSeriesSplit
 import optuna
 import joblib
-from github import Github
-from kaggle_secrets import UserSecretsClient
 import warnings
 import datetime
-import requests
-from bs4 import BeautifulSoup
 import time
 
 warnings.simplefilter('ignore', ResourceWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(日経225・メタラベリング版)を起動します...")
+print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(API直結版)を起動します...")
 
-try:
-    user_secrets = UserSecretsClient()
-    GITHUB_TOKEN = user_secrets.get_secret("GITHUB_TOKEN")
-    GITHUB_REPO = user_secrets.get_secret("GITHUB_REPO")
-    print("✅ GitHubトークンの読み込みに成功しました。")
-except Exception as e:
-    print(f"❌ Kaggle Secretsの読み込みエラー: {e}")
-    raise e
-
+# --- 1. 日経225銘柄リスト（安定版：直接定義） ---
 def get_nikkei225_tickers():
-    print("🌐 Wikipediaから日経225の最新構成銘柄を取得中...")
-    url = "https://ja.wikipedia.org/wiki/%E6%97%A5%E7%B5%8C%E5%B9%B3%E5%9D%87%E6%A0%AA%E4%BE%A1#%E6%A7%8B%E6%88%90%E9%8A%98%E6%9F%84"
-    try:
-        response = requests.get(url)
-        soup = BeautifulSoup(response.content, 'lxml')
-        tables = soup.find_all('table', class_='wikitable')
-        target_table = None
-        for table in tables:
-            if 'コード' in table.text and '銘柄名' in table.text:
-                target_table = table
-                break
-        if not target_table: raise ValueError("テーブルが見つかりません。")
-
-        tickers = {}
-        for row in target_table.find_all('tr')[1:]:
-            cols = row.find_all(['td', 'th'])
-            if len(cols) >= 2:
-                code = cols[0].text.strip()
-                name = cols[1].text.strip()
-                if code.isdigit(): tickers[name] = f"{code}.T"
-        print(f"✅ 日経225銘柄の取得に成功しました。合計: {len(tickers)} 銘柄")
-        return tickers
-    except Exception as e:
-        print(f"❌ 取得失敗。デフォルトを使用します: {e}")
-        return {"トヨタ自動車": "7203.T", "三菱UFJ": "8306.T", "ソフトバンクG": "9984.T"}
+    print("🌐 日経225主要銘柄リストを読み込みます...")
+    codes = [
+        4151, 4502, 4503, 4519, 4523, 4568, 4578, 6098, 7741, 1332, 1605, 1925, 1928, 2502, 
+        2801, 2802, 2914, 3382, 3401, 3402, 3405, 3407, 3861, 3863, 4004, 4005, 4021, 4042, 
+        4043, 4063, 4183, 4188, 4208, 4452, 4631, 4901, 4911, 5019, 5020, 5101, 5108, 5201, 
+        5214, 5301, 5332, 5333, 5401, 5406, 5411, 5631, 5703, 5711, 5713, 5714, 5801, 5802, 
+        5803, 5901, 6103, 6118, 6301, 6302, 6305, 6326, 6367, 6471, 6472, 6473, 6501, 6503, 
+        6504, 6506, 6645, 6701, 6702, 6724, 6752, 6753, 6758, 6762, 6770, 6841, 6857, 6861, 
+        6902, 6954, 6971, 6981, 6988, 7003, 7011, 7012, 7013, 7186, 7201, 7202, 7203, 7205, 
+        7211, 7259, 7261, 7267, 7269, 7270, 7272, 7731, 7733, 7735, 7751, 7752, 7911, 7912, 
+        7951, 8015, 8031, 8035, 8053, 8058, 9766, 2432, 3659, 4324, 4689, 4704, 4751, 7974, 
+        8001, 8002, 8028, 8766, 9432, 9433, 9434, 9613, 9735, 9843, 9983, 9984, 8252, 8253, 
+        8303, 8304, 8306, 8308, 8309, 8316, 8331, 8354, 8355, 8411, 8550, 8586, 8591, 8593, 
+        8601, 8604, 8628, 8630, 8725, 8750, 8795, 8801, 8802, 8804, 8830, 8892, 8953, 9001, 
+        9005, 9007, 9008, 9009, 9020, 9021, 9022, 9062, 9064, 9101, 9104, 9107, 9147, 9201, 
+        9202, 9301, 9501, 9502, 9503, 9504, 9506, 9508, 9531, 9532, 9602, 9736
+    ]
+    tickers = {f"Code_{code}": f"{code}.T" for code in codes}
+    print(f"✅ {len(tickers)} 銘柄のリストを読み込みました。")
+    return tickers
 
 TICKERS = get_nikkei225_tickers()
 
+# --- 2. データ取得と特徴量生成 ---
 def get_macro_data():
     macro_tickers = {"USDJPY=X": "USDJPY_Ret", "^GSPC": "SP500_Ret", "1306.T": "TOPIX_Ret"}
     macro_df = yf.download(list(macro_tickers.keys()), period="5y", progress=False)
@@ -228,7 +212,7 @@ best_params = study.best_params
 best_params['random_state'] = 42
 best_params['verbose'] = -1
 
-# --- 6. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM) ---
+# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM) ---
 print("🧠 最終モデル(Ranker)を学習中...")
 ranker_model = lgb.LGBMRanker(**best_params)
 ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
@@ -254,30 +238,13 @@ print("🧠 本番用ベースモデル(XGBoost)を学習中...")
 xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, eval_metric='logloss')
 xgb_model.fit(X_train_sel, y_train_class)
 
-print("💾 モデルをファイルに保存中...")
-os.makedirs("models", exist_ok=True)
-joblib.dump(ranker_model, 'models/ranker_model.pkl')
-joblib.dump(xgb_model, 'models/classifier_model.pkl')
-joblib.dump(meta_model, 'models/meta_model.pkl')
-joblib.dump(scaler, 'models/scaler.pkl')
-joblib.dump(selected_features, 'models/selected_features.pkl')
+# --- 4. モデルの保存 (KaggleのOutputとして保存) ---
+print("💾 モデルをファイルに保存中(Kaggle Output)...")
+# APIでダウンロードしやすいようにカレントディレクトリに保存
+joblib.dump(ranker_model, 'ranker_model.pkl')
+joblib.dump(xgb_model, 'classifier_model.pkl')
+joblib.dump(meta_model, 'meta_model.pkl')
+joblib.dump(scaler, 'scaler.pkl')
+joblib.dump(selected_features, 'selected_features.pkl')
 
-print("🌐 GitHubリポジトリへモデルを転送中...")
-g = Github(GITHUB_TOKEN)
-repo = g.get_repo(GITHUB_REPO)
-
-def upload_to_github(file_path, git_path):
-    with open(file_path, 'rb') as file: content = file.read()
-    try:
-        contents = repo.get_contents(git_path)
-        repo.update_file(contents.path, f"Auto-update {git_path} from Kaggle", content, contents.sha)
-    except Exception:
-        repo.create_file(git_path, f"Create {git_path} from Kaggle", content)
-
-upload_to_github('models/ranker_model.pkl', 'models/ranker_model.pkl')
-upload_to_github('models/classifier_model.pkl', 'models/classifier_model.pkl')
-upload_to_github('models/meta_model.pkl', 'models/meta_model.pkl')
-upload_to_github('models/scaler.pkl', 'models/scaler.pkl')
-upload_to_github('models/selected_features.pkl', 'models/selected_features.pkl')
-
-print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！")
+print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
