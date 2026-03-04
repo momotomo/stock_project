@@ -285,7 +285,10 @@ class PortfolioManager:
             hold_qty = int(p.get("HoldQty", 0) or 0)
             qty = leaves_qty + hold_qty
             entry_price = float(p.get("Price", 0) or 0)
-            hold_id = p.get("HoldID")
+            
+            # 🔥 修正: kabuステーションAPIでは保有ポジションの建玉IDは「ExecutionID」という名前で返ってきます
+            hold_id = p.get("ExecutionID")
+            
             exchange = p.get("Exchange", self.config.EXCHANGE)
             
             if qty > 0 and symbol:
@@ -293,9 +296,9 @@ class PortfolioManager:
                 if symbol not in self.positions:
                     self.add_position(symbol, qty, entry_price, hold_id, exchange)
                     if not is_startup:
-                        logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol}")
+                        logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol} (建玉ID: {hold_id})")
                     else:
-                        logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange})")
+                        logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange}, 建玉ID: {hold_id})")
                 else:
                     pos = self.positions[symbol]
                     if pos.hold_id is None and hold_id is not None:
@@ -304,7 +307,7 @@ class PortfolioManager:
                         pos.highest_price = entry_price
                         pos.take_profit_price = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
                         pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
-                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(正確な取得単価: {entry_price:,.1f}円)")
+                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(取得単価: {entry_price:,.1f}円, 建玉ID: {hold_id})")
         
         if is_startup and not found_positions and len(positions_data) > 0:
             logger.info("保有しているポジションはありませんでした。")
