@@ -52,6 +52,14 @@ def download_models_from_kaggle():
     try:
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
+        
+        # 🔥 Streamlit SecretsからKaggleの認証情報を取得して環境変数にセット
+        kaggle_username = get_secret("KAGGLE_USERNAME")
+        kaggle_key = get_secret("KAGGLE_KEY")
+        if kaggle_username and kaggle_key:
+            env["KAGGLE_USERNAME"] = kaggle_username
+            env["KAGGLE_KEY"] = kaggle_key
+        
         subprocess.run(
             ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models"],
             capture_output=True, text=True, check=True, encoding="utf-8", env=env
@@ -63,7 +71,7 @@ def download_models_from_kaggle():
             return True, "✅ モデルのダウンロードが完了しました。"
         return False, f"❌ Kaggleダウンロードエラー: {error_msg}"
     except FileNotFoundError:
-        return False, "❌ 'kaggle' コマンドが見つかりません。"
+        return False, "❌ 'kaggle' コマンドが見つかりません。アプリの requirements.txt に 'kaggle' が追加されているか確認してください。"
     except Exception as e:
         return False, f"❌ 予期せぬエラー: {e}"
 
