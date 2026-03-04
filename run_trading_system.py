@@ -17,7 +17,7 @@ CONFIG_PATH = "settings.yml"
 
 # ⚠️ 【重要】ここにあなたのKaggleノートブックのURLの一部（ID）を入力してください
 # 例： https://www.kaggle.com/code/taro/stock-ai だったら "taro/stock-ai" と書く
-KAGGLE_NOTEBOOK_SLUG = "tokkatokka/stock-ai-trainer"
+KAGGLE_NOTEBOOK_SLUG = "momotomo/stock-ai-trainer"
 
 def load_config():
     try:
@@ -58,9 +58,9 @@ def download_models_from_kaggle():
     os.makedirs("models", exist_ok=True)
     
     try:
-        # Kaggle APIを使ってOutputファイルを models フォルダにダウンロード＆解凍
+        # Kaggle APIを使ってOutputファイルを models フォルダにダウンロード (※ --unzip を削除)
         result = subprocess.run(
-            ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models", "--unzip"],
+            ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models"],
             capture_output=True, text=True, check=True
         )
         logger.info(f"✅ Kaggleモデルのダウンロード完了:\n{result.stdout.strip()}")
