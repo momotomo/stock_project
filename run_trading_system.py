@@ -15,9 +15,8 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "settings.yml"
 
-# ⚠️ 【重要】ここにあなたのKaggleノートブックのURLの一部（ID）を入力してください
-# 例： https://www.kaggle.com/code/taro/stock-ai だったら "taro/stock-ai" と書く
-KAGGLE_NOTEBOOK_SLUG = "momotomo/stock-ai-trainer"
+# ⚠️ 【重要】ここをご自身のKaggleのID（前回は tokkatokka/stock-ai-trainer でした）に必ず書き換えてください！
+KAGGLE_NOTEBOOK_SLUG = "tokkatokka/stock-ai-trainer"
 
 def load_config():
     try:
@@ -65,7 +64,9 @@ def download_models_from_kaggle():
         )
         logger.info(f"✅ Kaggleモデルのダウンロード完了:\n{result.stdout.strip()}")
     except subprocess.CalledProcessError as e:
-        logger.error(f"❌ Kaggleからのダウンロードエラー:\n{e.stderr.strip()}")
+        # 🔥 修正: エラーメッセージが隠れてしまわないように、標準出力(stdout)も拾うようにしました
+        error_msg = e.stderr.strip() if e.stderr else e.stdout.strip()
+        logger.error(f"❌ Kaggleからのダウンロードエラー:\n{error_msg}")
         logger.error("👉 ヒント: コマンドプロンプトで 'pip install kaggle' が実行されているか、'~/.kaggle/kaggle.json' が正しく配置されているか確認してください。")
     except FileNotFoundError:
         logger.error("❌ 'kaggle' コマンドが見つかりません。'pip install kaggle' を実行してください。")

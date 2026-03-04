@@ -11,3 +11,4 @@ lightgbm
 requests
 optuna
 xgboost
+kaggle
