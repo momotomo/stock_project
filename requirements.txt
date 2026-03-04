@@ -5,3 +5,7 @@ numpy
 scikit-learn
 plotly
 PyGithub
+joblib
+altair
+lightgbm
+requests
