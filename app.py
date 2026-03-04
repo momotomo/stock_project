@@ -8,12 +8,21 @@ import os
 import plotly.express as px
 from github import Github
 import warnings
+import optuna
 
-# 無害な警告を非表示にする
 warnings.simplefilter('ignore', ResourceWarning)
+optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-# ページ設定
 st.set_page_config(layout="wide", page_title="AI株価スクリーニング")
+
+def calculate_psi(expected, actual, bins=10):
+    bins_edges = np.linspace(0, 1, bins + 1)
+    expected_percents = np.histogram(expected, bins=bins_edges)[0] / len(expected)
+    actual_percents = np.histogram(actual, bins=bins_edges)[0] / len(actual)
+    expected_percents = np.where(expected_percents == 0, 0.0001, expected_percents)
+    actual_percents = np.where(actual_percents == 0, 0.0001, actual_percents)
+    psi_values = (actual_percents - expected_percents) * np.log(actual_percents / expected_percents)
+    return np.sum(psi_values)
 
 def get_tickers():
     tickers = {}
@@ -72,7 +81,6 @@ def get_stock_features(ticker, macro_returns):
     data = data.loc[:, ~data.columns.duplicated()].copy()
     data.index = pd.to_datetime(data.index).map(lambda x: x.replace(tzinfo=None).normalize())
     
-    # 既存の特徴量
     data['Log_Return'] = np.log(data['Close'] / data['Close'].shift(1))
     data['Frac_Diff_0.5'] = calc_fractional_diff(data['Close'], d=0.5, window=20)
     
@@ -100,20 +108,13 @@ def get_stock_features(ticker, macro_returns):
     data['MACD_Norm'] = (data['Close'].ewm(span=12).mean() - data['Close'].ewm(span=26).mean()) / data['Close']
     data['OBV_Ret'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum().pct_change()
 
-    # =========================================================
-    # 🔥 DeepResearch提案: 高度な特徴量空間の拡張
-    # =========================================================
-    
-    # 🟢 1. EMA差分比率
     ema_20_val = data['Close'].ewm(span=20, adjust=False).mean()
     data['EMA_Diff_Ratio'] = (data['Close'] - data['Open']) / (ema_20_val + 1e-9)
 
-    # 🟢 2. ダイバージェンスの定量化
     price_slope = data['Close'].diff(5)
     macd_slope = data['MACD_Norm'].diff(5)
     data['MACD_Div'] = np.where(np.sign(price_slope) != np.sign(macd_slope), 1, 0) * macd_slope
 
-    # 🟢 3. 動的ラグ特徴量
     lag_cols = ['Log_Return_Norm', 'RSI_14', 'MACD_Norm']
     for col in lag_cols:
         data[f'{col}_Lag1'] = data[col].shift(1)
@@ -125,17 +126,15 @@ def get_stock_features(ticker, macro_returns):
         if col not in data.columns: data[col] = 0.0
     data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']] = data[['USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret']].ffill().fillna(0)
     
-    # 🟢 5. TOPIX相対強度 (Relative Strength: 業績の良さの代替指標)
     data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
     data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
     
     data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-    data['Target_Price'] = data['Close'].shift(-1)
+    data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
     return data
 
 @st.cache_data(show_spinner=False)
 def fetch_and_prepare_all_data(tickers_dict):
-    """全銘柄を一括取得し、横断的Zスコアを計算して返す関数"""
     macro_returns = get_macro_data()
     stock_data_dict = {}
     for name, ticker in tickers_dict.items():
@@ -143,7 +142,6 @@ def fetch_and_prepare_all_data(tickers_dict):
         if data is not None:
             stock_data_dict[name] = data
             
-    # 🟢 4. 横断的Zスコア (Cross-Sectional Z-Score)
     if stock_data_dict:
         rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
         rsi_mean = rsi_df.mean(axis=1)
@@ -153,31 +151,6 @@ def fetch_and_prepare_all_data(tickers_dict):
             
     return stock_data_dict
 
-@st.cache_data
-def calc_triple_barrier(prices, horizon, pt_pct, sl_pct):
-    vals = prices.values
-    n = len(vals)
-    labels = np.full(n, np.nan)
-    for i in range(n - horizon):
-        p0 = vals[i]
-        ub = p0 * (1 + pt_pct)
-        lb = p0 * (1 - sl_pct)
-        path = vals[i+1 : i+1+horizon]
-        hit_ub = np.where(path >= ub)[0]
-        hit_lb = np.where(path <= lb)[0]
-        first_ub = hit_ub[0] if len(hit_ub) > 0 else horizon + 1
-        first_lb = hit_lb[0] if len(hit_lb) > 0 else horizon + 1
-        if first_ub == (horizon + 1) and first_lb == (horizon + 1):
-            labels[i] = 0
-        elif first_ub < first_lb:
-            labels[i] = 1
-        elif first_lb < first_ub:
-            labels[i] = -1
-        else:
-            labels[i] = 0
-    return labels
-
-# 拡張された最強特徴量セット (計25個)
 EXTENDED_FEATURES = [
     'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
     'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
@@ -187,7 +160,7 @@ EXTENDED_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-st.title("🚀 AI株価スクリーニングダッシュボード (LightGBM高度化版)")
+st.title("🚀 AI株価スクリーニングダッシュボード (Optuna自己学習・Ranker版)")
 
 tab1, tab2, tab3 = st.tabs(["🔍 今日の分析 ＆ おすすめ", "📈 予測推移", "📊 バックテスト (検証)"])
 
@@ -228,107 +201,175 @@ if st.sidebar.button("💾 監視リストを保存・同期", use_container_wid
 
 with tab1:
     st.subheader("🌟 AIが選ぶ本日のおすすめ銘柄 (自動更新)")
-    st.write("設定された銘柄のチャートをLightGBMがスキャンし、トップ銘柄を厳選しています。")
+    st.write("設定された銘柄群をLGBMRankerが横断的に評価し、相対的な「強さ」で順位付けしています。")
     
     rec_file = 'recommendations.csv'
     if os.path.exists(rec_file) and os.path.getsize(rec_file) > 0:
         try:
             df_rec = pd.read_csv(rec_file)
             
-            st.markdown("### ⚡ 短期取引向け（明日〜2週間）トップ3")
+            # 🔥 追加: データの先頭に「順位」列を追加
+            if '順位' not in df_rec.columns:
+                df_rec.insert(0, '順位', range(1, len(df_rec) + 1))
+            
+            st.markdown("### ⚡ 本日のAI推奨トップ3")
             if "短期スコア" in df_rec.columns:
-                short_top = df_rec.sort_values(by="短期スコア", ascending=False).head(3)
+                # 🔥 修正: 余計な再ソートをやめ、AIが書き出した並び順（Rankerの順位）をそのまま採用する
+                short_top = df_rec.head(3)
+                
+                # 🔥 修正: 見切れを防ぎつつ、プロのダッシュボードのようなカード型UIに変更
                 cols_s = st.columns(3)
                 for i, (_, row) in enumerate(short_top.iterrows()):
                     with cols_s[i]:
-                        st.info(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n短期期待値: **{row.get('短期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
+                        with st.container(border=True):
+                            st.markdown(f"#### 👑 第{row['順位']}位：{row['銘柄名']}")
+                            st.metric("現在値", f"¥{row.get('今日の終値', 0):.1f}")
+                            st.metric("総合スコア (相対)", f"{row.get('短期スコア', 0):.1f}")
+                            st.metric("絶対上昇確率", f"{row.get('明日の上昇確率', 0):.1f}%")
+                            st.caption(f"💡 AIの評価: {row.get('おすすめ理由', '')}")
             
-            st.markdown("### 🔭 中長期取引向け（1ヶ月〜1年）トップ3")
-            if "中長期スコア" in df_rec.columns:
-                long_top = df_rec.sort_values(by="中長期スコア", ascending=False).head(3)
-                cols_l = st.columns(3)
-                for i, (_, row) in enumerate(long_top.iterrows()):
-                    with cols_l[i]:
-                        st.success(f"**第{i+1}位：{row['銘柄名']}**\n\n現在値: ¥{row.get('今日の終値', '---')}\n\n中長期期待値: **{row.get('中長期スコア', 0):.1f}%**\n\nメタ確信度: {row.get('メタ確信度', 0):.1f}%\n\n💡 **AIの評価**: {row.get('おすすめ理由', '')}")
-                    
-            with st.expander("👉 スキャン対象の全データを詳しく見る"):
+            with st.expander("👉 スキャン対象の全データを詳しく見る (AIの評価順)"):
                 st.dataframe(df_rec, hide_index=True, use_container_width=True)
         except Exception as e:
             st.error(f"おすすめデータの読み込みに失敗しました: {e}")
 
-    st.subheader("🔍 あなたの監視リストの手動分析（全スパン）")
+    st.subheader("🔍 あなたの監視リストの手動分析（自己学習・PSI監視）")
     tickers = get_tickers()
     
     if st.button("🚀 監視銘柄の最新分析を実行", type="primary") and tickers:
-        results = []
-        tb_horizons = {'1W': 5, '2W': 10, '1M': 21, '3M': 63, '6M': 126, '1Y': 252}
-        pt_sl = {'1W': 0.03, '2W': 0.05, '1M': 0.10, '3M': 0.20, '6M': 0.30, '1Y': 0.50}
-
-        with st.spinner('データを一括取得し、高度特徴量空間(Zスコア等)を構築しています...'):
+        with st.spinner('データを一括取得し、Optunaによる自己学習とドリフト検知を実行中...'):
             stock_data_dict = fetch_and_prepare_all_data(tickers)
             
-            for name, ticker in tickers.items():
-                data = stock_data_dict.get(name)
-                if data is None: continue
+            df_all = []
+            for name, data in stock_data_dict.items():
+                data['Ticker'] = name
+                df_all.append(data)
                 
-                data_features = data.dropna(subset=EXTENDED_FEATURES)
-                if len(data_features) <= 100: continue
+            if df_all:
+                df_panel = pd.concat(df_all).sort_index()
+                df_panel = df_panel.dropna(subset=EXTENDED_FEATURES + ['Target_Return', 'Target_Class'])
                 
-                latest_data = data_features.iloc[[-1]]
-                current_price = latest_data['Close'].values[0]
-                historical_data = data_features.dropna(subset=['Target_Class', 'Target_Price'])
-                
-                if len(historical_data) <= 100: continue
-                
-                X_raw = historical_data[EXTENDED_FEATURES]
-                scaler = RobustScaler()
-                X_scaled = pd.DataFrame(scaler.fit_transform(X_raw), index=X_raw.index, columns=EXTENDED_FEATURES)
-                latest_X_scaled = pd.DataFrame(scaler.transform(latest_data[EXTENDED_FEATURES]), index=latest_data.index, columns=EXTENDED_FEATURES)
-                
-                clf = lgb.LGBMClassifier(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                y_train_tom = historical_data['Target_Class']
-                if len(np.unique(y_train_tom)) > 1:
-                    clf.fit(X_scaled, y_train_tom)
-                    prob_up = clf.predict_proba(latest_X_scaled)[0][1]
-                else:
-                    prob_up = 0.0
-                
-                reg = lgb.LGBMRegressor(n_estimators=100, max_depth=5, random_state=42, verbose=-1)
-                reg.fit(X_scaled, historical_data['Target_Price'])
-                pred_price = reg.predict(latest_X_scaled)[0]
-                
-                tb_results = {}
-                for h_key, h_days in tb_horizons.items():
-                    target_col = f'Target_TB_{h_key}'
-                    data[target_col] = calc_triple_barrier(data['Close'], h_days, pt_sl[h_key], pt_sl[h_key])
-                    valid_idx = data[data[target_col].notna()].index.intersection(X_raw.index)
-                    if len(valid_idx) > 100:
-                        y_train_tb = data.loc[valid_idx, target_col]
-                        if len(np.unique(y_train_tb)) > 1:
-                            clf.fit(X_scaled.loc[valid_idx], y_train_tb)
-                            cls = list(clf.classes_)
-                            tb_results[h_key] = clf.predict_proba(latest_X_scaled)[0][cls.index(1)] if 1 in cls else 0.0
-                        else: tb_results[h_key] = 0.0
-                    else: tb_results[h_key] = 0.0
-                
-                res_dict = {
-                    "銘柄名": name,
-                    "現在価格": float(current_price),
-                    "予測価格": float(pred_price),
-                    "明日の上昇確率": float(prob_up * 100)
-                }
-                for k in tb_horizons.keys():
-                    res_dict[f"{k} 利確(>{int(pt_sl[k]*100)}%)"] = float(tb_results[k] * 100)
-                results.append(res_dict)
+                if len(df_panel) > 100:
+                    df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
+                        lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
+                    )
 
-        if results:
-            df_res = pd.DataFrame(results).sort_values("明日の上昇確率", ascending=False)
-            st.write("### 📊 本日の分析結果（高度特徴量版）")
-            cfg = {"現在価格": st.column_config.NumberColumn(format="¥%.1f"), "予測価格": st.column_config.NumberColumn(format="¥%.1f")}
-            for col in df_res.columns:
-                if "確率" in col or "利確" in col:
-                    cfg[col] = st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
-            st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True)
+                    latest_date = df_panel.index.max()
+                    train_df = df_panel[df_panel.index < latest_date]
+                    latest_df = df_panel[df_panel.index == latest_date]
+                    
+                    X_train_raw = train_df[EXTENDED_FEATURES]
+                    y_train_rank = train_df['Target_Rank']
+                    y_train_class = train_df['Target_Class']
+                    
+                    scaler = RobustScaler()
+                    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=EXTENDED_FEATURES)
+                    X_latest_scaled = pd.DataFrame(scaler.transform(latest_df[EXTENDED_FEATURES]), index=latest_df.index, columns=EXTENDED_FEATURES)
+                    
+                    group_train = train_df.groupby(level=0).size().values
+                    
+                    fs_model = lgb.LGBMRanker(n_estimators=50, random_state=42, verbose=-1)
+                    fs_model.fit(X_train_scaled, y_train_rank, group=group_train)
+                    importance = pd.Series(fs_model.feature_importances_, index=EXTENDED_FEATURES).sort_values(ascending=False)
+                    top_k = min(int(len(EXTENDED_FEATURES) * 0.8), len(EXTENDED_FEATURES))
+                    selected_features = importance.head(top_k).index.tolist()
+                    
+                    X_train_sel = X_train_scaled[selected_features]
+                    X_latest_sel = X_latest_scaled[selected_features]
+                    
+                    def objective(trial):
+                        params = {
+                            'n_estimators': trial.suggest_int('n_estimators', 50, 100),
+                            'max_depth': trial.suggest_int('max_depth', 3, 6),
+                            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+                            'num_leaves': trial.suggest_int('num_leaves', 10, 30),
+                            'random_state': 42,
+                            'verbose': -1
+                        }
+                        dates = train_df.index.unique()
+                        split_idx = int(len(dates) * 0.8)
+                        split_date = dates[split_idx]
+                        mask_train = train_df.index < split_date
+                        mask_val = train_df.index >= split_date
+                        
+                        X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
+                        g_t = train_df[mask_train].groupby(level=0).size().values
+                        X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
+                        g_v = train_df[mask_val].groupby(level=0).size().values
+                        
+                        if len(g_t) == 0 or len(g_v) == 0: return 0.0
+                        
+                        model = lgb.LGBMRanker(**params)
+                        model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
+                        return model.best_score_['valid_0']['ndcg@1']
+                        
+                    study = optuna.create_study(direction='maximize')
+                    study.optimize(objective, n_trials=5)
+                    
+                    best_params = study.best_params
+                    best_params['random_state'] = 42
+                    best_params['verbose'] = -1
+                    
+                    ranker = lgb.LGBMRanker(**best_params)
+                    ranker.fit(X_train_sel, y_train_rank, group=group_train)
+                    latest_df['Ranking_Score'] = ranker.predict(X_latest_sel)
+                    
+                    clf = lgb.LGBMClassifier(**best_params)
+                    clf.fit(X_train_sel, y_train_class)
+                    latest_df['Prob_Up'] = clf.predict_proba(X_latest_sel)[:, 1]
+                    
+                    train_probs = clf.predict_proba(X_train_sel)[:, 1]
+                    recent_mask = train_df.index >= (train_df.index.max() - pd.Timedelta(days=30))
+                    psi_value = 0
+                    if recent_mask.sum() > 0:
+                        recent_probs = clf.predict_proba(X_train_sel[recent_mask])[:, 1]
+                        psi_value = calculate_psi(train_probs, recent_probs)
+                    
+                    min_s = latest_df['Ranking_Score'].min()
+                    max_s = latest_df['Ranking_Score'].max()
+                    if max_s > min_s:
+                        latest_df['Normalized_Score'] = (latest_df['Ranking_Score'] - min_s) / (max_s - min_s) * 100
+                    else:
+                        latest_df['Normalized_Score'] = 50.0
+                        
+                    latest_df = latest_df.sort_values(by='Ranking_Score', ascending=False)
+                    
+                    results = []
+                    for i, (idx, row) in enumerate(latest_df.iterrows()):
+                        res_dict = {
+                            "順位": int(i + 1),
+                            "銘柄名": row['Ticker'],
+                            "現在価格": float(row['Close']),
+                            "相対スコア(ランキング)": float(row['Normalized_Score']),
+                            "絶対上昇確率(メタ確信度)": float(row['Prob_Up'] * 100)
+                        }
+                        results.append(res_dict)
+
+            if results:
+                df_res = pd.DataFrame(results)
+                st.success(f"✅ 自己学習(Optuna)と特徴量選択が完了しました！ (最適パラメータ: {best_params})")
+                
+                if psi_value > 0.2:
+                    st.error(f"⚠️ 警告: PSIスコアが {psi_value:.4f} と異常値を示しています。相場環境が激変しているため、AIの予測精度が低下している可能性があります！")
+                elif psi_value > 0.1:
+                    st.warning(f"ℹ️ 注意: PSIスコアが {psi_value:.4f} です。相場の傾向に変化の兆しがあります。")
+                else:
+                    st.info(f"📊 PSIスコア (コンセプトドリフト): {psi_value:.4f} -> 相場は正常・安定しています。")
+                
+                st.write("### 📊 本日の相場に最適化された相対ランキング")
+                cfg = {
+                    "順位": st.column_config.NumberColumn(format="%d位"),
+                    "現在価格": st.column_config.NumberColumn(format="¥%.1f"), 
+                    "相対スコア(ランキング)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f"),
+                    "絶対上昇確率(メタ確信度)": st.column_config.ProgressColumn(min_value=0, max_value=100, format="%.1f%%")
+                }
+                # 🔥 修正: heightを212px（ヘッダー1行＋データ5行の計6行分）に固定し、コンパクトに表示する
+                st.dataframe(df_res, column_config=cfg, hide_index=True, use_container_width=True, height=212)
+                
+                # 🔥 追加: 表の下に「透明な余白（改行3つ分）」を強制的に挿入し、見切れを完全に防ぐ
+                st.markdown("<br><br><br>", unsafe_allow_html=True)
+            else:
+                st.warning("データが不足しているため分析できませんでした。")
 
 with tab2:
     st.write("### 📈 AI予測の過去の推移")
@@ -343,14 +384,13 @@ with tab2:
                 df_s['Date'] = pd.to_datetime(df_s['Date'])
                 df_s = df_s.sort_values('Date').reset_index(drop=True)
                 
-                available_cols = ['明日の上昇確率']
-                for col in ['1W 利確(>3%)', '2W 利確(>5%)', '1M 利確(>10%)', '3M 利確(>20%)', '6M 利確(>30%)', '1Y 利確(>50%)']:
-                    if col in df_s.columns:
-                        available_cols.append(col)
+                available_cols = ['明日の上昇確率', '短期スコア', 'メタ確信度']
+                cols_to_plot = [c for c in available_cols if c in df_s.columns]
                         
-                fig = px.line(df_s, x='Date', y=available_cols, title=f"{selected_stock} の予測確率推移", markers=True)
-                fig.update_layout(yaxis_range=[0, 100], yaxis_title="確率 (%)")
-                st.plotly_chart(fig, use_container_width=True)
+                if cols_to_plot:
+                    fig = px.line(df_s, x='Date', y=cols_to_plot, title=f"{selected_stock} の予測スコア推移", markers=True)
+                    fig.update_layout(yaxis_range=[0, 100], yaxis_title="スコア / 確率 (%)")
+                    st.plotly_chart(fig, use_container_width=True)
                 
                 st.markdown("---")
                 st.write("#### 💸 予測履歴からの「仮想損益」シミュレーション")
@@ -359,7 +399,7 @@ with tab2:
                 default_lot = 100 if selected_ticker.endswith(".T") else 1
                 
                 col_sim1, col_sim2, col_sim3 = st.columns(3)
-                with col_sim1: sim_threshold = st.slider("買い条件", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
+                with col_sim1: sim_threshold = st.slider("買い条件(スコア)", min_value=50, max_value=90, value=55, step=1, key="tab2_sim")
                 with col_sim2: sim_initial_cash = st.number_input("初期資金", value=1000000, step=100000, key="tab2_cash")
                 with col_sim3: sim_lot_size = st.number_input("1回の購入株数", value=default_lot, step=1, key="tab2_lot")
                 
@@ -369,7 +409,11 @@ with tab2:
                 for i in range(len(df_s)):
                     current_date = df_s.iloc[i]['Date']
                     current_price = df_s.iloc[i]['今日の終値']
-                    current_prob = df_s.iloc[i]['明日の上昇確率']
+                    
+                    current_prob = 0
+                    if '短期スコア' in df_s.columns: current_prob = df_s.iloc[i]['短期スコア']
+                    elif '明日の上昇確率' in df_s.columns: current_prob = df_s.iloc[i]['明日の上昇確率']
+                    
                     profit = 0
                     executed = False
                     
@@ -382,7 +426,7 @@ with tab2:
                             executed = True
                             
                     sim_history.append({
-                        'Date': current_date, '今日の終値': current_price, '明日の上昇確率': current_prob,
+                        'Date': current_date, '今日の終値': current_price, '判断スコア': current_prob,
                         'シグナル': "買い" if executed else "-", '損益(円)': profit if executed else 0, '仮想累積資産(円)': cash
                     })
                 
@@ -395,7 +439,8 @@ with tab2:
             st.error(f"履歴データの読み込みエラー: {e}")
 
 with tab3:
-    st.write("### 📊 高度特徴量による運用シミュレーション (Purged Walk-Forward)")
+    st.write("### 📊 単一銘柄ポテンシャル検証 (LGBMClassifier)")
+    st.write("※ここではRankerではなく、従来通りその銘柄が単独で利益を出せるかのシビアな検証を行います。")
     tickers_dict = get_tickers()
     if not tickers_dict:
         st.warning("サイドバーで監視リストを設定してください。")
@@ -415,7 +460,6 @@ with tab3:
 
         @st.cache_data(show_spinner=False)
         def run_purged_walk_forward_cv(ticker_name, hold_days, _tickers_dict):
-            # 常にキャッシュされた全銘柄データを取得(Zスコア利用のため)
             stock_data_dict = fetch_and_prepare_all_data(_tickers_dict)
             data = stock_data_dict.get(ticker_name)
             if data is None: return None, None

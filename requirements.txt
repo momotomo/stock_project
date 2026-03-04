@@ -9,3 +9,4 @@ joblib
 altair
 lightgbm
 requests
+optuna
