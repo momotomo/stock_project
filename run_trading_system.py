@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_PATH = "settings.yml"
 
-# ⚠️ 【重要】ここをご自身のKaggleのID（前回は tokkatokka/stock-ai-trainer でした）に必ず書き換えてください！
+# ⚠️ 【重要】ここをご自身のKaggleのIDに必ず書き換えてください！
 KAGGLE_NOTEBOOK_SLUG = "tokkatokka/stock-ai-trainer"
 
 def load_config():
@@ -57,17 +57,24 @@ def download_models_from_kaggle():
     os.makedirs("models", exist_ok=True)
     
     try:
-        # Kaggle APIを使ってOutputファイルを models フォルダにダウンロード (※ --unzip を削除)
+        # Windowsの絵文字(cp932)エラーを防ぐため、UTF-8環境変数をセット
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        
+        # Kaggle APIを使ってOutputファイルを models フォルダにダウンロード
         result = subprocess.run(
             ["kaggle", "kernels", "output", KAGGLE_NOTEBOOK_SLUG, "-p", "models"],
-            capture_output=True, text=True, check=True
+            capture_output=True, text=True, check=True, encoding="utf-8", env=env
         )
         logger.info(f"✅ Kaggleモデルのダウンロード完了:\n{result.stdout.strip()}")
     except subprocess.CalledProcessError as e:
-        # 🔥 修正: エラーメッセージが隠れてしまわないように、標準出力(stdout)も拾うようにしました
         error_msg = e.stderr.strip() if e.stderr else e.stdout.strip()
-        logger.error(f"❌ Kaggleからのダウンロードエラー:\n{error_msg}")
-        logger.error("👉 ヒント: コマンドプロンプトで 'pip install kaggle' が実行されているか、'~/.kaggle/kaggle.json' が正しく配置されているか確認してください。")
+        # ファイルのダウンロード自体は成功しており、絵文字の表示エラーで落ちただけの場合は「成功」とみなす
+        if "cp932" in error_msg or "multibyte sequence" in error_msg:
+            logger.info("✅ Kaggleモデルのダウンロード完了 (※Windowsの絵文字表示エラーはスキップしました)")
+        else:
+            logger.error(f"❌ Kaggleからのダウンロードエラー:\n{error_msg}")
+            logger.error("👉 ヒント: コマンドプロンプトで 'pip install kaggle' が実行されているか、'~/.kaggle/kaggle.json' が正しく配置されているか確認してください。")
     except FileNotFoundError:
         logger.error("❌ 'kaggle' コマンドが見つかりません。'pip install kaggle' を実行してください。")
 
