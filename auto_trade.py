@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (V2.1 完全実運用対応版)
+# kabuステーション 自動取引エンジン (V2.1 最終調整版)
 # =========================================================
 
 # --- ログ設定 ---
@@ -82,7 +82,7 @@ class Config:
             "TRADE_MODE": "MARGIN",
             "ACCOUNT_TYPE": 4,
             "MAX_POSITIONS": 2,
-            "LOT_CALC_MODE": "KELLY", 
+            "LOT_CALC_MODE": "FIXED", 
             "FIXED_LOT_SIZE": 100,
             "AUTO_INVEST_RATIO": 0.3,
             "ENTRY_THRESHOLD_PROB": 55.0,
@@ -297,7 +297,7 @@ class PortfolioManager:
         self.api = api
         self.positions: Dict[str, Position] = {}
         self.seen_exec_ids = set() 
-        self.pending_orders = {} # 🔥 V2.1: 注文と約定の突合用ディクショナリ
+        self.pending_orders = {}
 
     def add_position(self, symbol: str, qty: int, entry_price: float, exchange: int = 1, hold_id: str = None):
         tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
@@ -336,7 +336,6 @@ class PortfolioManager:
                 if symbol not in self.positions:
                     self.add_position(symbol, qty, entry_price, exchange, hold_id)
                     
-                    # 🔥 V2.1: 突合ロジック (注文時の期待値と、実際の約定値を合体させる)
                     execution_id = hold_id
                     if execution_id and execution_id not in self.seen_exec_ids:
                         self.seen_exec_ids.add(execution_id)
@@ -344,7 +343,6 @@ class PortfolioManager:
                         pending = self.pending_orders.get(symbol)
                         if pending:
                             expected_ask = pending["expected_ask"]
-                            # スリッページ計算: 予想より高く買わされた分
                             slippage_yen = entry_price - expected_ask if expected_ask > 0 else 0.0
                             log_trade_execution({
                                 "order_id": pending["order_id"],
@@ -362,9 +360,8 @@ class PortfolioManager:
                                 "slippage_yen": slippage_yen
                             })
                             logger.info(f"📝 ログ記録完了: {symbol} (予想:{expected_ask}円 -> 実約定:{entry_price}円 / スリッページ:{slippage_yen}円)")
-                            del self.pending_orders[symbol] # 記録が終わったら削除
+                            del self.pending_orders[symbol] 
                         else:
-                            # 手動買いや前日からの持ち越しなど、pendingデータがない場合
                             log_trade_execution({
                                 "order_id": "",
                                 "execution_id": execution_id,
@@ -480,7 +477,12 @@ def load_ai_signals(config: Config) -> List[dict]:
                 try: net_pct = float(row.get("Net_Score(%)", 0.0))
                 except ValueError: net_pct = 0.0
                 if net_pct <= 0: continue
-                signals.append({"name": name, "symbol": code, "net_pct": net_pct})
+                
+                # 🔥 修正: ケリー計算用に「メタ確信度」を勝率(prob)として取得
+                try: prob = float(row.get("メタ確信度(%)", row.get("メタ確信度", 50.0)))
+                except ValueError: prob = 50.0
+                
+                signals.append({"name": name, "symbol": code, "net_pct": net_pct, "prob": prob})
             else:
                 try: prob = float(row.get("短期スコア", 0))
                 except ValueError: prob = 0.0
@@ -550,7 +552,8 @@ async def main():
                 elif config.LOT_CALC_MODE == "KELLY":
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
-                    p = sig.get('prob', sig.get('net_pct', 50)) / 100.0
+                    # 🔥 修正: Net_Scoreではなく正しくメタ確信度(prob)を使う
+                    p = sig.get('prob', 50.0) / 100.0
                     
                     kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
                     invest_ratio = max(0.0, min(kelly_f / 2.0, config.AUTO_INVEST_RATIO))
@@ -585,14 +588,14 @@ async def main():
                     order_id = str(res.get("OrderId", ""))
                     logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
                     
-                    # 🔥 V2.1: ログに直接書かず、pendingとしてメモリに保持（約定検知時に合体させる）
                     portfolio.pending_orders[sig['symbol']] = {
                         "order_id": order_id,
                         "order_sent_time": order_sent_time,
                         "execution_order": execution_order,
                         "expected_ask": ask1,
                         "expected_bid": bid1,
-                        "spread_pct": spread_pct
+                        "spread_pct": spread_pct,
+                        "time_added": time.time() # 🔥 V2.1: クリーンアップ用タイムスタンプ
                     }
                     active_orders_count += 1
                 else:
@@ -623,6 +626,13 @@ async def main():
                 if sync_counter >= 3:
                     await portfolio.sync_positions(is_startup=False)
                     sync_counter = 0
+
+                # 🔥 V2.1: 未約定（10分経過）のpendingログをクリーンアップ
+                current_time = time.time()
+                for sym in list(portfolio.pending_orders.keys()):
+                    if current_time - portfolio.pending_orders[sym]["time_added"] > 600: # 10分
+                        logger.info(f"🗑️ 未約定タイムアウトのため {sym} のログ待機(pending)を破棄しました。")
+                        del portfolio.pending_orders[sym]
 
                 active_count, _, active_details = await get_active_orders(api, log=False)
                 for detail in active_details:
