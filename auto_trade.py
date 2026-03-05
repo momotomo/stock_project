@@ -482,10 +482,15 @@ def load_ai_signals(config: Config) -> List[dict]:
                 try: prob = float(row.get("メタ確信度(%)", row.get("メタ確信度", 50.0)))
                 except ValueError: prob = 50.0
                 
+                prob = max(0.0, min(prob, 100.0)) # 🔥 追加: 異常値のクリップ
+                
                 signals.append({"name": name, "symbol": code, "net_pct": net_pct, "prob": prob})
             else:
                 try: prob = float(row.get("短期スコア", 0))
                 except ValueError: prob = 0.0
+                
+                prob = max(0.0, min(prob, 100.0)) # 🔥 追加: 異常値のクリップ
+                
                 if prob >= config.ENTRY_THRESHOLD_PROB:
                     signals.append({'name': name, 'symbol': code, 'prob': prob})
                 
@@ -552,8 +557,11 @@ async def main():
                 elif config.LOT_CALC_MODE == "KELLY":
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
-                    # 🔥 修正: Net_Scoreではなく正しくメタ確信度(prob)を使う
-                    p = sig.get('prob', 50.0) / 100.0
+                    
+                    # 🔥 修正: 異常値を防ぐクリップ処理を追加
+                    prob_pct = float(sig.get('prob', 50.0))
+                    prob_pct = max(0.0, min(prob_pct, 100.0))
+                    p = prob_pct / 100.0
                     
                     kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
                     invest_ratio = max(0.0, min(kelly_f / 2.0, config.AUTO_INVEST_RATIO))
