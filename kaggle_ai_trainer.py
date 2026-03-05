@@ -1,5 +1,5 @@
 # ==============================================================================
-# Kaggle専用：AI自動学習スクリプト (API直結・GitHub不要版)
+# Kaggle専用：AI自動学習スクリプト (V2.1 実運用対応・リーク排除版)
 # ==============================================================================
 !pip install yfinance optuna xgboost lightgbm -q
 
@@ -16,13 +16,15 @@ import joblib
 import warnings
 import datetime
 import time
+import json
+from pathlib import Path
 
 warnings.simplefilter('ignore', ResourceWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(API直結版)を起動します...")
+print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
 
-# --- 1. 日経225銘柄リスト（安定版：直接定義） ---
+# --- 1. 日経225銘柄リスト ---
 def get_nikkei225_tickers():
     print("🌐 日経225主要銘柄リストを読み込みます...")
     codes = [
@@ -87,7 +89,7 @@ def get_stock_features(ticker, macro_returns):
             delta = data['Close'].diff()
             ema_up = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
             ema_down = (-1 * delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-            data['RSI_14'] = 100 - (100 / (1 + (ema_up / ema_down)))
+            data['RSI_14'] = 100 - (100 / (1 + (ema_up / (ema_down + 1e-9))))
             
             std_20 = data['Close'].rolling(20).std()
             ma_20 = data['Close'].rolling(20).mean()
@@ -113,8 +115,19 @@ def get_stock_features(ticker, macro_returns):
             data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
             data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
             
-            data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-            data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
+            # --- V2.1: TargetをOpen→Close（翌日の日中リターン）へ変更 ---
+            data["Next_Open"] = data["Open"].shift(-1)
+            data["Next_Close"] = data["Close"].shift(-1)
+
+            # 日中リターン（翌日）
+            data["Target_Return"] = (data["Next_Close"] / data["Next_Open"]) - 1.0
+
+            # クラスも「翌日の日中が上か」
+            data["Target_Class"] = (data["Next_Close"] > data["Next_Open"]).astype(int)
+
+            # --- V2.1: ATR_Prev（bfill禁止）---
+            data["ATR_Prev_Ratio"] = data["ATR"].shift(1)
+            
             return data
         except Exception:
             if attempt < max_retries - 1: time.sleep(2)
@@ -158,7 +171,8 @@ ALL_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class'])
+# V2.1: dropna に ATR_Prev_Ratio を追加
+df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class', 'ATR_Prev_Ratio'])
 df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
     lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
 )
@@ -181,38 +195,74 @@ top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
 selected_features = importance.head(top_k).index.tolist()
 X_train_sel = X_train_scaled[selected_features]
 
-print("⚙️ Optunaによるパラメータ最適化を実行中 (15 Trials)...")
-def objective(trial):
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-        'max_depth': trial.suggest_int('max_depth', 3, 8),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-        'num_leaves': trial.suggest_int('num_leaves', 10, 60),
-        'random_state': 42,
-        'verbose': -1
-    }
-    dates = train_df.index.unique()
-    split_idx = int(len(dates) * 0.8)
-    mask_train = train_df.index < dates[split_idx]
-    mask_val = train_df.index >= dates[split_idx]
-    
-    X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
-    g_t = train_df[mask_train].groupby(level=0).size().values
-    X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
-    g_v = train_df[mask_val].groupby(level=0).size().values
-    
-    if len(g_t) == 0 or len(g_v) == 0: return 0.0
-    model = lgb.LGBMRanker(**params)
-    model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
-    return model.best_score_['valid_0']['ndcg@1']
+# 🔥 変更: Optunaの週1回化と永続化のロジック
+PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")  # Kaggle Datasetのマウント先
+PARAMS_OUT = Path("best_params.json")
 
-study = optuna.create_study(direction='maximize')
-study.optimize(objective, n_trials=15)
-best_params = study.best_params
-best_params['random_state'] = 42
-best_params['verbose'] = -1
+def jst_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
 
-# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM) ---
+def is_tuning_day():
+    return jst_now().weekday() == 5  # 5=土曜日
+
+DEFAULT_PARAMS = {
+    "n_estimators": 400,
+    "learning_rate": 0.03,
+    "max_depth": 4,
+    "num_leaves": 31,
+    "random_state": 42,
+    "verbose": -1,
+}
+
+def load_best_params():
+    if PARAMS_IN.exists():
+        try:
+            return json.loads(PARAMS_IN.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"⚠️ パラメータ読み込みエラー: {e}")
+    return DEFAULT_PARAMS.copy()
+
+def save_best_params(params: dict):
+    PARAMS_OUT.write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+
+if is_tuning_day():
+    print("⚙️ 本日は土曜日: Optunaによるパラメータ最適化を実行中 (15 Trials)...")
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+            'max_depth': trial.suggest_int('max_depth', 3, 8),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 10, 60),
+            'random_state': 42,
+            'verbose': -1
+        }
+        dates = train_df.index.unique()
+        split_idx = int(len(dates) * 0.8)
+        mask_train = train_df.index < dates[split_idx]
+        mask_val = train_df.index >= dates[split_idx]
+        
+        X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
+        g_t = train_df[mask_train].groupby(level=0).size().values
+        X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
+        g_v = train_df[mask_val].groupby(level=0).size().values
+        
+        if len(g_t) == 0 or len(g_v) == 0: return 0.0
+        model = lgb.LGBMRanker(**params)
+        model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
+        return model.best_score_['valid_0']['ndcg@1']
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=15)
+    best_params = study.best_params
+    best_params['random_state'] = 42
+    best_params['verbose'] = -1
+    save_best_params(best_params)
+else:
+    print("⚙️ 本日は平日: 保存されたパラメータ(またはデフォルト)を読み込みます...")
+    best_params = load_best_params()
+    save_best_params(best_params) # 平日もOutputに残すために保存
+
+# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
 print("🧠 最終モデル(Ranker)を学習中...")
 ranker_model = lgb.LGBMRanker(**best_params)
 ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
@@ -238,12 +288,28 @@ print("🧠 本番用ベースモデル(XGBoost)を学習中...")
 xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, eval_metric='logloss')
 xgb_model.fit(X_train_sel, y_train_class)
 
+# --- V2.1: 回帰モデル（Pred_Return用）の学習を追加 ---
+print("🧠 本番用リターン回帰モデル(LGBMRegressor)を学習中...")
+y_train_reg = train_df["Target_Return"].astype(float)
+regressor_model = lgb.LGBMRegressor(
+    n_estimators=400,
+    learning_rate=0.03,
+    max_depth=4,
+    num_leaves=31,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    objective="regression", # huberが弾かれる環境対策としてregressionを採用
+    verbose=-1,
+)
+regressor_model.fit(X_train_sel, y_train_reg)
+
 # --- 4. モデルの保存 (KaggleのOutputとして保存) ---
 print("💾 モデルをファイルに保存中(Kaggle Output)...")
-# APIでダウンロードしやすいようにカレントディレクトリに保存
 joblib.dump(ranker_model, 'ranker_model.pkl')
 joblib.dump(xgb_model, 'classifier_model.pkl')
 joblib.dump(meta_model, 'meta_model.pkl')
+joblib.dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
 joblib.dump(scaler, 'scaler.pkl')
 joblib.dump(selected_features, 'selected_features.pkl')
 
