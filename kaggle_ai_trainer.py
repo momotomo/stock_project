@@ -16,6 +16,8 @@ import joblib
 import warnings
 import datetime
 import time
+import json
+from pathlib import Path
 
 warnings.simplefilter('ignore', ResourceWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -193,36 +195,72 @@ top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
 selected_features = importance.head(top_k).index.tolist()
 X_train_sel = X_train_scaled[selected_features]
 
-print("⚙️ Optunaによるパラメータ最適化を実行中 (15 Trials)...")
-def objective(trial):
-    params = {
-        'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-        'max_depth': trial.suggest_int('max_depth', 3, 8),
-        'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-        'num_leaves': trial.suggest_int('num_leaves', 10, 60),
-        'random_state': 42,
-        'verbose': -1
-    }
-    dates = train_df.index.unique()
-    split_idx = int(len(dates) * 0.8)
-    mask_train = train_df.index < dates[split_idx]
-    mask_val = train_df.index >= dates[split_idx]
-    
-    X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
-    g_t = train_df[mask_train].groupby(level=0).size().values
-    X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
-    g_v = train_df[mask_val].groupby(level=0).size().values
-    
-    if len(g_t) == 0 or len(g_v) == 0: return 0.0
-    model = lgb.LGBMRanker(**params)
-    model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
-    return model.best_score_['valid_0']['ndcg@1']
+# 🔥 変更: Optunaの週1回化と永続化のロジック
+PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")  # Kaggle Datasetのマウント先
+PARAMS_OUT = Path("best_params.json")
 
-study = optuna.create_study(direction='maximize')
-study.optimize(objective, n_trials=15)
-best_params = study.best_params
-best_params['random_state'] = 42
-best_params['verbose'] = -1
+def jst_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+
+def is_tuning_day():
+    return jst_now().weekday() == 5  # 5=土曜日
+
+DEFAULT_PARAMS = {
+    "n_estimators": 400,
+    "learning_rate": 0.03,
+    "max_depth": 4,
+    "num_leaves": 31,
+    "random_state": 42,
+    "verbose": -1,
+}
+
+def load_best_params():
+    if PARAMS_IN.exists():
+        try:
+            return json.loads(PARAMS_IN.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"⚠️ パラメータ読み込みエラー: {e}")
+    return DEFAULT_PARAMS.copy()
+
+def save_best_params(params: dict):
+    PARAMS_OUT.write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+
+if is_tuning_day():
+    print("⚙️ 本日は土曜日: Optunaによるパラメータ最適化を実行中 (15 Trials)...")
+    def objective(trial):
+        params = {
+            'n_estimators': trial.suggest_int('n_estimators', 50, 200),
+            'max_depth': trial.suggest_int('max_depth', 3, 8),
+            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
+            'num_leaves': trial.suggest_int('num_leaves', 10, 60),
+            'random_state': 42,
+            'verbose': -1
+        }
+        dates = train_df.index.unique()
+        split_idx = int(len(dates) * 0.8)
+        mask_train = train_df.index < dates[split_idx]
+        mask_val = train_df.index >= dates[split_idx]
+        
+        X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
+        g_t = train_df[mask_train].groupby(level=0).size().values
+        X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
+        g_v = train_df[mask_val].groupby(level=0).size().values
+        
+        if len(g_t) == 0 or len(g_v) == 0: return 0.0
+        model = lgb.LGBMRanker(**params)
+        model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
+        return model.best_score_['valid_0']['ndcg@1']
+
+    study = optuna.create_study(direction='maximize')
+    study.optimize(objective, n_trials=15)
+    best_params = study.best_params
+    best_params['random_state'] = 42
+    best_params['verbose'] = -1
+    save_best_params(best_params)
+else:
+    print("⚙️ 本日は平日: 保存されたパラメータ(またはデフォルト)を読み込みます...")
+    best_params = load_best_params()
+    save_best_params(best_params) # 平日もOutputに残すために保存
 
 # --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
 print("🧠 最終モデル(Ranker)を学習中...")
