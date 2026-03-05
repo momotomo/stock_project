@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (SOR買い/東証決済・決済エラー修正版)
+# kabuステーション 自動取引エンジン (V2.1 実運用対応版)
 # =========================================================
 
 # --- ログ設定 ---
@@ -26,6 +26,44 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+# ===== V2.1: トレード実行ログ設定 =====
+EXEC_LOG_PATH = "trade_execution_log.csv"
+
+EXEC_LOG_HEADER = [
+    "order_id", "execution_id", "order_sent_time", "fill_time", "execution_order",
+    "symbol", "side", "expected_ask", "expected_bid", "actual_price", "qty",
+    "spread_pct", "slippage_yen"
+]
+
+def ensure_exec_log_header():
+    if not os.path.exists(EXEC_LOG_PATH) or os.path.getsize(EXEC_LOG_PATH) == 0:
+        with open(EXEC_LOG_PATH, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(EXEC_LOG_HEADER)
+
+def log_trade_execution(row: dict):
+    ensure_exec_log_header()
+    with open(EXEC_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=EXEC_LOG_HEADER)
+        w.writerow(row)
+
+def now_str():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+def extract_best_bid_ask(board: dict) -> tuple[float, float]:
+    """kabuステ boardレスポンスから最良気配値を取得"""
+    if not board:
+        return (0.0, 0.0)
+    ask = board.get("Sell1", {}).get("Price") or board.get("AskPrice") or board.get("AskPrice1") or board.get("Ask") or 0.0
+    bid = board.get("Buy1", {}).get("Price") or board.get("BidPrice") or board.get("BidPrice1") or board.get("Bid") or 0.0
+    return (float(ask or 0.0), float(bid or 0.0))
+
+# V2.1: Kill Switch グローバル変数
+INITIAL_EQUITY = 1_000_000
+DAILY_LOSS_LIMIT = INITIAL_EQUITY * -0.02  # -2%
+today_realized_pnl = 0.0
+trading_halted = False
 
 # --- システム設定 (Config) ---
 class Config:
@@ -43,7 +81,6 @@ class Config:
             "TARGET_HORIZON": "短期",         
             "TRADE_MODE": "MARGIN",
             "ACCOUNT_TYPE": 4,
-            "FUND_TYPE": "AA",
             "MAX_POSITIONS": 2,
             "LOT_CALC_MODE": "KELLY", 
             "FIXED_LOT_SIZE": 100,
@@ -77,7 +114,6 @@ class Config:
 
         self.TRADE_MODE = self.config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
         self.ACCOUNT_TYPE = int(self.config_data.get("ACCOUNT_TYPE", default_config["ACCOUNT_TYPE"]))
-        self.FUND_TYPE = str(self.config_data.get("FUND_TYPE", default_config["FUND_TYPE"]))
         
         self.MAX_POSITIONS = self.config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
         self.LOT_CALC_MODE = self.config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
@@ -150,7 +186,9 @@ class KabuAPI:
             logger.error("❌ トークン取得失敗")
 
     async def get_board(self, symbol: str, exchange: int):
-        return await self._request("GET", f"board/{symbol}@1")
+        # 🔥 修正: 板情報取得はSOR(9)が使えないため、9なら東証(1)にフォールバック
+        target_ex = 1 if int(exchange) == 9 else int(exchange)
+        return await self._request("GET", f"board/{symbol}@{target_ex}")
 
     async def get_wallet_cash(self):
         return await self._request("GET", "wallet/cash")
@@ -170,12 +208,10 @@ class KabuAPI:
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
-            fund_type = self.config.FUND_TYPE if side == "2" else "  "  
         else:
             cash_margin = 3 if is_close else 2
             margin_trade_type = 1 
             deliv_type = 0
-            fund_type = "  "
 
         target_exchange = exchange if exchange is not None else self.config.EXCHANGE
         
@@ -193,7 +229,7 @@ class KabuAPI:
             "MarginTradeType": margin_trade_type, 
             "MarginPremiumUnit": 1, 
             "DelivType": deliv_type,
-            "FundType": fund_type, 
+            "FundType": "  ", 
             "AccountType": self.config.ACCOUNT_TYPE,
             "Qty": int(qty),
             "Price": int(price) if price == 0 else float(price),
@@ -264,8 +300,9 @@ class PortfolioManager:
         self.config = config
         self.api = api
         self.positions: Dict[str, Position] = {}
+        self.seen_exec_ids = set() # V2.1: ログ重複防止用
 
-    def add_position(self, symbol: str, qty: int, entry_price: float, hold_id: str = None, exchange: int = 1):
+    def add_position(self, symbol: str, qty: int, entry_price: float, exchange: int = 1, hold_id: str = None):
         tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
         sl = entry_price * (1 - self.config.STOP_LOSS_PCT)
         self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, entry_price, hold_id, exchange)
@@ -292,10 +329,10 @@ class PortfolioManager:
             qty = leaves_qty + hold_qty
             entry_price = float(p.get("Price", 0) or 0)
             
-            # APIから建玉IDを取得（念のため文字列に固定）
-            hold_id = str(p.get("ExecutionID", ""))
+            # 🔥 修正: 信用返済の指定に必要なのは HoldID（なければExecutionIDへフォールバック）
+            hold_id = str(p.get("HoldID", p.get("ExecutionID", "")))
             
-            # 🔥 修正: APIからの市場コードを取得（SORの9だった場合は決済用に東証の1に補正）
+            # 🔥 APIからの市場コードを取得（SORの9だった場合は決済用に東証の1に補正）
             exchange = int(p.get("Exchange", 1))
             if exchange == 9:
                 exchange = 1
@@ -303,8 +340,28 @@ class PortfolioManager:
             if qty > 0 and symbol:
                 found_positions = True
                 if symbol not in self.positions:
-                    self.add_position(symbol, qty, entry_price, hold_id, exchange)
+                    self.add_position(symbol, qty, entry_price, exchange, hold_id)
                     
+                    # V2.1: 初回認識＝約定とみなしてログ出力
+                    execution_id = hold_id
+                    if execution_id and execution_id not in self.seen_exec_ids:
+                        self.seen_exec_ids.add(execution_id)
+                        log_trade_execution({
+                            "order_id": "",  # 注文IDの完全紐付けは将来の拡張とする
+                            "execution_id": execution_id,
+                            "order_sent_time": "",
+                            "fill_time": now_str(),
+                            "execution_order": 0,
+                            "symbol": symbol,
+                            "side": "BUY",
+                            "expected_ask": 0.0,
+                            "expected_bid": 0.0,
+                            "actual_price": float(entry_price),
+                            "qty": int(qty),
+                            "spread_pct": 0.0,
+                            "slippage_yen": 0.0
+                        })
+                        
                     if not is_startup:
                         logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol} (建玉ID: {hold_id})")
                     else:
@@ -357,6 +414,19 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
+        # V2.1: 決済前に板を取って概算PnLを計算し KillSwitch に反映
+        board = await self.api.get_board(pos.symbol, self.config.EXCHANGE)
+        ask1, bid1 = extract_best_bid_ask(board)
+        exit_est = bid1 if bid1 > 0 else (board.get("CurrentPrice") or pos.entry_price)
+
+        realized = (exit_est - pos.entry_price) * pos.qty
+
+        global today_realized_pnl, trading_halted, DAILY_LOSS_LIMIT
+        today_realized_pnl += realized
+        if today_realized_pnl <= DAILY_LOSS_LIMIT:
+            trading_halted = True
+            logger.error(f"🛑 KillSwitch発動: 本日確定損益={today_realized_pnl:,.0f}円（閾値={DAILY_LOSS_LIMIT:,.0f}円）")
+
         # 🔥 決済時はSOR(9)がエラーになるため、明示的に東証(1)を指定する
         target_exchange = 1
         res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
@@ -384,28 +454,39 @@ def load_ai_signals(config: Config) -> List[dict]:
     
     with open('recommendations.csv', 'r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
-        target_col = None
-        if config.TARGET_HORIZON == "短期": target_col = "短期スコア"
-        elif config.TARGET_HORIZON == "中長期": target_col = "中長期スコア"
-        else: target_col = "明日の上昇確率"
-                    
-        if target_col not in reader.fieldnames: return signals
+        has_net = "Net_Score(%)" in (reader.fieldnames or [])
 
         for row in reader:
-            try: prob = float(row.get(target_col, 0))
-            except ValueError: prob = 0.0
+            name = row.get('銘柄名', '')
+            code = mapping.get(name)
+            if not code: continue
+
+            # V2.1: Net_Score(%) を最優先
+            if has_net:
+                try:
+                    net_pct = float(row.get("Net_Score(%)", 0.0))
+                except ValueError:
+                    net_pct = 0.0
+                if net_pct <= 0:
+                    continue
+                signals.append({"name": name, "symbol": code, "net_pct": net_pct})
+            else:
+                try: prob = float(row.get("短期スコア", 0))
+                except ValueError: prob = 0.0
+                if prob >= config.ENTRY_THRESHOLD_PROB:
+                    signals.append({'name': name, 'symbol': code, 'prob': prob})
                 
-            if prob >= config.ENTRY_THRESHOLD_PROB:
-                name = row.get('銘柄名', '')
-                code = mapping.get(name)
-                meta_conf = float(row.get('メタ確信度', prob)) 
-                if code: signals.append({'name': name, 'symbol': code, 'prob': prob, 'confidence': meta_conf})
-                
-    signals = sorted(signals, key=lambda x: x['prob'], reverse=True)
+    if signals and "net_pct" in signals[0]:
+        signals.sort(key=lambda x: x["net_pct"], reverse=True)
+    else:
+        signals.sort(key=lambda x: x.get('prob', 0), reverse=True)
     return signals
+
 
 # --- メインループ ---
 async def main():
+    global today_realized_pnl, trading_halted, DAILY_LOSS_LIMIT
+    
     config = Config()
     logger.info(f"=== 自動取引エンジン起動 (モード: {config.TRADE_STYLE.upper()}) ===")
     
@@ -430,7 +511,12 @@ async def main():
         if not signals:
             logger.info("😴 本日は新規エントリー条件を満たす銘柄はありませんでした。")
         else:
+            execution_order = 0
             for sig in signals:
+                if trading_halted:
+                    logger.warning("🛑 KillSwitch: 本日は損失上限に達したため新規エントリーを停止します。")
+                    break
+
                 if sig['symbol'] in portfolio.positions: continue
                 if sig['symbol'] in active_order_symbols: continue
                 
@@ -439,38 +525,76 @@ async def main():
                     logger.warning(f"🚫 最大保有数({config.MAX_POSITIONS}銘柄)に達したため、これ以上の新規エントリーを見送ります。")
                     break
 
-                logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']}) - 確率: {sig['prob']}%")
+                logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']})")
+                execution_order += 1
                 board = await api.get_board(sig['symbol'], config.EXCHANGE)
-                current_price = board.get("CurrentPrice") or board.get("PreviousClose") if board else 2000.0
+                
+                # V2.1: 板情報の取得とスプレッド記録
+                ask1, bid1 = extract_best_bid_ask(board)
+                spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
+                ref_price = ask1 if ask1 > 0 else (board.get("CurrentPrice") or board.get("PreviousClose") or 2000.0)
 
                 qty = 0
                 if config.LOT_CALC_MODE == "FIXED":
                     qty = config.FIXED_LOT_SIZE
                 elif config.LOT_CALC_MODE == "AUTO":
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
-                    qty = (int((avail * config.AUTO_INVEST_RATIO) / config.MAX_POSITIONS / current_price) // 100) * 100 
+                    qty = (int((avail * config.AUTO_INVEST_RATIO) / config.MAX_POSITIONS / ref_price) // 100) * 100 
                 elif config.LOT_CALC_MODE == "KELLY":
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
-                    
-                    p = sig['prob'] / 100.0
+                    p = sig.get('prob', sig.get('net_pct', 50)) / 100.0
                     
                     kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
                     invest_ratio = max(0.0, min(kelly_f / 2.0, config.AUTO_INVEST_RATIO))
                     
                     if invest_ratio > 0:
-                        qty = (int((avail * invest_ratio) / current_price) // 100) * 100 
-                        logger.info(f"🧠 ケリー基準計算: 勝率={p*100:.1f}%, ペイオフ={b:.2f} -> 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
+                        qty = (int((avail * invest_ratio) / ref_price) // 100) * 100 
+                        logger.info(f"🧠 ケリー基準計算: 勝率={p*100:.1f}%, 投資割合={invest_ratio*100:.1f}% -> 算出ロット={qty}株")
                     else:
                         logger.warning(f"⚠️ ケリー基準がマイナスのため見送ります。(勝率: {p*100:.1f}%)")
                         qty = 0
 
-                if qty == 0: continue
+                # V2.1: 1銘柄上限（10%またはリスク0.5%）の適用
+                avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1_000_000)
+                max_notional = avail * 0.10
+                max_qty_notional = int(max_notional // ref_price) if ref_price > 0 else 0
 
+                stop_pct = config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 0.05
+                max_risk = avail * 0.005
+                max_qty_risk = int(max_risk // (ref_price * stop_pct)) if ref_price > 0 else 0
+
+                max_qty = max(0, min(max_qty_notional, max_qty_risk))
+                max_qty = (max_qty // 100) * 100
+                
+                qty = min(qty, max_qty)
+                if qty <= 0:
+                    logger.info("⛔ 1銘柄上限によりロットが0になったためスキップ")
+                    continue
+
+                order_sent_time = now_str()
                 res = await api.send_order(sig['symbol'], side="2", qty=qty, is_close=False)
                 
                 if res and res.get("Result") == 0:
-                    logger.info(f"✅ エントリー注文送信成功")
+                    order_id = str(res.get("OrderId", ""))
+                    logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
+                    
+                    # 注文直後のログ記録
+                    log_trade_execution({
+                        "order_id": order_id,
+                        "execution_id": "",  # sync_positionsで埋める
+                        "order_sent_time": order_sent_time,
+                        "fill_time": "",
+                        "execution_order": execution_order,
+                        "symbol": sig["symbol"],
+                        "side": "BUY",
+                        "expected_ask": ask1,
+                        "expected_bid": bid1,
+                        "actual_price": 0.0,
+                        "qty": qty,
+                        "spread_pct": spread_pct,
+                        "slippage_yen": 0.0
+                    })
                     active_orders_count += 1
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")

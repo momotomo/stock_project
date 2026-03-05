@@ -1,5 +1,5 @@
 # ==============================================================================
-# Kaggle専用：AI自動学習スクリプト (API直結・GitHub不要版)
+# Kaggle専用：AI自動学習スクリプト (V2.1 実運用対応・リーク排除版)
 # ==============================================================================
 !pip install yfinance optuna xgboost lightgbm -q
 
@@ -20,9 +20,9 @@ import time
 warnings.simplefilter('ignore', ResourceWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
-print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(API直結版)を起動します...")
+print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
 
-# --- 1. 日経225銘柄リスト（安定版：直接定義） ---
+# --- 1. 日経225銘柄リスト ---
 def get_nikkei225_tickers():
     print("🌐 日経225主要銘柄リストを読み込みます...")
     codes = [
@@ -113,8 +113,19 @@ def get_stock_features(ticker, macro_returns):
             data['Excess_Return'] = data['Log_Return'] - data['TOPIX_Ret']
             data['Excess_Return_20d'] = data['Excess_Return'].rolling(20).sum()
             
-            data['Target_Class'] = (data['Close'].shift(-1) > data['Close']).astype(int)
-            data['Target_Return'] = data['Close'].shift(-1) / data['Close'] - 1
+            # --- V2.1: TargetをOpen→Close（翌日の日中リターン）へ変更 ---
+            data["Next_Open"] = data["Open"].shift(-1)
+            data["Next_Close"] = data["Close"].shift(-1)
+
+            # 日中リターン（翌日）
+            data["Target_Return"] = (data["Next_Close"] / data["Next_Open"]) - 1.0
+
+            # クラスも「翌日の日中が上か」
+            data["Target_Class"] = (data["Next_Close"] > data["Next_Open"]).astype(int)
+
+            # --- V2.1: ATR_Prev（bfill禁止）---
+            # すでに data['ATR'] は tr/Close で比率になっているので shiftだけでOK
+            data["ATR_Prev_Ratio"] = data["ATR"].shift(1)
             return data
         except Exception:
             if attempt < max_retries - 1: time.sleep(2)
@@ -158,7 +169,8 @@ ALL_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class'])
+# V2.1: dropna に ATR_Prev_Ratio を追加（bfill等で未来のデータを埋めない）
+df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class', 'ATR_Prev_Ratio'])
 df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
     lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
 )
@@ -212,7 +224,7 @@ best_params = study.best_params
 best_params['random_state'] = 42
 best_params['verbose'] = -1
 
-# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM) ---
+# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
 print("🧠 最終モデル(Ranker)を学習中...")
 ranker_model = lgb.LGBMRanker(**best_params)
 ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
@@ -238,6 +250,18 @@ print("🧠 本番用ベースモデル(XGBoost)を学習中...")
 xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, eval_metric='logloss')
 xgb_model.fit(X_train_sel, y_train_class)
 
+# --- V2.1: 回帰モデル（Pred_Return用）の学習を追加 ---
+print("🧠 本番用リターン回帰モデル(LGBMRegressor)を学習中...")
+y_train_return = train_df["Target_Return"].astype(float)
+regressor_model = lgb.LGBMRegressor(
+    n_estimators=300,
+    learning_rate=0.03,
+    max_depth=6,
+    num_leaves=31,
+    random_state=42
+)
+regressor_model.fit(X_train_sel, y_train_return)
+
 # --- 4. モデルの保存 (KaggleのOutputとして保存) ---
 print("💾 モデルをファイルに保存中(Kaggle Output)...")
 # APIでダウンロードしやすいようにカレントディレクトリに保存
@@ -246,5 +270,6 @@ joblib.dump(xgb_model, 'classifier_model.pkl')
 joblib.dump(meta_model, 'meta_model.pkl')
 joblib.dump(scaler, 'scaler.pkl')
 joblib.dump(selected_features, 'selected_features.pkl')
+joblib.dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
 
 print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
