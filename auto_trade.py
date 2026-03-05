@@ -29,6 +29,7 @@ logger = logging.getLogger(__name__)
 
 # ===== V2.1: トレード実行ログ設定 =====
 EXEC_LOG_PATH = "trade_execution_log.csv"
+EXEC_LOG_PATH_SIM = "trade_execution_log_SIM.csv"
 
 EXEC_LOG_HEADER = [
     "order_id", "execution_id", "order_sent_time", "fill_time", "execution_order",
@@ -37,26 +38,25 @@ EXEC_LOG_HEADER = [
 ]
 
 ORDER_STATUS_LOG_PATH = "order_status_log.csv"
-ORDER_STATUS_HEADER = [
-    "order_id", "symbol", "side", "expected_ask", "expected_bid", 
-    "order_sent_time", "status", "reason"
-]
+ORDER_STATUS_LOG_PATH_SIM = "order_status_log_SIM.csv"
 
-def ensure_exec_log_header():
-    if not os.path.exists(EXEC_LOG_PATH) or os.path.getsize(EXEC_LOG_PATH) == 0:
-        with open(EXEC_LOG_PATH, "w", newline="", encoding="utf-8-sig") as f:
+def ensure_exec_log_header(path: str):
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
             w.writerow(EXEC_LOG_HEADER)
 
-def log_trade_execution(row: dict):
-    ensure_exec_log_header()
-    with open(EXEC_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+def log_trade_execution(row: dict, is_sim: bool = False):
+    path = EXEC_LOG_PATH_SIM if is_sim else EXEC_LOG_PATH
+    ensure_exec_log_header(path)
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=EXEC_LOG_HEADER)
         w.writerow(row)
 
-def log_order_status(row: dict):
-    file_exists = os.path.exists(ORDER_STATUS_LOG_PATH) and os.path.getsize(ORDER_STATUS_LOG_PATH) > 0
-    with open(ORDER_STATUS_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+def log_order_status(row: dict, is_sim: bool = False):
+    path = ORDER_STATUS_LOG_PATH_SIM if is_sim else ORDER_STATUS_LOG_PATH
+    file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+    with open(path, "a", newline="", encoding="utf-8-sig") as f:
         w = csv.DictWriter(f, fieldnames=ORDER_STATUS_HEADER)
         if not file_exists: w.writeheader()
         w.writerow(row)
@@ -66,7 +66,8 @@ def now_str():
 
 def extract_best_bid_ask(board: dict) -> tuple[float, float]:
     """kabuステ boardレスポンスから最良気配値を取得"""
-    if not board:
+    # 🔥 Noneだけでなく、辞書型以外（エラー文字列など）が返ってきた場合のクラッシュも防ぐ
+    if board is None or not isinstance(board, dict):
         return (0.0, 0.0)
     ask = board.get("Sell1", {}).get("Price") or board.get("AskPrice") or board.get("AskPrice1") or board.get("Ask") or 0.0
     bid = board.get("Buy1", {}).get("Price") or board.get("BidPrice") or board.get("BidPrice1") or board.get("Bid") or 0.0
@@ -152,6 +153,10 @@ class Config:
         self.ENTRY_THRESHOLD_PROB = float(self.config_data.get("ENTRY_THRESHOLD_PROB", default_config["ENTRY_THRESHOLD_PROB"]))
         self.TAKE_PROFIT_PCT = float(self.config_data.get("TAKE_PROFIT_PCT", default_config["TAKE_PROFIT_PCT"]))
         self.STOP_LOSS_PCT = float(self.config_data.get("STOP_LOSS_PCT", default_config["STOP_LOSS_PCT"]))
+        
+        # 🔥 追加: ATR連動エグジット用の係数 (k1, k2)
+        self.ATR_K1 = float(self.config_data.get("ATR_K1", 2.0))
+        self.ATR_K2 = float(self.config_data.get("ATR_K2", 3.0))
 
 # --- トークンバケット ---
 class TokenBucket:
@@ -311,24 +316,16 @@ async def get_active_orders(api: KabuAPI, log: bool = True):
 
 @dataclass
 class Position:
-    symbol: str
-    qty: int
-    entry_price: float
-    take_profit_price: float
-    stop_loss_price: float
-    highest_price: float = 0.0  
-    hold_id: str = None
-    exchange: int = 1
-    last_logged_price: float = 0.0
-    is_closing: bool = False  # 🔥 二重決済防止フラグ
+    symbol: str; qty: int; entry_price: float; stop_loss_price: float; highest_price: float; 
+    hold_id: str; exchange: int; is_closing: bool = False
+    atr: float = 0.0 # 🔥 追加: ポジションにATR情報を保持
 
 class PortfolioManager:
     def __init__(self, config: Config, api: KabuAPI):
-        self.config = config
-        self.api = api
-        self.positions: Dict[str, Position] = {}
-        self.seen_exec_ids = set() 
-        self.pending_orders: Dict[str, List[dict]] = {}
+        self.config, self.api = config, api
+        self.positions, self.seen_exec_ids, self.pending_orders = {}, set(), {}
+        self.active_signals: Dict[str, float] = {} # 🔥 追加: 読み込んだATRを保持する辞書
+        self.is_sim = not self.config.IS_PRODUCTION # 🔥 追加: 渡し忘れ防止のためSIM判定を保持
 
     def _find_best_pending(self, symbol: str, side: str):
         """時間差が最小のpending（期待値ログ）を探して取り出す"""
@@ -346,12 +343,14 @@ class PortfolioManager:
             del self.pending_orders[symbol]
         return best_p
 
-    def add_position(self, symbol: str, qty: int, entry_price: float, exchange: int = 1, hold_id: str = None):
-        tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
-        sl = entry_price * (1 - self.config.STOP_LOSS_PCT)
-        self.positions[symbol] = Position(symbol, qty, entry_price, tp, sl, entry_price, hold_id, exchange)
-        mode_str = "現物" if self.config.TRADE_MODE == "CASH" else "信用"
-        logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円 / 市場: {exchange})")
+    def add_position(self, symbol: str, qty: int, entry_price: float, exchange: int, hold_id: str):
+        # 🔥 変更: ATR連動の初期損切ライン(k1)を計算
+        atr = self.active_signals.get(symbol, 0.0)
+        stop_pct = self.config.ATR_K1 * atr if atr > 0 else self.config.STOP_LOSS_PCT
+        sl = entry_price * (1 - stop_pct)
+        
+        self.positions[symbol] = Position(symbol, qty, entry_price, sl, entry_price, hold_id, exchange, False, atr)
+        logger.info(f"💼 ポジション登録: {symbol} {qty}株 (単価: {entry_price:,.1f}円 / 損切幅: {stop_pct*100:.1f}%)")
 
     async def sync_positions(self, is_startup=False, all_orders=None):
         if is_startup:
@@ -400,7 +399,7 @@ class PortfolioManager:
                         "qty": pos.qty,
                         "spread_pct": pending["spread_pct"],
                         "slippage_yen": slippage_yen
-                    })
+                    }, is_sim=self.is_sim)
                     logger.info(f"📝 SELLログ記録: {symbol} 予想Bid:{expected_bid}円 -> 実約定:{actual_price}円 / Slip:{slippage_yen}円")
                 
                 # 管理から削除
@@ -443,7 +442,7 @@ class PortfolioManager:
                                 "qty": int(qty),
                                 "spread_pct": pending["spread_pct"],
                                 "slippage_yen": slippage_yen
-                            })
+                            }, is_sim=self.is_sim)
                             logger.info(f"📝 BUYログ記録: {symbol} 予想Ask:{expected_ask}円 -> 実約定:{entry_price}円 / Slip:{slippage_yen}円")
                         else:
                             # 手動発注などの場合
@@ -453,7 +452,7 @@ class PortfolioManager:
                                 "side": "BUY", "expected_ask": 0.0, "expected_bid": 0.0,
                                 "actual_price": float(entry_price), "qty": int(qty),
                                 "spread_pct": 0.0, "slippage_yen": 0.0
-                            })
+                            }, is_sim=self.is_sim)
                         
                     if not is_startup:
                         logger.info(f"🎉 注文の約定を確認しました！監視モードに移行します: {symbol} (建玉ID: {hold_id})")
@@ -465,7 +464,6 @@ class PortfolioManager:
                         pos.hold_id = hold_id
                         pos.entry_price = entry_price
                         pos.highest_price = entry_price
-                        pos.take_profit_price = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
                         pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
                         logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(建玉ID: {hold_id})")
         
@@ -505,7 +503,7 @@ class PortfolioManager:
                         "expected_ask": p["expected_ask"], "expected_bid": p["expected_bid"],
                         "order_sent_time": p["order_sent_time"],
                         "status": status, "reason": reason
-                    })
+                    }, is_sim=self.is_sim)
                     logger.info(f"🗑️ ログ待機破棄: {sym} ({status})")
                     continue
                 
@@ -516,10 +514,11 @@ class PortfolioManager:
                 del self.pending_orders[sym]
 
     async def check_barriers(self):
-        for symbol, pos in list(self.positions.items()):
-            if pos.is_closing: continue # すでに決済注文を出している場合はスキップ
+        """トレール決済・損切監視"""
+        for sym, pos in list(self.positions.items()):
+            if pos.is_closing: continue
 
-            board = await self.api.get_board(symbol, self.config.EXCHANGE)
+            board = await self.api.get_board(sym, pos.exchange)
             if not board: continue
             
             current_price = board.get("CurrentPrice") or board.get("PreviousClose")
@@ -534,19 +533,18 @@ class PortfolioManager:
             if current_price > pos.highest_price:
                 pos.highest_price = current_price
                 if current_price > pos.entry_price:
-                    new_sl = current_price * (1 - self.config.STOP_LOSS_PCT)
+                    # 🔥 変更: ATR連動のトレール幅(k2)を計算
+                    trail_pct = self.config.ATR_K2 * pos.atr if pos.atr > 0 else self.config.STOP_LOSS_PCT
+                    new_sl = current_price * (1 - trail_pct)
                     if new_sl > pos.stop_loss_price:
                         pos.stop_loss_price = new_sl
-                        logger.info(f"✨ トレール発動！ {symbol} が最高値を更新。損切ラインを {new_sl:,.1f}円 に引き上げました。")
+                        logger.info(f"✨ トレール発動！ {sym} が最高値を更新。損切ラインを {new_sl:,.1f}円 に引き上げました。")
             
-            if current_price != pos.last_logged_price:
-                pos.last_logged_price = current_price
-
             if current_price <= pos.stop_loss_price:
                 if current_price > pos.entry_price:
-                    logger.warning(f"📈 トレール利確！ {symbol} の決済（売り）を実行します。")
+                    logger.warning(f"📈 トレール利確！ {sym} の決済（売り）を実行します。")
                 else:
-                    logger.error(f"📉 損切バリア到達！ {symbol} の決済（売り）を実行します。")
+                    logger.error(f"📉 損切バリア到達！ {sym} の決済（売り）を実行します。")
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
@@ -570,7 +568,6 @@ class PortfolioManager:
             logger.info(f"✅ 決済注文受付成功: {pos.symbol} (OrderID: {order_id})")
 
             if not self.config.IS_PRODUCTION and str(order_id).startswith('SIM_'):
-                # シミュレーションでは約定/建玉が発生しないため、pending突合を行わずステータスログのみ残す
                 log_order_status({
                     'order_id': order_id,
                     'symbol': pos.symbol,
@@ -580,10 +577,9 @@ class PortfolioManager:
                     'order_sent_time': now_str(),
                     'status': 'SIM_SENT',
                     'reason': 'Simulated close order (no execution)'
-                })
+                }, is_sim=self.is_sim)
                 return
 
-            # 🔥 SELL側の期待値ログを積む
             spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
             self.pending_orders.setdefault(pos.symbol, []).append({
                 'order_id': order_id,
@@ -595,7 +591,6 @@ class PortfolioManager:
                 'time_added': time.time(),
                 'side': 'SELL'
             })
-            # ※ポジション自体の削除(del self.positions)は、sync_positions側の消滅検知に任せる
         else:
             pos.is_closing = False
             logger.error(f"❌ 決済注文失敗: {res}")
@@ -625,6 +620,10 @@ def load_ai_signals(config: Config) -> List[dict]:
             if not code: continue
             code = str(code).replace(".T", "").strip()
 
+            atr = 0.0
+            try: atr = float(row.get("ATR_Prev_Ratio", 0.0))
+            except ValueError: pass
+
             if has_net:
                 try: net_pct = float(row.get("Net_Score(%)", 0.0))
                 except ValueError: net_pct = 0.0
@@ -634,14 +633,14 @@ def load_ai_signals(config: Config) -> List[dict]:
                 except ValueError: prob = 50.0
                 
                 prob = max(0.0, min(prob, 100.0))
-                signals.append({"name": name, "symbol": code, "net_pct": net_pct, "prob": prob})
+                signals.append({"name": name, "symbol": code, "net_pct": net_pct, "prob": prob, "atr": atr})
             else:
                 try: prob = float(row.get("短期スコア", 0))
                 except ValueError: prob = 0.0
                 
                 prob = max(0.0, min(prob, 100.0))
                 if prob >= config.ENTRY_THRESHOLD_PROB:
-                    signals.append({'name': name, 'symbol': code, 'prob': prob})
+                    signals.append({'name': name, 'symbol': code, 'prob': prob, "atr": atr})
                 
     if signals and "net_pct" in signals[0]:
         signals.sort(key=lambda x: x["net_pct"], reverse=True)
@@ -672,6 +671,8 @@ async def main():
             signals = []
         else:
             signals = load_ai_signals(config)
+            # 🔥 追加: 読み込んだシグナルのATRをPortfolioManagerに登録
+            portfolio.active_signals = {sig['symbol']: sig.get('atr', 0.0) for sig in signals}
 
         if not signals:
             logger.info("😴 本日は新規エントリー条件を満たす銘柄はありませんでした。")
@@ -696,7 +697,6 @@ async def main():
                 if not board:
                     consecutive_board_failures += 1
                     logger.warning(f"⚠️ 板情報が取得できませんでした: {sig['symbol']}（スキップ）")
-                    # 連続して板取得に失敗する場合は、その日の新規エントリーを停止（API不調・閉場・メンテ対策）
                     if consecutive_board_failures >= 5:
                         logger.error("🛑 板情報取得の連続失敗が閾値に達したため、本日の新規エントリーを停止します")
                         break
@@ -710,7 +710,7 @@ async def main():
                     continue
 
                 spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
-                ref_price = ask1  # BUY成行の参照価格はAskを使う（V2.1ログ整合）
+                ref_price = ask1 
 
                 qty = 0
                 if config.LOT_CALC_MODE == "FIXED":
@@ -760,7 +760,6 @@ async def main():
                     logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
                     
                     if not config.IS_PRODUCTION and str(order_id).startswith('SIM_'):
-                        # シミュレーションでは約定/建玉が発生しないため、pending突合を行わずステータスログのみ残す
                         log_order_status({
                             'order_id': order_id,
                             'symbol': sig['symbol'],
@@ -770,7 +769,7 @@ async def main():
                             'order_sent_time': order_sent_time,
                             'status': 'SIM_SENT',
                             'reason': 'Simulated order (no execution)'
-                        })
+                        }, is_sim=not config.IS_PRODUCTION)
                     else:
                         portfolio.pending_orders.setdefault(sig['symbol'], []).append({
                             'order_id': order_id,
@@ -815,7 +814,6 @@ async def main():
                     await portfolio.sync_positions(is_startup=False, all_orders=all_orders)
                     sync_counter = 0
 
-                # 🔥 V2.1: TTL(10分)超過のpendingを状態判定してクリーンアップ
                 await portfolio.cleanup_pendings(all_orders)
 
                 for detail in active_details:
