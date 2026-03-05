@@ -188,6 +188,7 @@ class KabuAPI:
     async def close_session(self):
         if self.session:
             await self.session.close()
+            self.session = None
 
     async def _request(self, method: str, endpoint: str, data: dict = None, params: dict = None) -> dict:
         await self.bucket.consume()
@@ -552,7 +553,7 @@ class PortfolioManager:
         pos.is_closing = True # 二重決済防止
         board = await self.api.get_board(pos.symbol, self.config.EXCHANGE)
         ask1, bid1 = extract_best_bid_ask(board)
-        exit_est = bid1 if bid1 > 0 else (board.get("CurrentPrice") or pos.entry_price)
+        exit_est = bid1 if bid1 > 0 else ((board.get("CurrentPrice") if board else None) or pos.entry_price)
 
         realized = (exit_est - pos.entry_price) * pos.qty
 
@@ -567,18 +568,32 @@ class PortfolioManager:
         if res and res.get("Result") == 0:
             order_id = str(res.get("OrderId", ""))
             logger.info(f"✅ 決済注文受付成功: {pos.symbol} (OrderID: {order_id})")
-            
+
+            if not self.config.IS_PRODUCTION and str(order_id).startswith('SIM_'):
+                # シミュレーションでは約定/建玉が発生しないため、pending突合を行わずステータスログのみ残す
+                log_order_status({
+                    'order_id': order_id,
+                    'symbol': pos.symbol,
+                    'side': 'SELL',
+                    'expected_ask': ask1,
+                    'expected_bid': bid1,
+                    'order_sent_time': now_str(),
+                    'status': 'SIM_SENT',
+                    'reason': 'Simulated close order (no execution)'
+                })
+                return
+
             # 🔥 SELL側の期待値ログを積む
             spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
             self.pending_orders.setdefault(pos.symbol, []).append({
-                "order_id": order_id,
-                "order_sent_time": now_str(),
-                "execution_order": 0,
-                "expected_ask": ask1,
-                "expected_bid": bid1,
-                "spread_pct": spread_pct,
-                "time_added": time.time(),
-                "side": "SELL"
+                'order_id': order_id,
+                'order_sent_time': now_str(),
+                'execution_order': 0,
+                'expected_ask': ask1,
+                'expected_bid': bid1,
+                'spread_pct': spread_pct,
+                'time_added': time.time(),
+                'side': 'SELL'
             })
             # ※ポジション自体の削除(del self.positions)は、sync_positions側の消滅検知に任せる
         else:
@@ -662,6 +677,7 @@ async def main():
             logger.info("😴 本日は新規エントリー条件を満たす銘柄はありませんでした。")
         else:
             execution_order = 0
+            consecutive_board_failures = 0
             for sig in signals:
                 if trading_halted:
                     logger.warning("🛑 KillSwitch: 本日は損失上限に達したため新規エントリーを停止します。")
@@ -677,10 +693,24 @@ async def main():
                 logger.info(f"🌟 AIシグナル発火！ 銘柄: {sig['name']} ({sig['symbol']})")
                 execution_order += 1
                 board = await api.get_board(sig['symbol'], config.EXCHANGE)
-                
+                if not board:
+                    consecutive_board_failures += 1
+                    logger.warning(f"⚠️ 板情報が取得できませんでした: {sig['symbol']}（スキップ）")
+                    # 連続して板取得に失敗する場合は、その日の新規エントリーを停止（API不調・閉場・メンテ対策）
+                    if consecutive_board_failures >= 5:
+                        logger.error("🛑 板情報取得の連続失敗が閾値に達したため、本日の新規エントリーを停止します")
+                        break
+                    continue
+
+                consecutive_board_failures = 0
+
                 ask1, bid1 = extract_best_bid_ask(board)
+                if ask1 <= 0:
+                    logger.warning(f"⚠️ 最良売気配(Ask)が0です: {sig['symbol']}（スキップ）")
+                    continue
+
                 spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
-                ref_price = ask1 if ask1 > 0 else (board.get("CurrentPrice") or board.get("PreviousClose") or 2000.0)
+                ref_price = ask1  # BUY成行の参照価格はAskを使う（V2.1ログ整合）
 
                 qty = 0
                 if config.LOT_CALC_MODE == "FIXED":
@@ -729,17 +759,30 @@ async def main():
                     order_id = str(res.get("OrderId", ""))
                     logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
                     
-                    portfolio.pending_orders.setdefault(sig['symbol'], []).append({
-                        "order_id": order_id,
-                        "order_sent_time": order_sent_time,
-                        "execution_order": execution_order,
-                        "expected_ask": ask1,
-                        "expected_bid": bid1,
-                        "spread_pct": spread_pct,
-                        "time_added": time.time(),
-                        "side": "BUY"
-                    })
-                    active_orders_count += 1
+                    if not config.IS_PRODUCTION and str(order_id).startswith('SIM_'):
+                        # シミュレーションでは約定/建玉が発生しないため、pending突合を行わずステータスログのみ残す
+                        log_order_status({
+                            'order_id': order_id,
+                            'symbol': sig['symbol'],
+                            'side': 'BUY',
+                            'expected_ask': ask1,
+                            'expected_bid': bid1,
+                            'order_sent_time': order_sent_time,
+                            'status': 'SIM_SENT',
+                            'reason': 'Simulated order (no execution)'
+                        })
+                    else:
+                        portfolio.pending_orders.setdefault(sig['symbol'], []).append({
+                            'order_id': order_id,
+                            'order_sent_time': order_sent_time,
+                            'execution_order': execution_order,
+                            'expected_ask': ask1,
+                            'expected_bid': bid1,
+                            'spread_pct': spread_pct,
+                            'time_added': time.time(),
+                            'side': 'BUY'
+                        })
+                        active_orders_count += 1
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
         
