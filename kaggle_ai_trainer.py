@@ -87,7 +87,7 @@ def get_stock_features(ticker, macro_returns):
             delta = data['Close'].diff()
             ema_up = delta.clip(lower=0).ewm(com=13, adjust=False).mean()
             ema_down = (-1 * delta.clip(upper=0)).ewm(com=13, adjust=False).mean()
-            data['RSI_14'] = 100 - (100 / (1 + (ema_up / ema_down)))
+            data['RSI_14'] = 100 - (100 / (1 + (ema_up / (ema_down + 1e-9))))
             
             std_20 = data['Close'].rolling(20).std()
             ma_20 = data['Close'].rolling(20).mean()
@@ -124,8 +124,8 @@ def get_stock_features(ticker, macro_returns):
             data["Target_Class"] = (data["Next_Close"] > data["Next_Open"]).astype(int)
 
             # --- V2.1: ATR_Prev（bfill禁止）---
-            # すでに data['ATR'] は tr/Close で比率になっているので shiftだけでOK
             data["ATR_Prev_Ratio"] = data["ATR"].shift(1)
+            
             return data
         except Exception:
             if attempt < max_retries - 1: time.sleep(2)
@@ -169,7 +169,7 @@ ALL_FEATURES = [
     'Excess_Return', 'Excess_Return_20d'
 ]
 
-# V2.1: dropna に ATR_Prev_Ratio を追加（bfill等で未来のデータを埋めない）
+# V2.1: dropna に ATR_Prev_Ratio を追加
 df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class', 'ATR_Prev_Ratio'])
 df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
     lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
@@ -252,24 +252,27 @@ xgb_model.fit(X_train_sel, y_train_class)
 
 # --- V2.1: 回帰モデル（Pred_Return用）の学習を追加 ---
 print("🧠 本番用リターン回帰モデル(LGBMRegressor)を学習中...")
-y_train_return = train_df["Target_Return"].astype(float)
+y_train_reg = train_df["Target_Return"].astype(float)
 regressor_model = lgb.LGBMRegressor(
-    n_estimators=300,
+    n_estimators=400,
     learning_rate=0.03,
-    max_depth=6,
+    max_depth=4,
     num_leaves=31,
-    random_state=42
+    subsample=0.8,
+    colsample_bytree=0.8,
+    random_state=42,
+    objective="regression", # huberが弾かれる環境対策としてregressionを採用
+    verbose=-1,
 )
-regressor_model.fit(X_train_sel, y_train_return)
+regressor_model.fit(X_train_sel, y_train_reg)
 
 # --- 4. モデルの保存 (KaggleのOutputとして保存) ---
 print("💾 モデルをファイルに保存中(Kaggle Output)...")
-# APIでダウンロードしやすいようにカレントディレクトリに保存
 joblib.dump(ranker_model, 'ranker_model.pkl')
 joblib.dump(xgb_model, 'classifier_model.pkl')
 joblib.dump(meta_model, 'meta_model.pkl')
+joblib.dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
 joblib.dump(scaler, 'scaler.pkl')
 joblib.dump(selected_features, 'selected_features.pkl')
-joblib.dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
 
 print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
