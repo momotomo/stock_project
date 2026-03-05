@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (信用2銘柄・通知なし・1日1回終了版)
+# kabuステーション 自動取引エンジン (SOR買い/東証決済・決済エラー修正版)
 # =========================================================
 
 # --- ログ設定 ---
@@ -43,6 +43,7 @@ class Config:
             "TARGET_HORIZON": "短期",         
             "TRADE_MODE": "MARGIN",
             "ACCOUNT_TYPE": 4,
+            "FUND_TYPE": "AA",
             "MAX_POSITIONS": 2,
             "LOT_CALC_MODE": "KELLY", 
             "FIXED_LOT_SIZE": 100,
@@ -76,6 +77,7 @@ class Config:
 
         self.TRADE_MODE = self.config_data.get("TRADE_MODE", default_config["TRADE_MODE"])
         self.ACCOUNT_TYPE = int(self.config_data.get("ACCOUNT_TYPE", default_config["ACCOUNT_TYPE"]))
+        self.FUND_TYPE = str(self.config_data.get("FUND_TYPE", default_config["FUND_TYPE"]))
         
         self.MAX_POSITIONS = self.config_data.get("MAX_POSITIONS", default_config["MAX_POSITIONS"])
         self.LOT_CALC_MODE = self.config_data.get("LOT_CALC_MODE", default_config["LOT_CALC_MODE"])
@@ -168,7 +170,7 @@ class KabuAPI:
             cash_margin = 1
             margin_trade_type = 1 
             deliv_type = 2 if side == "2" else 0
-            fund_type = "AA" if side == "2" else "  "  
+            fund_type = self.config.FUND_TYPE if side == "2" else "  "  
         else:
             cash_margin = 3 if is_close else 2
             margin_trade_type = 1 
@@ -176,6 +178,10 @@ class KabuAPI:
             fund_type = "  "
 
         target_exchange = exchange if exchange is not None else self.config.EXCHANGE
+        
+        # 🔥 決済（返済）時はSOR(9)が使えないため、強制的に東証(1)に変更する
+        if is_close and target_exchange == 9:
+            target_exchange = 1
 
         order_data = {
             "Password": self.config.TRADE_PASSWORD,
@@ -289,13 +295,14 @@ class PortfolioManager:
             # APIから建玉IDを取得（念のため文字列に固定）
             hold_id = str(p.get("ExecutionID", ""))
             
-            # 🔥 追加・修正: APIからPTS市場(27等)が返ってきても、決済エラーを防ぐため強制的に「設定ファイル(東証等)の市場コード」で上書きします
-            exchange = self.config.EXCHANGE
+            # 🔥 修正: APIからの市場コードを取得（SORの9だった場合は決済用に東証の1に補正）
+            exchange = int(p.get("Exchange", 1))
+            if exchange == 9:
+                exchange = 1
             
             if qty > 0 and symbol:
                 found_positions = True
                 if symbol not in self.positions:
-                    # 🔥 修正: 引数の順番を【元通り】に戻します（hold_id が先）。前回の私の指示は忘れてください！
                     self.add_position(symbol, qty, entry_price, hold_id, exchange)
                     
                     if not is_startup:
@@ -350,7 +357,8 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
-        target_exchange = pos.exchange if self.config.TRADE_MODE == "MARGIN" else self.config.EXCHANGE
+        # 🔥 決済時はSOR(9)がエラーになるため、明示的に東証(1)を指定する
+        target_exchange = 1
         res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
         if res and res.get("Result") == 0:
             logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
@@ -445,7 +453,6 @@ async def main():
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
                     
-                    # 🔥 修正: 厳しすぎる「メタ確信度」の代わりに、メインAIの予測確率をケリー基準の勝率として採用
                     p = sig['prob'] / 100.0
                     
                     kelly_f = p - ((1.0 - p) / b) if b > 0 else 0.0
