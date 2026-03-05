@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Dict, List
 
 # =========================================================
-# kabuステーション 自動取引エンジン (V2.1 最終調整版)
+# kabuステーション 自動取引エンジン (V2.1 完全突合・品質向上版)
 # =========================================================
 
 # --- ログ設定 ---
@@ -36,6 +36,12 @@ EXEC_LOG_HEADER = [
     "spread_pct", "slippage_yen"
 ]
 
+ORDER_STATUS_LOG_PATH = "order_status_log.csv"
+ORDER_STATUS_HEADER = [
+    "order_id", "symbol", "side", "expected_ask", "expected_bid", 
+    "order_sent_time", "status", "reason"
+]
+
 def ensure_exec_log_header():
     if not os.path.exists(EXEC_LOG_PATH) or os.path.getsize(EXEC_LOG_PATH) == 0:
         with open(EXEC_LOG_PATH, "w", newline="", encoding="utf-8-sig") as f:
@@ -48,6 +54,13 @@ def log_trade_execution(row: dict):
         w = csv.DictWriter(f, fieldnames=EXEC_LOG_HEADER)
         w.writerow(row)
 
+def log_order_status(row: dict):
+    file_exists = os.path.exists(ORDER_STATUS_LOG_PATH) and os.path.getsize(ORDER_STATUS_LOG_PATH) > 0
+    with open(ORDER_STATUS_LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        w = csv.DictWriter(f, fieldnames=ORDER_STATUS_HEADER)
+        if not file_exists: w.writeheader()
+        w.writerow(row)
+
 def now_str():
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
@@ -58,6 +71,22 @@ def extract_best_bid_ask(board: dict) -> tuple[float, float]:
     ask = board.get("Sell1", {}).get("Price") or board.get("AskPrice") or board.get("AskPrice1") or board.get("Ask") or 0.0
     bid = board.get("Buy1", {}).get("Price") or board.get("BidPrice") or board.get("BidPrice1") or board.get("Bid") or 0.0
     return (float(ask or 0.0), float(bid or 0.0))
+
+def extract_actual_price(api_order: dict) -> float:
+    """ordersレスポンスの詳細から平均約定単価（VWAP）を抽出"""
+    if not api_order: return 0.0
+    details = api_order.get("Details", [])
+    total_val = 0.0
+    total_qty = 0
+    for d in details:
+        if d.get("State") == 5:
+            p = float(d.get("Price", 0))
+            q = int(d.get("Qty", 0))
+            total_val += p * q
+            total_qty += q
+    if total_qty > 0:
+        return total_val / total_qty
+    return 0.0
 
 # V2.1: Kill Switch グローバル変数
 INITIAL_EQUITY = 1_000_000
@@ -277,7 +306,7 @@ async def get_active_orders(api: KabuAPI, log: bool = True):
                     })
                 if log:
                     logger.info(f"⏳ 未約定(予約・待機中)の注文を認識しました: {symbol}")
-    return active_count, active_symbols, active_details
+    return active_count, active_symbols, active_details, orders
 
 @dataclass
 class Position:
@@ -290,6 +319,7 @@ class Position:
     hold_id: str = None
     exchange: int = 1
     last_logged_price: float = 0.0
+    is_closing: bool = False  # 🔥 二重決済防止フラグ
 
 class PortfolioManager:
     def __init__(self, config: Config, api: KabuAPI):
@@ -297,7 +327,23 @@ class PortfolioManager:
         self.api = api
         self.positions: Dict[str, Position] = {}
         self.seen_exec_ids = set() 
-        self.pending_orders = {}
+        self.pending_orders: Dict[str, List[dict]] = {}
+
+    def _find_best_pending(self, symbol: str, side: str):
+        """時間差が最小のpending（期待値ログ）を探して取り出す"""
+        pending_list = self.pending_orders.get(symbol, [])
+        side_pendings = [p for p in pending_list if p.get("side", "BUY") == side]
+        if not side_pendings:
+            return None
+        
+        now = time.time()
+        # 注文送信時刻からの経過時間が最も小さいものを優先
+        best_p = min(side_pendings, key=lambda p: abs(now - p["time_added"]))
+        
+        self.pending_orders[symbol] = [p for p in pending_list if p != best_p]
+        if not self.pending_orders[symbol]:
+            del self.pending_orders[symbol]
+        return best_p
 
     def add_position(self, symbol: str, qty: int, entry_price: float, exchange: int = 1, hold_id: str = None):
         tp = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
@@ -306,47 +352,85 @@ class PortfolioManager:
         mode_str = "現物" if self.config.TRADE_MODE == "CASH" else "信用"
         logger.info(f"💼 ポジション登録 [{mode_str}]: {symbol} {qty}株 (取得単価: {entry_price:,.1f}円 / 市場: {exchange})")
 
-    async def sync_positions(self, is_startup=False):
+    async def sync_positions(self, is_startup=False, all_orders=None):
         if is_startup:
             logger.info("🔄 持ち越しポジション（残高）を確認中...")
             
         product = 1 if self.config.TRADE_MODE == "CASH" else 2
         positions_data = await self.api.get_positions(product=product)
-        
-        if not positions_data:
-            if is_startup:
-                logger.info("保有しているポジションはありませんでした。")
-            return
+        if positions_data is None: return
 
+        # 現在の保有建玉IDのセットを作成
+        current_hold_ids = {str(p.get("HoldID", p.get("ExecutionID", ""))): p for p in positions_data}
+        
+        # 🔥 1. SELL（決済）の検知：持っていたはずのポジションがAPIから消えたら約定とみなす
+        for symbol, pos in list(self.positions.items()):
+            if pos.hold_id and pos.hold_id not in current_hold_ids:
+                logger.info(f"💨 決済完了(ポジション消滅)を確認: {symbol}")
+                pending = self._find_best_pending(symbol, "SELL")
+                
+                # 正確な約定単価を取るため orders から探す
+                actual_price = 0.0
+                if all_orders and pending:
+                    for o in all_orders:
+                        if str(o.get("ID")) == pending["order_id"]:
+                            actual_price = extract_actual_price(o)
+                            break
+                            
+                # ordersから取れなければ期待Bidで仮埋め
+                if actual_price == 0.0 and pending:
+                    actual_price = pending["expected_bid"]
+                    
+                if pending:
+                    expected_bid = pending["expected_bid"]
+                    # SELL側のスリッページは「期待Bidより安く売らされたらプラス（不利）」
+                    slippage_yen = expected_bid - actual_price if expected_bid > 0 else 0.0
+                    log_trade_execution({
+                        "order_id": pending["order_id"],
+                        "execution_id": pos.hold_id,
+                        "order_sent_time": pending["order_sent_time"],
+                        "fill_time": now_str(),
+                        "execution_order": pending["execution_order"],
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "expected_ask": pending["expected_ask"],
+                        "expected_bid": expected_bid,
+                        "actual_price": float(actual_price),
+                        "qty": pos.qty,
+                        "spread_pct": pending["spread_pct"],
+                        "slippage_yen": slippage_yen
+                    })
+                    logger.info(f"📝 SELLログ記録: {symbol} 予想Bid:{expected_bid}円 -> 実約定:{actual_price}円 / Slip:{slippage_yen}円")
+                
+                # 管理から削除
+                del self.positions[symbol]
+
+        # 🔥 2. BUY（新規）の検知
         found_positions = False
         for p in positions_data:
             symbol = p.get("Symbol")
-            leaves_qty = int(p.get("LeavesQty", 0) or 0)
-            hold_qty = int(p.get("HoldQty", 0) or 0)
-            qty = leaves_qty + hold_qty
+            qty = int(p.get("LeavesQty", 0) or 0) + int(p.get("HoldQty", 0) or 0)
             entry_price = float(p.get("Price", 0) or 0)
-            
             hold_id = str(p.get("HoldID", p.get("ExecutionID", "")))
             exchange = int(p.get("Exchange", 1))
-            if exchange == 9:
-                exchange = 1
+            if exchange == 9: exchange = 1
             
             if qty > 0 and symbol:
                 found_positions = True
                 if symbol not in self.positions:
                     self.add_position(symbol, qty, entry_price, exchange, hold_id)
                     
-                    execution_id = hold_id
-                    if execution_id and execution_id not in self.seen_exec_ids:
-                        self.seen_exec_ids.add(execution_id)
+                    if hold_id and hold_id not in self.seen_exec_ids:
+                        self.seen_exec_ids.add(hold_id)
+                        pending = self._find_best_pending(symbol, "BUY")
                         
-                        pending = self.pending_orders.get(symbol)
                         if pending:
                             expected_ask = pending["expected_ask"]
+                            # BUY側のスリッページは「期待Askより高く買わされたらプラス（不利）」
                             slippage_yen = entry_price - expected_ask if expected_ask > 0 else 0.0
                             log_trade_execution({
                                 "order_id": pending["order_id"],
-                                "execution_id": execution_id,
+                                "execution_id": hold_id,
                                 "order_sent_time": pending["order_sent_time"],
                                 "fill_time": now_str(),
                                 "execution_order": pending["execution_order"],
@@ -359,29 +443,21 @@ class PortfolioManager:
                                 "spread_pct": pending["spread_pct"],
                                 "slippage_yen": slippage_yen
                             })
-                            logger.info(f"📝 ログ記録完了: {symbol} (予想:{expected_ask}円 -> 実約定:{entry_price}円 / スリッページ:{slippage_yen}円)")
-                            del self.pending_orders[symbol] 
+                            logger.info(f"📝 BUYログ記録: {symbol} 予想Ask:{expected_ask}円 -> 実約定:{entry_price}円 / Slip:{slippage_yen}円")
                         else:
+                            # 手動発注などの場合
                             log_trade_execution({
-                                "order_id": "",
-                                "execution_id": execution_id,
-                                "order_sent_time": "",
-                                "fill_time": now_str(),
-                                "execution_order": 0,
-                                "symbol": symbol,
-                                "side": "BUY",
-                                "expected_ask": 0.0,
-                                "expected_bid": 0.0,
-                                "actual_price": float(entry_price),
-                                "qty": int(qty),
-                                "spread_pct": 0.0,
-                                "slippage_yen": 0.0
+                                "order_id": "", "execution_id": hold_id, "order_sent_time": "",
+                                "fill_time": now_str(), "execution_order": 0, "symbol": symbol,
+                                "side": "BUY", "expected_ask": 0.0, "expected_bid": 0.0,
+                                "actual_price": float(entry_price), "qty": int(qty),
+                                "spread_pct": 0.0, "slippage_yen": 0.0
                             })
                         
                     if not is_startup:
-                        logger.info(f"🎉 注文の約定を確認しました！正式に監視モードに移行します: {symbol} (建玉ID: {hold_id})")
+                        logger.info(f"🎉 注文の約定を確認しました！監視モードに移行します: {symbol} (建玉ID: {hold_id})")
                     else:
-                        logger.info(f"📥 既存・新規ポジションを認識しました: {symbol} (市場: {exchange}, 建玉ID: {hold_id})")
+                        logger.info(f"📥 既存ポジションを認識しました: {symbol} (建玉ID: {hold_id})")
                 else:
                     pos = self.positions[symbol]
                     if pos.hold_id is None and hold_id is not None:
@@ -390,13 +466,58 @@ class PortfolioManager:
                         pos.highest_price = entry_price
                         pos.take_profit_price = entry_price * (1 + self.config.TAKE_PROFIT_PCT)
                         pos.stop_loss_price = entry_price * (1 - self.config.STOP_LOSS_PCT)
-                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(取得単価: {entry_price:,.1f}円, 建玉ID: {hold_id})")
+                        logger.info(f"🔄 約定完了！ {symbol} の情報を最新化しました(建玉ID: {hold_id})")
         
         if is_startup and not found_positions and len(positions_data) > 0:
             logger.info("保有しているポジションはありませんでした。")
 
+    async def cleanup_pendings(self, all_orders):
+        """TTL超過の保留ログを状態判定して破棄する"""
+        current_time = time.time()
+        orders_by_id = {str(o.get("ID")): o for o in (all_orders or [])}
+        
+        for sym in list(self.pending_orders.keys()):
+            active_pendings = []
+            for p in self.pending_orders[sym]:
+                order_id = p["order_id"]
+                api_order = orders_by_id.get(order_id)
+                
+                if current_time - p["time_added"] > 600: # 10分経過
+                    status = "TIMEOUT"
+                    reason = "TTL (10min) expired"
+                    
+                    if api_order:
+                        state = api_order.get("State")
+                        cum_qty = int(api_order.get("CumQty", 0))
+                        if state == 5:
+                            if cum_qty == 0:
+                                status = "CANCELED/REJECTED"
+                                reason = "Order completed with 0 qty"
+                            else:
+                                status = "PARTIAL_FILLED"
+                                reason = f"Completed with {cum_qty} qty"
+                        else:
+                            status = f"API_STATE_{state}"
+                            
+                    log_order_status({
+                        "order_id": order_id, "symbol": sym, "side": p.get("side", "BUY"),
+                        "expected_ask": p["expected_ask"], "expected_bid": p["expected_bid"],
+                        "order_sent_time": p["order_sent_time"],
+                        "status": status, "reason": reason
+                    })
+                    logger.info(f"🗑️ ログ待機破棄: {sym} ({status})")
+                    continue
+                
+                active_pendings.append(p)
+                
+            self.pending_orders[sym] = active_pendings
+            if not self.pending_orders[sym]:
+                del self.pending_orders[sym]
+
     async def check_barriers(self):
         for symbol, pos in list(self.positions.items()):
+            if pos.is_closing: continue # すでに決済注文を出している場合はスキップ
+
             board = await self.api.get_board(symbol, self.config.EXCHANGE)
             if not board: continue
             
@@ -428,6 +549,7 @@ class PortfolioManager:
                 await self.execute_exit(pos)
 
     async def execute_exit(self, pos: Position):
+        pos.is_closing = True # 二重決済防止
         board = await self.api.get_board(pos.symbol, self.config.EXCHANGE)
         ask1, bid1 = extract_best_bid_ask(board)
         exit_est = bid1 if bid1 > 0 else (board.get("CurrentPrice") or pos.entry_price)
@@ -443,9 +565,24 @@ class PortfolioManager:
         target_exchange = 1
         res = await self.api.send_order(pos.symbol, side="1", qty=pos.qty, is_close=True, hold_id=pos.hold_id, exchange=target_exchange)
         if res and res.get("Result") == 0:
-            logger.info(f"✅ 決済注文受付成功: {pos.symbol}")
-            del self.positions[pos.symbol]
+            order_id = str(res.get("OrderId", ""))
+            logger.info(f"✅ 決済注文受付成功: {pos.symbol} (OrderID: {order_id})")
+            
+            # 🔥 SELL側の期待値ログを積む
+            spread_pct = ((ask1 - bid1) / bid1) if bid1 > 0 else 0.0
+            self.pending_orders.setdefault(pos.symbol, []).append({
+                "order_id": order_id,
+                "order_sent_time": now_str(),
+                "execution_order": 0,
+                "expected_ask": ask1,
+                "expected_bid": bid1,
+                "spread_pct": spread_pct,
+                "time_added": time.time(),
+                "side": "SELL"
+            })
+            # ※ポジション自体の削除(del self.positions)は、sync_positions側の消滅検知に任せる
         else:
+            pos.is_closing = False
             logger.error(f"❌ 決済注文失敗: {res}")
 
 def get_ticker_mapping() -> dict:
@@ -478,19 +615,16 @@ def load_ai_signals(config: Config) -> List[dict]:
                 except ValueError: net_pct = 0.0
                 if net_pct <= 0: continue
                 
-                # 🔥 修正: ケリー計算用に「メタ確信度」を勝率(prob)として取得
                 try: prob = float(row.get("メタ確信度(%)", row.get("メタ確信度", 50.0)))
                 except ValueError: prob = 50.0
                 
-                prob = max(0.0, min(prob, 100.0)) # 🔥 追加: 異常値のクリップ
-                
+                prob = max(0.0, min(prob, 100.0))
                 signals.append({"name": name, "symbol": code, "net_pct": net_pct, "prob": prob})
             else:
                 try: prob = float(row.get("短期スコア", 0))
                 except ValueError: prob = 0.0
                 
-                prob = max(0.0, min(prob, 100.0)) # 🔥 追加: 異常値のクリップ
-                
+                prob = max(0.0, min(prob, 100.0))
                 if prob >= config.ENTRY_THRESHOLD_PROB:
                     signals.append({'name': name, 'symbol': code, 'prob': prob})
                 
@@ -514,7 +648,7 @@ async def main():
 
     portfolio = PortfolioManager(config, api)
     await portfolio.sync_positions(is_startup=True)
-    active_orders_count, active_order_symbols, _ = await get_active_orders(api, log=True)
+    active_orders_count, active_order_symbols, _, all_orders = await get_active_orders(api, log=True)
 
     try:
         now = datetime.now()
@@ -558,7 +692,6 @@ async def main():
                     avail = (await api.get_wallet_cash()).get("StockAccountWallet", 1000000)
                     b = config.TAKE_PROFIT_PCT / config.STOP_LOSS_PCT if config.STOP_LOSS_PCT > 0 else 1.0
                     
-                    # 🔥 修正: 異常値を防ぐクリップ処理を追加
                     prob_pct = float(sig.get('prob', 50.0))
                     prob_pct = max(0.0, min(prob_pct, 100.0))
                     p = prob_pct / 100.0
@@ -596,15 +729,16 @@ async def main():
                     order_id = str(res.get("OrderId", ""))
                     logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
                     
-                    portfolio.pending_orders[sig['symbol']] = {
+                    portfolio.pending_orders.setdefault(sig['symbol'], []).append({
                         "order_id": order_id,
                         "order_sent_time": order_sent_time,
                         "execution_order": execution_order,
                         "expected_ask": ask1,
                         "expected_bid": bid1,
                         "spread_pct": spread_pct,
-                        "time_added": time.time() # 🔥 V2.1: クリーンアップ用タイムスタンプ
-                    }
+                        "time_added": time.time(),
+                        "side": "BUY"
+                    })
                     active_orders_count += 1
                 else:
                     logger.warning(f"⚠️ 注文送信に失敗しました。レスポンス: {res}")
@@ -621,7 +755,8 @@ async def main():
                     if not has_force_closed_today:
                         logger.warning("⏰ 14:50 を回りました！デイトレモードのため、全保有銘柄を強制決済(成行売)します！")
                         for sym, pos in list(portfolio.positions.items()):
-                            await portfolio.execute_exit(pos)
+                            if not pos.is_closing:
+                                await portfolio.execute_exit(pos)
                         has_force_closed_today = True
                     if len(portfolio.positions) == 0:
                         break
@@ -630,19 +765,16 @@ async def main():
                     logger.info("🌙 15:00を回りました。本日の市場監視を終了します。")
                     break
 
+                active_count, _, active_details, all_orders = await get_active_orders(api, log=False)
+                
                 sync_counter += 1
                 if sync_counter >= 3:
-                    await portfolio.sync_positions(is_startup=False)
+                    await portfolio.sync_positions(is_startup=False, all_orders=all_orders)
                     sync_counter = 0
 
-                # 🔥 V2.1: 未約定（10分経過）のpendingログをクリーンアップ
-                current_time = time.time()
-                for sym in list(portfolio.pending_orders.keys()):
-                    if current_time - portfolio.pending_orders[sym]["time_added"] > 600: # 10分
-                        logger.info(f"🗑️ 未約定タイムアウトのため {sym} のログ待機(pending)を破棄しました。")
-                        del portfolio.pending_orders[sym]
+                # 🔥 V2.1: TTL(10分)超過のpendingを状態判定してクリーンアップ
+                await portfolio.cleanup_pendings(all_orders)
 
-                active_count, _, active_details = await get_active_orders(api, log=False)
                 for detail in active_details:
                     sym = detail['symbol']
                     board = await api.get_board(sym, config.EXCHANGE)
@@ -655,7 +787,7 @@ async def main():
                 
                 if not portfolio.positions and config.TRADE_STYLE == "day":
                     if active_count == 0:
-                        await portfolio.sync_positions(is_startup=False)
+                        await portfolio.sync_positions(is_startup=False, all_orders=all_orders)
                         if not portfolio.positions:
                             logger.info("📉 全てのポジションの決済が完了し、未約定の注文もありません。本日の取引を終了します。")
                             break
