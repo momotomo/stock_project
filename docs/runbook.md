@@ -24,10 +24,22 @@
 `health_log_report.py`:
 
 - `python scripts/health_log_report.py --days 14`
+- `python scripts/health_log_report.py --input daily_health_log.csv --out-dir logs`
+- 標準出力では対象期間、`breaker_true_rate`、`reason` 内訳、`cond_close_lt_ma_true_count`、`cond_ret_lt_threshold_true_count` を確認
 - `logs/health_summary.csv`
 - `logs/health_reason_counts.csv`
 - `logs/health_daily.csv`
 - `logs/health_summary.txt`
+- `logs/health_reason_counts.html` / `logs/health_daily.html` は Plotly が使える環境で出力される
+
+見方:
+
+- `breaker_true_rate` が高い場合は、直近期間でブレーカー停止が常態化している
+- `health_reason_counts.csv` で `close_below_ma` と `ret_below_threshold` のどちらが多いかを見る
+- `cond_close_lt_ma_true_count` が多ければ MA 条件が主因
+- `cond_ret_lt_threshold_true_count` が多ければ前日比条件が主因
+- `both_conditions_true_count` が多ければ相場悪化が複合条件で発生している
+- `health_daily.csv` / `health_daily.html` で日別の `topix_close`、`topix_ma`、`topix_ret1` と `reason` を突き合わせる
 
 運用切替:
 
