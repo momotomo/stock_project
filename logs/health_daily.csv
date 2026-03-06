@@ -1,0 +1,2 @@
+﻿run_at,breaker,reason,breaker_enabled,breaker_ticker,ma_days,ret_threshold,cond_close_lt_ma,cond_ret_lt_threshold,topix_close,topix_ma,topix_ret1,note
+2026-03-06 23:43:01,True,close_below_ma,True,1306.T,5,-0.015,True,False,3903.0,3931.8,0.004633204633204713,breaker triggered; recommendations cleared by breaker

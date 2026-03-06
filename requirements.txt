@@ -2,6 +2,8 @@ streamlit
 yfinance
 pandas
 numpy
+aiohttp
+PyYAML
 scikit-learn
 plotly
 PyGithub
