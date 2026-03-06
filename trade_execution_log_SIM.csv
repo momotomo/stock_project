@@ -1,0 +1,1 @@
+﻿order_id,execution_id,order_sent_time,fill_time,execution_order,symbol,side,expected_ask,expected_bid,actual_price,qty,spread_pct,slippage_yen

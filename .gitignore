@@ -1,3 +1,5 @@
 .venv/
 .streamlit/
 models/
+__pycache__/
+settings.local.yml

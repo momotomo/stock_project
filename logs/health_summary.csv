@@ -1,0 +1,2 @@
+﻿generated_at,input_path,lookback_days,total_runs,breaker_true_count,breaker_true_rate,cond_close_lt_ma_true_count,cond_ret_lt_threshold_true_count,both_conditions_true_count,skipped_old_format_count,missing_required_columns
+2026-03-06 23:51:04,daily_health_log.csv,14,1,1,1.0,1,0,0,1,
