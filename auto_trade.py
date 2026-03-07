@@ -1719,6 +1719,9 @@ def load_ai_signals(config: Config) -> List[dict]:
 
 
 class TradingEngine:
+    FORCE_EXIT_CONFIRM_TTL_SEC = 30
+    FORCE_EXIT_RETRY_LIMIT = 3
+
     def __init__(
         self,
         config: Config,
@@ -1899,21 +1902,161 @@ class TradingEngine:
 
         return active_orders_count
 
+    def _get_positions_product(self) -> int:
+        return 1 if self.config.TRADE_MODE == "CASH" else 2
+
+    async def _request_force_exit_for_position(self, position: Any, local_state: dict, reason: str) -> dict:
+        board = await self.market_data.safe_get_board(
+            local_state.get("symbol", getattr(position, "symbol", "")),
+            local_state.get("exchange", getattr(position, "exchange", self.config.EXCHANGE)),
+        )
+        ask1, bid1 = self.market_data.extract_best_bid_ask(board)
+
+        result = await request_exit(self.api, position, local_state, reason)
+        order_id = result.get("exit_order_id", "")
+        symbol = local_state.get("symbol", getattr(position, "symbol", ""))
+
+        if result.get("ok"):
+            logger.info(
+                f"🚪 強制決済注文を送信しました: {symbol} "
+                f"attempt={result['attempt_no']} order_id={order_id} reason={reason}"
+            )
+            if not self.config.IS_PRODUCTION and order_id.startswith("SIM_"):
+                self.portfolio.execution_logger.log_order_status(
+                    {
+                        "order_id": order_id,
+                        "symbol": symbol,
+                        "side": "SELL",
+                        "expected_ask": ask1,
+                        "expected_bid": bid1,
+                        "order_sent_time": result["requested_at"],
+                        "status": "SIM_SENT",
+                        "reason": reason,
+                    }
+                )
+            else:
+                self.portfolio.register_pending(
+                    symbol,
+                    order_id=order_id,
+                    order_sent_time=result["requested_at"],
+                    execution_order=0,
+                    expected_ask=ask1,
+                    expected_bid=bid1,
+                    side="SELL",
+                )
+            return result
+
+        logger.error(
+            f"❌ 強制決済注文の送信に失敗: {symbol} "
+            f"attempt={result['attempt_no']} reason={reason} error={result['error']}"
+        )
+        return result
+
+    async def _start_force_exit_requests(self, force_exit_states: Dict[str, dict]) -> None:
+        logger.warning("⏰ 14:50 を回りました。建玉ごとに返済注文を送信し、建玉消滅を確認します。")
+        for symbol, position in list(self.portfolio.positions.items()):
+            if position.is_closing:
+                continue
+
+            position.is_closing = True
+            state_key = position.hold_id or symbol
+            local_state = force_exit_states.setdefault(
+                state_key,
+                {
+                    "symbol": position.symbol,
+                    "hold_id": position.hold_id,
+                    "position_side": "BUY",
+                    "known_position_qty": position.qty,
+                    "exchange": position.exchange,
+                    "status": "FORCE_EXIT_PREPARED",
+                    "exit_retry_limit": self.FORCE_EXIT_RETRY_LIMIT,
+                },
+            )
+            await self._request_force_exit_for_position(position, local_state, "14:50_force_exit")
+
+    async def _confirm_force_exit_states(self, force_exit_states: Dict[str, dict]) -> None:
+        if not force_exit_states:
+            return
+
+        orders_snapshot = await fetch_orders_snapshot(self.api)
+        positions_snapshot = await fetch_positions_snapshot(self.api, product=self._get_positions_product())
+
+        for state_key, local_state in list(force_exit_states.items()):
+            confirmation = confirm_exit(
+                local_state,
+                orders_snapshot=orders_snapshot,
+                positions_snapshot=positions_snapshot,
+                ttl_sec=self.FORCE_EXIT_CONFIRM_TTL_SEC,
+            )
+            result = confirmation["result"]
+            remaining_qty = safe_int(confirmation.get("remaining_qty"), 0)
+            last_result = local_state.get("_last_confirm_result")
+            last_remaining = safe_int(local_state.get("_last_confirm_remaining_qty"), -1)
+
+            if result in {"PARTIAL", "PENDING", "RETRY", "UNRESOLVED"}:
+                local_state["known_position_qty"] = remaining_qty or safe_int(
+                    _pick_first_value(local_state, ["known_position_qty"]),
+                    0,
+                )
+
+            if result != last_result or remaining_qty != last_remaining:
+                logger.info(
+                    f"🔎 強制決済確認: symbol={local_state.get('symbol', '')} "
+                    f"result={result} remaining_qty={remaining_qty} reason={confirmation['reason']}"
+                )
+                local_state["_last_confirm_result"] = result
+                local_state["_last_confirm_remaining_qty"] = remaining_qty
+
+            if result == "CLOSED":
+                logger.info(
+                    f"✅ 強制決済完了を確認: {local_state.get('symbol', '')} "
+                    f"hold_id={local_state.get('hold_id', '')}"
+                )
+                force_exit_states.pop(state_key, None)
+                continue
+
+            if result == "RETRY":
+                retry_position = {
+                    "symbol": local_state.get("symbol", ""),
+                    "hold_id": local_state.get("hold_id", ""),
+                    "qty": remaining_qty or safe_int(_pick_first_value(local_state, ["known_position_qty"]), 0),
+                    "exchange": as_int(_pick_first_value(local_state, ["exchange"]), self.config.EXCHANGE),
+                    "side": "BUY",
+                }
+                await self._request_force_exit_for_position(retry_position, local_state, "14:50_force_exit_retry")
+                continue
+
+            if result == "UNRESOLVED" and not local_state.get("_unresolved_logged"):
+                self.portfolio.execution_logger.log_order_status(
+                    {
+                        "order_id": _safe_str(_pick_first_value(local_state, ["exit_order_id"])),
+                        "symbol": local_state.get("symbol", ""),
+                        "side": "SELL",
+                        "expected_ask": "",
+                        "expected_bid": "",
+                        "order_sent_time": _safe_str(
+                            _pick_first_value(local_state, ["exit_requested_at", "last_exit_attempt_at"])
+                        ),
+                        "status": "UNRESOLVED",
+                        "reason": confirmation["reason"],
+                    }
+                )
+                local_state["_unresolved_logged"] = True
+
     async def _monitor_positions(self) -> None:
         has_force_closed_today = False
         logger.info("=== ⏱ リアルタイムインメモリ監視ループ開始 ===")
         sync_counter = 0
         last_logged_active_prices: Dict[str, float] = {}
+        force_exit_states: Dict[str, dict] = {}
 
         while True:
             now = datetime.now()
             if self.config.TRADE_STYLE == "day" and now.hour == 14 and now.minute >= 50:
                 if not has_force_closed_today:
-                    logger.warning("⏰ 14:50 を回りました！デイトレモードのため、全保有銘柄を強制決済(成行売)します！")
-                    for _, position in list(self.portfolio.positions.items()):
-                        if not position.is_closing:
-                            await self.portfolio.execute_exit(position)
+                    await self._start_force_exit_requests(force_exit_states)
                     has_force_closed_today = True
+                await self._confirm_force_exit_states(force_exit_states)
                 if not self.portfolio.positions:
                     break
 
@@ -1935,7 +2078,8 @@ class TradingEngine:
                 if current_price is not None and current_price != last_logged_active_prices.get(symbol):
                     last_logged_active_prices[symbol] = current_price
 
-            await self.portfolio.check_barriers()
+            if not has_force_closed_today:
+                await self.portfolio.check_barriers()
 
             if not self.portfolio.positions and self.config.TRADE_STYLE == "day" and active_count == 0:
                 await self.portfolio.sync_positions(is_startup=False, all_orders=all_orders)
