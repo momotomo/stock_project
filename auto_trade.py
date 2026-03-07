@@ -68,6 +68,7 @@ ORDER_STATUS_LOG_PATH_SIM = "order_status_log_SIM.csv"
 INITIAL_EQUITY = 1_000_000
 PLACEHOLDER_PREFIXES = ("YOUR_",)
 PLACEHOLDER_VALUES = {"", "dummy", "changeme", "replace_me", "your_password"}
+HALT_FORCE_EXIT_UNRESOLVED = "HALT_FORCE_EXIT_UNRESOLVED"
 
 
 def now_str() -> str:
@@ -1239,6 +1240,8 @@ class TradingState:
     daily_loss_limit: float = INITIAL_EQUITY * -0.02
     today_realized_pnl: float = 0.0
     trading_halted: bool = False
+    halt_reason: str = ""
+    unresolved_exit_count: int = 0
 
 
 class PortfolioManager:
@@ -1831,7 +1834,8 @@ class TradingEngine:
 
         for signal in signals:
             if self.portfolio.trading_state.trading_halted:
-                logger.warning("🛑 KillSwitch: 本日は損失上限に達したため新規エントリーを停止します。")
+                halt_reason = self.portfolio.trading_state.halt_reason or "TRADING_HALTED"
+                logger.warning(f"🛑 Halt中のため新規エントリーを停止します: {halt_reason}")
                 break
             if signal["symbol"] in self.portfolio.positions:
                 continue
@@ -1970,9 +1974,48 @@ class TradingEngine:
                     "exchange": position.exchange,
                     "status": "FORCE_EXIT_PREPARED",
                     "exit_retry_limit": self.FORCE_EXIT_RETRY_LIMIT,
+                    "halt_reason": "",
+                    "unresolved_exit_count": 0,
                 },
             )
             await self._request_force_exit_for_position(position, local_state, "14:50_force_exit")
+
+    def _halt_on_unresolved_force_exit(self, local_state: dict, confirmation: dict) -> None:
+        if local_state.get("_unresolved_logged"):
+            return
+
+        trading_state = self.portfolio.trading_state
+        trading_state.trading_halted = True
+        trading_state.halt_reason = HALT_FORCE_EXIT_UNRESOLVED
+        trading_state.unresolved_exit_count += 1
+
+        local_state["status"] = "EXIT_UNRESOLVED"
+        local_state["halt_reason"] = HALT_FORCE_EXIT_UNRESOLVED
+        local_state["unresolved_exit_count"] = safe_int(
+            _pick_first_value(local_state, ["unresolved_exit_count"]),
+            0,
+        ) + 1
+
+        reason_detail = confirmation.get("reason", "")
+        logger.error(
+            f"🛑 強制決済が未解消のため新規エントリーを停止します: "
+            f"symbol={local_state.get('symbol', '')} reason={HALT_FORCE_EXIT_UNRESOLVED} detail={reason_detail}"
+        )
+        self.portfolio.execution_logger.log_order_status(
+            {
+                "order_id": _safe_str(_pick_first_value(local_state, ["exit_order_id"])),
+                "symbol": local_state.get("symbol", ""),
+                "side": "SELL",
+                "expected_ask": "",
+                "expected_bid": "",
+                "order_sent_time": _safe_str(
+                    _pick_first_value(local_state, ["exit_requested_at", "last_exit_attempt_at"])
+                ),
+                "status": "HALT",
+                "reason": f"{HALT_FORCE_EXIT_UNRESOLVED}: {reason_detail}",
+            }
+        )
+        local_state["_unresolved_logged"] = True
 
     async def _confirm_force_exit_states(self, force_exit_states: Dict[str, dict]) -> None:
         if not force_exit_states:
@@ -2008,6 +2051,7 @@ class TradingEngine:
                 local_state["_last_confirm_remaining_qty"] = remaining_qty
 
             if result == "CLOSED":
+                local_state["status"] = "CLOSED"
                 logger.info(
                     f"✅ 強制決済完了を確認: {local_state.get('symbol', '')} "
                     f"hold_id={local_state.get('hold_id', '')}"
@@ -2015,7 +2059,16 @@ class TradingEngine:
                 force_exit_states.pop(state_key, None)
                 continue
 
+            if result == "PARTIAL":
+                local_state["status"] = "EXIT_PARTIAL"
+                continue
+
+            if result == "PENDING":
+                local_state["status"] = "EXIT_PENDING"
+                continue
+
             if result == "RETRY":
+                local_state["status"] = "EXIT_RETRYING"
                 retry_position = {
                     "symbol": local_state.get("symbol", ""),
                     "hold_id": local_state.get("hold_id", ""),
@@ -2026,22 +2079,8 @@ class TradingEngine:
                 await self._request_force_exit_for_position(retry_position, local_state, "14:50_force_exit_retry")
                 continue
 
-            if result == "UNRESOLVED" and not local_state.get("_unresolved_logged"):
-                self.portfolio.execution_logger.log_order_status(
-                    {
-                        "order_id": _safe_str(_pick_first_value(local_state, ["exit_order_id"])),
-                        "symbol": local_state.get("symbol", ""),
-                        "side": "SELL",
-                        "expected_ask": "",
-                        "expected_bid": "",
-                        "order_sent_time": _safe_str(
-                            _pick_first_value(local_state, ["exit_requested_at", "last_exit_attempt_at"])
-                        ),
-                        "status": "UNRESOLVED",
-                        "reason": confirmation["reason"],
-                    }
-                )
-                local_state["_unresolved_logged"] = True
+            if result == "UNRESOLVED":
+                self._halt_on_unresolved_force_exit(local_state, confirmation)
 
     async def _monitor_positions(self) -> None:
         has_force_closed_today = False
