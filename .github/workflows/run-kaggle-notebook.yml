@@ -130,6 +130,16 @@ jobs:
           mkdir -p kaggle-output
           kaggle kernels output "$KERNEL_REF" -p kaggle-output
 
+      - name: List downloaded Kaggle output files
+        if: ${{ always() }}
+        run: |
+          echo "Downloaded kaggle-output files:"
+          if [ -d kaggle-output ]; then
+            find kaggle-output -type f | sort
+          else
+            echo "kaggle-output directory not found"
+          fi
+
       - name: Validate Kaggle output artifacts
         run: |
           python - <<'PY'
