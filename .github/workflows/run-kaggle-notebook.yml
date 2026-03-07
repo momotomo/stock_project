@@ -1,0 +1,140 @@
+name: Run Kaggle Notebook Manually
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_slug:
+        description: "Kaggle kernel slug"
+        required: true
+        default: "stock-ai-trainer"
+      kernel_title:
+        description: "Kaggle kernel title"
+        required: true
+        default: "stock-ai-trainer"
+      is_private:
+        description: "Whether the Kaggle kernel stays private"
+        required: true
+        default: "true"
+      poll_attempts:
+        description: "How many times to poll kernel status"
+        required: true
+        default: "40"
+      poll_interval_seconds:
+        description: "Seconds between status polls"
+        required: true
+        default: "30"
+
+jobs:
+  run-kaggle-notebook:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      KAGGLE_USERNAME: ${{ secrets.KAGGLE_USERNAME }}
+      KAGGLE_KEY: ${{ secrets.KAGGLE_KEY }}
+      KERNEL_SLUG: ${{ inputs.kernel_slug }}
+      KERNEL_TITLE: ${{ inputs.kernel_title }}
+      KERNEL_IS_PRIVATE: ${{ inputs.is_private }}
+      POLL_ATTEMPTS: ${{ inputs.poll_attempts }}
+      POLL_INTERVAL_SECONDS: ${{ inputs.poll_interval_seconds }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Kaggle CLI
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install kaggle
+
+      - name: Validate required secrets
+        run: |
+          test -n "$KAGGLE_USERNAME"
+          test -n "$KAGGLE_KEY"
+
+      - name: Configure Kaggle credentials
+        run: |
+          mkdir -p "$HOME/.kaggle"
+          cat > "$HOME/.kaggle/kaggle.json" <<EOF
+          {"username":"$KAGGLE_USERNAME","key":"$KAGGLE_KEY"}
+          EOF
+          chmod 600 "$HOME/.kaggle/kaggle.json"
+
+      - name: Prepare Kaggle kernel payload
+        run: |
+          rm -rf .kaggle-kernel kaggle-output
+          mkdir -p .kaggle-kernel
+          cp kaggle_ai_trainer.py .kaggle-kernel/kaggle_ai_trainer.py
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata = {
+              "id": f"{os.environ['KAGGLE_USERNAME']}/{os.environ['KERNEL_SLUG']}",
+              "title": os.environ["KERNEL_TITLE"],
+              "code_file": "kaggle_ai_trainer.py",
+              "language": "python",
+              "kernel_type": "script",
+              "is_private": os.environ["KERNEL_IS_PRIVATE"].lower(),
+              "enable_gpu": "false",
+              "enable_internet": "true",
+              "dataset_sources": [],
+              "competition_sources": [],
+              "kernel_sources": [],
+          }
+          Path(".kaggle-kernel/kernel-metadata.json").write_text(
+              json.dumps(metadata, ensure_ascii=False, indent=2),
+              encoding="utf-8",
+          )
+          print("Prepared kernel ref:", metadata["id"])
+          PY
+
+      - name: Push Kaggle kernel
+        run: kaggle kernels push -p .kaggle-kernel
+
+      - name: Poll Kaggle kernel status
+        env:
+          KERNEL_REF: ${{ secrets.KAGGLE_USERNAME }}/${{ inputs.kernel_slug }}
+        run: |
+          success=0
+          for attempt in $(seq 1 "$POLL_ATTEMPTS"); do
+            status_output="$(kaggle kernels status "$KERNEL_REF" 2>&1 || true)"
+            echo "Attempt ${attempt}/${POLL_ATTEMPTS}: ${status_output}"
+            status_text="$(echo "$status_output" | tr '[:upper:]' '[:lower:]')"
+            if echo "$status_text" | grep -Eq "complete|success"; then
+              success=1
+              break
+            fi
+            if echo "$status_text" | grep -Eq "error|failed|cancel"; then
+              echo "Kaggle kernel finished with failure status"
+              exit 1
+            fi
+            sleep "$POLL_INTERVAL_SECONDS"
+          done
+          if [ "$success" -ne 1 ]; then
+            echo "Kaggle kernel did not reach success within polling window"
+            exit 1
+          fi
+
+      - name: Download Kaggle output
+        env:
+          KERNEL_REF: ${{ secrets.KAGGLE_USERNAME }}/${{ inputs.kernel_slug }}
+        run: |
+          mkdir -p kaggle-output
+          kaggle kernels output "$KERNEL_REF" -p kaggle-output
+
+      - name: Upload Kaggle output artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kaggle-output-${{ inputs.kernel_slug }}
+          path: |
+            kaggle-output/**
+            .kaggle-kernel/kernel-metadata.json
+          if-no-files-found: error
