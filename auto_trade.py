@@ -1,5 +1,6 @@
 import asyncio
 import argparse
+import copy
 import csv
 import logging
 import os
@@ -7,7 +8,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     import aiohttp
@@ -85,6 +86,161 @@ def safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _pick_first_value(data: Optional[dict], keys: List[str]) -> Any:
+    if not isinstance(data, dict):
+        return None
+    for key in keys:
+        value = data.get(key)
+        if value not in (None, ""):
+            return value
+    return None
+
+
+def _safe_str(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _normalize_order_side(value: Any) -> str:
+    raw_side = _safe_str(value).upper()
+    if raw_side in {"1", "SELL", "S"}:
+        return "SELL"
+    if raw_side in {"2", "BUY", "B"}:
+        return "BUY"
+    return raw_side or "UNKNOWN"
+
+
+def _extract_order_avg_price(order: dict) -> float:
+    avg_price = safe_float(
+        _pick_first_value(
+            order,
+            ["AvgPrice", "AveragePrice", "CumPrice", "ExecutionPrice"],
+        ),
+        0.0,
+    )
+    if avg_price > 0:
+        return avg_price
+
+    details = order.get("Details") or []
+    if not isinstance(details, list):
+        return 0.0
+
+    total_value = 0.0
+    total_qty = 0
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        price = safe_float(_pick_first_value(detail, ["Price", "ExecutionPrice"]), 0.0)
+        qty = safe_int(_pick_first_value(detail, ["Qty", "CumQty", "ExecutionQty"]), 0)
+        if price <= 0 or qty <= 0:
+            continue
+        total_value += price * qty
+        total_qty += qty
+
+    if total_qty <= 0:
+        return 0.0
+    return total_value / total_qty
+
+
+def _normalize_order_state(order: dict, qty: int, cum_qty: int, remaining_qty: int) -> str:
+    state_value = _pick_first_value(order, ["State", "OrderState", "Status", "OrderStatus"])
+    state_code = safe_int(state_value, -1)
+    state_text_parts = [
+        _safe_str(_pick_first_value(order, ["StateName", "OrderStateName", "StatusText"])),
+        _safe_str(_pick_first_value(order, ["Result", "OrderResult", "Message"])),
+    ]
+    state_text = " ".join(part.lower() for part in state_text_parts if part)
+
+    if "reject" in state_text or "rejected" in state_text or "失敗" in state_text or "エラー" in state_text:
+        return "REJECTED"
+    if "expire" in state_text or "expired" in state_text or "失効" in state_text:
+        return "EXPIRED"
+    if "cancel" in state_text or "cancelled" in state_text or "canceled" in state_text or "取消" in state_text:
+        return "CANCELED"
+
+    if qty > 0 and cum_qty >= qty:
+        return "FILLED"
+    if cum_qty > 0 and remaining_qty > 0:
+        return "PARTIAL"
+
+    if state_code in {1, 2, 3, 4}:
+        return "ORDERED"
+    if state_code == 5:
+        if qty > 0 and cum_qty >= qty:
+            return "FILLED"
+        if cum_qty > 0:
+            return "PARTIAL"
+        return "UNKNOWN"
+    if state_code in {6}:
+        return "CANCELED"
+    if state_code in {7}:
+        return "EXPIRED"
+    if state_code in {8, 9}:
+        return "REJECTED"
+
+    return "UNKNOWN"
+
+
+def _normalize_order_snapshot(order: dict) -> Optional[dict]:
+    if not isinstance(order, dict):
+        return None
+
+    order_id = _safe_str(_pick_first_value(order, ["ID", "OrderID", "OrderId"]))
+    if not order_id:
+        return None
+
+    qty = safe_int(_pick_first_value(order, ["OrderQty", "Qty"]), 0)
+    cum_qty = safe_int(_pick_first_value(order, ["CumQty", "ExecutionQty", "FilledQty"]), 0)
+    remaining_qty_value = _pick_first_value(order, ["LeavesQty", "RemainingQty"])
+    remaining_qty = safe_int(remaining_qty_value, max(qty - cum_qty, 0))
+    if remaining_qty < 0:
+        remaining_qty = 0
+
+    snapshot = {
+        "order_id": order_id,
+        "symbol": _safe_str(_pick_first_value(order, ["Symbol", "Ticker"])),
+        "side": _normalize_order_side(_pick_first_value(order, ["Side"])),
+        "state": _normalize_order_state(order, qty, cum_qty, remaining_qty),
+        "qty": qty,
+        "cum_qty": cum_qty,
+        "remaining_qty": remaining_qty,
+        "price": safe_float(_pick_first_value(order, ["Price", "OrderPrice"]), 0.0),
+        "avg_price": _extract_order_avg_price(order),
+        "sent_at": _safe_str(
+            _pick_first_value(
+                order,
+                ["RecvTime", "OrderTime", "SendTime", "TransactTime"],
+            )
+        ),
+        "raw": copy.deepcopy(order),
+    }
+    return snapshot
+
+
+async def fetch_orders_snapshot(api: "KabuAPI") -> Dict[str, dict]:
+    response = await api.get_orders()
+    if not response:
+        return {}
+
+    if isinstance(response, list):
+        orders = response
+    elif isinstance(response, dict):
+        nested_orders = _pick_first_value(response, ["Orders", "orders", "data"])
+        if isinstance(nested_orders, list):
+            orders = nested_orders
+        else:
+            orders = [response]
+    else:
+        return {}
+
+    snapshots: Dict[str, dict] = {}
+    for order in orders:
+        snapshot = _normalize_order_snapshot(order)
+        if snapshot is None:
+            continue
+        snapshots[snapshot["order_id"]] = snapshot
+    return snapshots
 
 
 class Config:
