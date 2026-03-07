@@ -7,6 +7,8 @@
 3. `python auto_trade.py`
 4. 取引終了後に `python scripts/ops_kpi_report.py --env sim --days 7` または `--env prod` を実行
 5. ブレーカー傾向の確認が必要なら `python scripts/health_log_report.py --days 14`
+6. スリッページ基礎集計は `python scripts/slippage_report.py --env sim --days 14` または `--env prod`
+7. `slippage_summary.csv` / `slippage_by_time_bucket.csv` / `slippage_by_symbol.csv` で `slippage_bps` を確認
 
 事前確認:
 
