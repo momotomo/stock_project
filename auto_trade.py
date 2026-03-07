@@ -243,6 +243,79 @@ async def fetch_orders_snapshot(api: "KabuAPI") -> Dict[str, dict]:
     return snapshots
 
 
+def _normalize_position_state(position: dict, qty: int, leaves_qty: int) -> str:
+    state_value = _pick_first_value(position, ["State", "PositionState", "Status", "PositionStatus"])
+    state_code = safe_int(state_value, -1)
+    state_text_parts = [
+        _safe_str(_pick_first_value(position, ["StateName", "PositionStateName", "StatusText"])),
+        _safe_str(_pick_first_value(position, ["Message", "Result"])),
+    ]
+    state_text = " ".join(part.lower() for part in state_text_parts if part)
+
+    if "open" in state_text or "active" in state_text or "保有" in state_text or "建玉" in state_text:
+        return "OPEN"
+    if "close" in state_text or "closed" in state_text or "決済" in state_text:
+        return "CLOSED"
+
+    if qty > 0 or leaves_qty > 0:
+        return "OPEN"
+    if state_code == 0:
+        return "UNKNOWN"
+    if state_code > 0:
+        return "CLOSED"
+    return "UNKNOWN"
+
+
+def _normalize_position_snapshot(position: dict) -> Optional[dict]:
+    if not isinstance(position, dict):
+        return None
+
+    hold_id = _safe_str(_pick_first_value(position, ["HoldID", "ExecutionID"]))
+    if not hold_id:
+        return None
+
+    hold_qty = safe_int(_pick_first_value(position, ["HoldQty", "Qty"]), 0)
+    leaves_qty = safe_int(_pick_first_value(position, ["LeavesQty", "RemainingQty"]), 0)
+    qty = hold_qty if hold_qty > 0 else leaves_qty
+
+    snapshot = {
+        "hold_id": hold_id,
+        "symbol": _safe_str(_pick_first_value(position, ["Symbol", "Ticker"])),
+        "side": _normalize_order_side(_pick_first_value(position, ["Side"])),
+        "qty": qty,
+        "price": safe_float(_pick_first_value(position, ["Price", "ExecutionPrice", "EntryPrice"]), 0.0),
+        "leaves_qty": leaves_qty,
+        "state": _normalize_position_state(position, qty, leaves_qty),
+        "raw": copy.deepcopy(position),
+    }
+    return snapshot
+
+
+async def fetch_positions_snapshot(api: "KabuAPI", product: int) -> Dict[str, dict]:
+    response = await api.get_positions(product=product)
+    if not response:
+        return {}
+
+    if isinstance(response, list):
+        positions = response
+    elif isinstance(response, dict):
+        nested_positions = _pick_first_value(response, ["Positions", "positions", "data"])
+        if isinstance(nested_positions, list):
+            positions = nested_positions
+        else:
+            positions = [response]
+    else:
+        return {}
+
+    snapshots: Dict[str, dict] = {}
+    for position in positions:
+        snapshot = _normalize_position_snapshot(position)
+        if snapshot is None:
+            continue
+        snapshots[snapshot["hold_id"]] = snapshot
+    return snapshots
+
+
 class Config:
     DEFAULT_CONFIG = {
         "IS_PRODUCTION": False,
