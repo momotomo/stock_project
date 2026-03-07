@@ -12,6 +12,8 @@
 
 - `python auto_trade.py --dry-run`
 - API 通信を行わずに、設定読込、SIM/PROD 判定、ログ出力先、主要コンポーネント初期化だけを確認できる
+- `python -m unittest discover -s tests -p "test_*.py" -v`
+- board / orders / positions failure、`HALT_FORCE_EXIT_UNRESOLVED`、`HALT_API_ORDER_ID_MISSING` などの安全性テストを再実行できる
 
 `daily_health_log.csv` の主要列:
 
