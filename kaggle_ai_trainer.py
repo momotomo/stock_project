@@ -1,11 +1,37 @@
 # ==============================================================================
 # Kaggle専用：AI自動学習スクリプト (V2.1 実運用対応・リーク排除版)
 # ==============================================================================
-!pip install yfinance optuna xgboost lightgbm -q
+import os
+import random
+import tempfile
+
+
+def ensure_notebook_dependencies():
+    if not os.getenv("KAGGLE_KERNEL_RUN_TYPE"):
+        return
+    try:
+        from IPython import get_ipython
+    except Exception:
+        return
+
+    shell = get_ipython()
+    if shell is None:
+        return
+
+    missing = []
+    for module_name in ("yfinance", "optuna", "xgboost", "lightgbm"):
+        try:
+            __import__(module_name)
+        except ModuleNotFoundError:
+            missing.append(module_name)
+    if missing:
+        shell.system(f"pip install {' '.join(missing)} -q")
+
+
+ensure_notebook_dependencies()
 
 import csv
 import hashlib
-import os
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -23,6 +49,10 @@ from pathlib import Path
 
 warnings.simplefilter('ignore', ResourceWarning)
 optuna.logging.set_verbosity(optuna.logging.WARNING)
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
 
 print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
 
@@ -190,7 +220,7 @@ scaler = RobustScaler()
 X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=ALL_FEATURES)
 
 print("🔍 特徴量選択を実行中...")
-fs_model = lgb.LGBMRanker(n_estimators=100, random_state=42, verbose=-1)
+fs_model = lgb.LGBMRanker(n_estimators=100, random_state=SEED, verbose=-1)
 fs_model.fit(X_train_scaled, y_train_rank, group=group_train)
 importance = pd.Series(fs_model.feature_importances_, index=ALL_FEATURES).sort_values(ascending=False)
 top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
@@ -230,7 +260,7 @@ FALLBACK_RANKER_PARAMS = {
     "learning_rate": 0.03,
     "max_depth": 4,
     "num_leaves": 31,
-    "random_state": 42,
+    "random_state": SEED,
     "verbose": -1,
 }
 REQUIRED_RANKER_PARAM_KEYS = {"n_estimators", "learning_rate", "max_depth", "num_leaves"}
@@ -304,6 +334,47 @@ def save_best_params(params: dict):
     temp_path.replace(PARAMS_OUT)
     print(f"💾 best_params.json を更新しました: {PARAMS_OUT}")
 
+
+def build_date_time_series_splits(index, n_splits=5):
+    unique_dates = list(pd.Index(index).unique())
+    if len(unique_dates) < 2:
+        return []
+
+    if len(unique_dates) == 2:
+        train_mask = index.isin(unique_dates[:1])
+        val_mask = index.isin(unique_dates[1:])
+        return [(np.flatnonzero(train_mask), np.flatnonzero(val_mask))]
+
+    effective_splits = min(n_splits, len(unique_dates) - 1)
+    splitter = TimeSeriesSplit(n_splits=effective_splits)
+    splits = []
+    unique_dates_array = np.array(unique_dates)
+    for train_date_idx, val_date_idx in splitter.split(unique_dates_array):
+        train_dates = unique_dates_array[train_date_idx]
+        val_dates = unique_dates_array[val_date_idx]
+        train_mask = index.isin(train_dates)
+        val_mask = index.isin(val_dates)
+        splits.append((np.flatnonzero(train_mask), np.flatnonzero(val_mask)))
+    return splits
+
+
+def atomic_joblib_dump(obj, path):
+    target_path = Path(path)
+    temp_handle = tempfile.NamedTemporaryFile(
+        delete=False,
+        dir=str(target_path.parent),
+        prefix=f".{target_path.name}.",
+        suffix=".tmp",
+    )
+    temp_handle.close()
+    temp_path = Path(temp_handle.name)
+    try:
+        joblib.dump(obj, temp_path)
+        temp_path.replace(target_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
 def run_weekly_optuna():
     trial_count = get_optuna_trials()
     print(
@@ -317,10 +388,12 @@ def run_weekly_optuna():
             "max_depth": trial.suggest_int("max_depth", 3, 8),
             "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
             "num_leaves": trial.suggest_int("num_leaves", 10, 60),
-            "random_state": 42,
+            "random_state": SEED,
             "verbose": -1,
         }
-        dates = train_df.index.unique()
+        dates = sorted(train_df.index.unique())
+        if len(dates) < 2:
+            return 0.0
         split_idx = int(len(dates) * 0.8)
         mask_train = train_df.index < dates[split_idx]
         mask_val = train_df.index >= dates[split_idx]
@@ -343,7 +416,7 @@ def run_weekly_optuna():
         )
         return model.best_score_["valid_0"]["ndcg@1"]
 
-    study = optuna.create_study(direction="maximize")
+    study = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=SEED))
     study.optimize(objective, n_trials=trial_count)
     best_params = normalize_ranker_params(study.best_params)
     if best_params is None:
@@ -483,24 +556,30 @@ ranker_model = lgb.LGBMRanker(**best_params)
 ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
 
 print("🔍 メタラベリング用 OOF(クロスバリデーション)予測を生成中...")
-tscv = TimeSeriesSplit(n_splits=5)
 oof_probs = np.zeros(len(X_train_sel))
+time_splits = build_date_time_series_splits(X_train_sel.index, n_splits=5)
 
-for train_index, val_index in tscv.split(X_train_sel):
+for train_index, val_index in time_splits:
     X_tr, y_tr = X_train_sel.iloc[train_index], y_train_class.iloc[train_index]
     X_va = X_train_sel.iloc[val_index]
-    xgb_cv = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, eval_metric='logloss')
+    xgb_cv = xgb.XGBClassifier(
+        n_estimators=100,
+        max_depth=5,
+        learning_rate=0.05,
+        random_state=SEED,
+        eval_metric='logloss',
+    )
     xgb_cv.fit(X_tr, y_tr)
     oof_probs[val_index] = xgb_cv.predict_proba(X_va)[:, 1]
 
 print("🧠 メタモデル(確信度AI)を学習中...")
 X_meta = X_train_sel.copy()
 X_meta['Base_Prob'] = oof_probs
-meta_model = lgb.LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=42, verbose=-1)
+meta_model = lgb.LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=SEED, verbose=-1)
 meta_model.fit(X_meta, y_train_class)
 
 print("🧠 本番用ベースモデル(XGBoost)を学習中...")
-xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=42, eval_metric='logloss')
+xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=SEED, eval_metric='logloss')
 xgb_model.fit(X_train_sel, y_train_class)
 
 # --- V2.1: 回帰モデル（Pred_Return用）の学習を追加 ---
@@ -513,7 +592,7 @@ regressor_model = lgb.LGBMRegressor(
     num_leaves=31,
     subsample=0.8,
     colsample_bytree=0.8,
-    random_state=42,
+    random_state=SEED,
     objective="regression", # huberが弾かれる環境対策としてregressionを採用
     verbose=-1,
 )
@@ -521,11 +600,11 @@ regressor_model.fit(X_train_sel, y_train_reg)
 
 # --- 4. モデルの保存 (KaggleのOutputとして保存) ---
 print("💾 モデルをファイルに保存中(Kaggle Output)...")
-joblib.dump(ranker_model, 'ranker_model.pkl')
-joblib.dump(xgb_model, 'classifier_model.pkl')
-joblib.dump(meta_model, 'meta_model.pkl')
-joblib.dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
-joblib.dump(scaler, 'scaler.pkl')
-joblib.dump(selected_features, 'selected_features.pkl')
+atomic_joblib_dump(ranker_model, 'ranker_model.pkl')
+atomic_joblib_dump(xgb_model, 'classifier_model.pkl')
+atomic_joblib_dump(meta_model, 'meta_model.pkl')
+atomic_joblib_dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
+atomic_joblib_dump(scaler, 'scaler.pkl')
+atomic_joblib_dump(selected_features, 'selected_features.pkl')
 
 print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
