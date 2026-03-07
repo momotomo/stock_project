@@ -595,6 +595,117 @@ def reconcile_trade_state(
     return response
 
 
+def _extract_position_context(position: Any, local_state: Any) -> dict:
+    position_data = _coerce_state_dict(position)
+    local_data = _coerce_state_dict(local_state)
+    symbol = _safe_str(_pick_first_value(position_data, ["symbol", "Symbol", "ticker", "Ticker"]))
+    hold_id = _safe_str(
+        _pick_first_value(
+            position_data,
+            ["hold_id", "HoldID", "execution_id", "ExecutionID"],
+        )
+    ) or _safe_str(_pick_first_value(local_data, ["hold_id", "HoldID", "execution_id", "ExecutionID"]))
+    qty = safe_int(_pick_first_value(position_data, ["qty", "Qty", "position_qty"]), 0)
+    exchange = as_int(_pick_first_value(position_data, ["exchange", "Exchange"]), 1)
+    position_side = _normalize_order_side(
+        _pick_first_value(
+            position_data,
+            ["side", "Side", "position_side"],
+        )
+        or _pick_first_value(local_data, ["position_side", "side", "Side"])
+        or "BUY"
+    )
+    exit_side = _opposite_trade_side(position_side)
+    if exit_side == "UNKNOWN":
+        exit_side = "SELL"
+
+    return {
+        "symbol": symbol,
+        "hold_id": hold_id,
+        "qty": qty,
+        "exchange": exchange,
+        "position_side": position_side,
+        "exit_side": exit_side,
+    }
+
+
+async def request_exit(api: "KabuAPI", position: Any, local_state: Any, reason: str) -> dict:
+    local_data = _coerce_state_dict(local_state)
+    position_context = _extract_position_context(position, local_state)
+    requested_at = now_str()
+    current_attempt = safe_int(_pick_first_value(local_data, ["exit_attempt_no"]), 0)
+    next_attempt = current_attempt + 1
+
+    response = {
+        "ok": False,
+        "exit_order_id": "",
+        "attempt_no": next_attempt,
+        "requested_at": requested_at,
+        "reason": reason,
+        "error": "",
+    }
+
+    symbol = position_context["symbol"]
+    hold_id = position_context["hold_id"]
+    qty = position_context["qty"]
+    exchange = position_context["exchange"]
+    exit_side = "1" if position_context["exit_side"] == "SELL" else "2"
+
+    if not hasattr(api, "send_order"):
+        response["error"] = "api.send_order is not available"
+        return response
+    if not symbol:
+        response["error"] = "missing symbol for exit request"
+        return response
+    if qty <= 0:
+        response["error"] = "missing qty for exit request"
+        return response
+    if not hold_id:
+        response["error"] = "missing hold_id for exit request"
+        return response
+
+    try:
+        send_order = getattr(api, "send_order")
+        result = send_order(
+            symbol,
+            side=exit_side,
+            qty=qty,
+            is_close=True,
+            hold_id=hold_id,
+            exchange=exchange,
+        )
+        if asyncio.iscoroutine(result):
+            result = await result
+    except Exception as exc:
+        response["error"] = str(exc)
+        logger.error(f"❌ 決済注文送信例外: {symbol} reason={reason} error={exc}")
+        return response
+
+    if not isinstance(result, dict) or result.get("Result") != 0:
+        response["error"] = _safe_str(_pick_first_value(result or {}, ["Message", "ErrorMessage", "Code"])) or str(result)
+        logger.error(f"❌ 決済注文送信失敗: {symbol} reason={reason} result={result}")
+        return response
+
+    exit_order_id = _safe_str(_pick_first_value(result, ["OrderId", "OrderID", "ID"]))
+    if not exit_order_id:
+        response["error"] = "exit order accepted without order id"
+        logger.error(f"❌ 決済注文送信失敗: {symbol} reason={reason} result={result}")
+        return response
+
+    local_data["hold_id"] = hold_id
+    local_data["exit_order_id"] = exit_order_id
+    local_data["exit_attempt_no"] = next_attempt
+    local_data["exit_requested_at"] = requested_at
+    local_data["status"] = "EXIT_SENT"
+    local_data["known_position_qty"] = qty
+
+    response["ok"] = True
+    response["exit_order_id"] = exit_order_id
+    response["error"] = ""
+    logger.info(f"✅ 決済注文送信受付: {symbol} hold_id={hold_id} order_id={exit_order_id} reason={reason}")
+    return response
+
+
 class Config:
     DEFAULT_CONFIG = {
         "IS_PRODUCTION": False,
