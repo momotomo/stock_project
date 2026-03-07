@@ -3,6 +3,8 @@
 # ==============================================================================
 !pip install yfinance optuna xgboost lightgbm -q
 
+import csv
+import hashlib
 import os
 import yfinance as yf
 import pandas as pd
@@ -199,9 +201,29 @@ X_train_sel = X_train_scaled[selected_features]
 PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")
 PARAMS_OUT = Path("best_params.json")
 PARAMS_LOCAL = Path("best_params.json")
+TRAINING_RUN_LOG_PATH = Path("training_run_log.csv")
 DEFAULT_TUNING_WEEKDAY = 5  # 5=土曜日
 DEFAULT_OPTUNA_TRIALS = 15
 FORCE_WEEKLY_TUNING = os.getenv("FORCE_WEEKLY_TUNING", "").strip().lower() in {"1", "true", "yes", "on"}
+TRAINING_RUN_LOG_HEADER = [
+    "run_at",
+    "strategy_version",
+    "params_version",
+    "optuna_executed",
+    "n_trials",
+    "params_source",
+    "train_start",
+    "train_end",
+    "valid_start",
+    "valid_end",
+    "oos_start",
+    "oos_end",
+    "selected_metric",
+    "best_params_path",
+    "adoption_decision",
+]
+STRATEGY_VERSION = "V2.1_weekly_optuna"
+SELECTED_METRIC = "ndcg@1"
 
 FALLBACK_RANKER_PARAMS = {
     "n_estimators": 400,
@@ -328,6 +350,80 @@ def run_weekly_optuna():
         raise ValueError("Optuna が不正または空の params を返しました")
     return best_params
 
+def classify_params_source(source_detail):
+    if source_detail.startswith("weekly_optuna"):
+        return "weekly_optuna"
+    if source_detail.startswith("cached"):
+        return "cached"
+    if source_detail.startswith("fallback"):
+        return "fallback"
+    return source_detail or "unknown"
+
+def resolve_best_params_path(source_detail):
+    if source_detail.startswith("cached:") or source_detail.startswith("cached_after_optuna_failure:"):
+        return source_detail.split(":", 1)[1]
+    if classify_params_source(source_detail) == "weekly_optuna":
+        return str(PARAMS_OUT)
+    return ""
+
+def build_params_version(params):
+    payload = json.dumps(params, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
+
+def build_adoption_decision(source_detail, optuna_executed):
+    if source_detail.startswith("cached_after_optuna_failure"):
+        return "adopt_cached_after_optuna_failure"
+    if source_detail.startswith("fallback_after_optuna_failure"):
+        return "adopt_fallback_after_optuna_failure"
+    canonical = classify_params_source(source_detail)
+    if canonical == "weekly_optuna":
+        return "adopt_weekly_optuna" if optuna_executed else "weekly_optuna_not_executed"
+    if canonical == "cached":
+        return "adopt_cached"
+    if canonical == "fallback":
+        return "adopt_fallback"
+    return "adopt_unknown"
+
+def format_date_value(value):
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    return str(value)
+
+def build_training_window_summary(train_dates, oos_date):
+    train_dates = list(train_dates)
+    if not train_dates:
+        return {
+            "train_start": "",
+            "train_end": "",
+            "valid_start": "",
+            "valid_end": "",
+            "oos_start": format_date_value(oos_date),
+            "oos_end": format_date_value(oos_date),
+        }
+
+    split_idx = int(len(train_dates) * 0.8)
+    split_idx = max(1, min(split_idx, len(train_dates) - 1)) if len(train_dates) > 1 else 0
+    valid_dates = train_dates[split_idx:] if split_idx < len(train_dates) else []
+
+    return {
+        "train_start": format_date_value(train_dates[0]),
+        "train_end": format_date_value(train_dates[-1]),
+        "valid_start": format_date_value(valid_dates[0]) if valid_dates else "",
+        "valid_end": format_date_value(valid_dates[-1]) if valid_dates else "",
+        "oos_start": format_date_value(oos_date),
+        "oos_end": format_date_value(oos_date),
+    }
+
+def append_training_run_log(row):
+    file_exists = TRAINING_RUN_LOG_PATH.exists() and TRAINING_RUN_LOG_PATH.stat().st_size > 0
+    with TRAINING_RUN_LOG_PATH.open("a", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRAINING_RUN_LOG_HEADER)
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow({field: row.get(field, "") for field in TRAINING_RUN_LOG_HEADER})
+
 def resolve_ranker_params():
     cached_params, cached_source = load_best_params()
 
@@ -339,22 +435,47 @@ def resolve_ranker_params():
         try:
             tuned_params = run_weekly_optuna()
             save_best_params(tuned_params)
-            return tuned_params, "weekly_optuna", True
+            return tuned_params, "weekly_optuna", True, get_optuna_trials()
         except Exception as exc:
             print(f"⚠️ Optuna 実行に失敗しました。既存 params を優先し、best_params.json は更新しません: {exc}")
             if cached_params is not None:
-                return cached_params, f"cached_after_optuna_failure:{cached_source}", False
-            return FALLBACK_RANKER_PARAMS.copy(), "fallback_after_optuna_failure", False
+                return cached_params, f"cached_after_optuna_failure:{cached_source}", True, get_optuna_trials()
+            return FALLBACK_RANKER_PARAMS.copy(), "fallback_after_optuna_failure", True, get_optuna_trials()
 
     if cached_params is not None:
         print(f"⚙️ 平日実行: Optuna をスキップし、既存 params を利用します: {cached_source}")
-        return cached_params, f"cached:{cached_source}", False
+        return cached_params, f"cached:{cached_source}", False, 0
 
     print("⚙️ 平日実行: best_params.json が無いため fallback params を利用します。")
-    return FALLBACK_RANKER_PARAMS.copy(), "fallback", False
+    return FALLBACK_RANKER_PARAMS.copy(), "fallback", False, 0
 
-best_params, best_params_source, optuna_ran = resolve_ranker_params()
-print(f"🧭 Ranker params source={best_params_source} optuna_ran={optuna_ran}")
+best_params, best_params_source_detail, optuna_executed, optuna_trials = resolve_ranker_params()
+best_params_source = classify_params_source(best_params_source_detail)
+best_params_path = resolve_best_params_path(best_params_source_detail)
+train_dates = sorted(train_df.index.unique())
+training_window = build_training_window_summary(train_dates, latest_date)
+training_run_row = {
+    "run_at": jst_now().strftime("%Y-%m-%d %H:%M:%S"),
+    "strategy_version": STRATEGY_VERSION,
+    "params_version": build_params_version(best_params),
+    "optuna_executed": str(bool(optuna_executed)),
+    "n_trials": optuna_trials,
+    "params_source": best_params_source,
+    "train_start": training_window["train_start"],
+    "train_end": training_window["train_end"],
+    "valid_start": training_window["valid_start"],
+    "valid_end": training_window["valid_end"],
+    "oos_start": training_window["oos_start"],
+    "oos_end": training_window["oos_end"],
+    "selected_metric": SELECTED_METRIC,
+    "best_params_path": best_params_path,
+    "adoption_decision": build_adoption_decision(best_params_source_detail, optuna_executed),
+}
+append_training_run_log(training_run_row)
+print(
+    f"🧭 Ranker params source={best_params_source} optuna_executed={optuna_executed} "
+    f"best_params_path={best_params_path or 'N/A'}"
+)
 
 # --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
 print("🧠 最終モデル(Ranker)を学習中...")
