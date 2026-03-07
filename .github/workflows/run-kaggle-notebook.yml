@@ -130,7 +130,87 @@ jobs:
           mkdir -p kaggle-output
           kaggle kernels output "$KERNEL_REF" -p kaggle-output
 
+      - name: Validate Kaggle output artifacts
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          output_dir = Path("kaggle-output")
+          required_files = [
+              "best_params.json",
+              "classifier_model.pkl",
+              "meta_model.pkl",
+              "ranker_model.pkl",
+              "regressor_model.pkl",
+              "scaler.pkl",
+              "selected_features.pkl",
+              "stock-ai-trainer.log",
+          ]
+          optional_files = [
+              "training_run_log.csv",
+          ]
+
+          def find_matches(filename: str) -> list[str]:
+              return sorted(str(path.relative_to(output_dir)) for path in output_dir.rglob(filename))
+
+          found_required = {name: find_matches(name) for name in required_files}
+          missing_required = [name for name, matches in found_required.items() if not matches]
+          found_optional = {name: find_matches(name) for name in optional_files}
+
+          summary_lines = [
+              "# Kaggle Output Validation",
+              "",
+              "## Required artifacts",
+          ]
+          for name in required_files:
+              matches = found_required[name]
+              if matches:
+                  summary_lines.append(f"- FOUND `{name}`: {', '.join(matches)}")
+              else:
+                  summary_lines.append(f"- MISSING `{name}`")
+
+          summary_lines.extend([
+              "",
+              "## Optional artifacts",
+          ])
+          for name in optional_files:
+              matches = found_optional[name]
+              if matches:
+                  summary_lines.append(f"- FOUND `{name}`: {', '.join(matches)}")
+              else:
+                  summary_lines.append(f"- OPTIONAL_MISSING `{name}`")
+
+          summary_lines.extend([
+              "",
+              "## Downloaded files",
+          ])
+          downloaded_files = sorted(
+              str(path.relative_to(output_dir))
+              for path in output_dir.rglob("*")
+              if path.is_file()
+          )
+          if downloaded_files:
+              for path in downloaded_files:
+                  summary_lines.append(f"- `{path}`")
+          else:
+              summary_lines.append("- No files downloaded")
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          summary_text = "\n".join(summary_lines) + "\n"
+          if summary_path:
+              Path(summary_path).write_text(summary_text, encoding="utf-8")
+          else:
+              print(summary_text)
+
+          if missing_required:
+              print("Missing required Kaggle artifacts:", ", ".join(missing_required), file=sys.stderr)
+              sys.exit(1)
+          PY
+
       - name: Upload Kaggle output artifact
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: kaggle-output-${{ inputs.kernel_slug }}
