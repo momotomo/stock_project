@@ -13,6 +13,8 @@
 9. `cost_gap_bps = current_cost_hat_bps - actual_cost_bps` で、正は過大見積もり、負は過小見積もり
 10. GitHub Actions から Kaggle 学習を手動起動する場合は `Run Kaggle Notebook Manually` workflow を実行
 11. 必要な Secrets は `KAGGLE_USERNAME` と `KAGGLE_KEY`
+12. workflow は download 後に成果物検証を行い、`best_params.json`、`classifier_model.pkl`、`meta_model.pkl`、`ranker_model.pkl`、`regressor_model.pkl`、`scaler.pkl`、`selected_features.pkl`、`stock-ai-trainer.log` が 1 つでも欠けると fail する
+13. `training_run_log.csv` は現時点では optional で、存在すれば Actions summary に表示される
 
 事前確認:
 
