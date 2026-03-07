@@ -17,6 +17,9 @@
 13. `training_run_log.csv` は現時点では validation 上 optional だが、Kaggle trainer は成功時・失敗時ともに `/kaggle/working/training_run_log.csv` を finally で保存する
 14. 保存時は `stock-ai-trainer.log` に `RUN_LOG_PERSIST_START` / `RUN_LOG_PERSIST_TARGET=...` / `RUN_LOG_PERSIST_DONE exists=True/False` が出る
 15. `/kaggle/working/run_log_written.txt` も作られるので、workflow ログの `kaggle-output/` 一覧と artifact で `training_run_log.csv` の有無を確認する
+16. workflow には週次 schedule を追加済みで、毎週土曜 00:00 UTC / 土曜 09:00 JST に同じ workflow が走る
+17. schedule run でも `Push Kaggle kernel`、`Poll Kaggle kernel status` の `COMPLETE`、`training_run_log.csv`、`run_log_written.txt`、`stock-ai-trainer.log` を確認する
+18. `training_run_log.csv` は schedule run でも引き続き optional のまま扱い、required 化は別途再検討する
 
 Kaggle 学習成功条件:
 
