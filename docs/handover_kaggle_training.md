@@ -39,3 +39,5 @@
 
 - `training_run_log.csv` は 3 回連続成功または 1 週間安定までは optional のまま
 - 毎回 `downloaded files` / artifact / `stock-ai-trainer.log` を確認する
+- 安定性観測には `docs/kaggle_training_stability_checklist.md` の checklist / summary テンプレートを使う
+- 3 回連続成功または 1 週間安定したら required 化を再検討する
