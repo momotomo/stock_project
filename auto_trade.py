@@ -316,6 +316,285 @@ async def fetch_positions_snapshot(api: "KabuAPI", product: int) -> Dict[str, di
     return snapshots
 
 
+def _coerce_state_dict(value: Any) -> dict:
+    if isinstance(value, dict):
+        return value
+    if hasattr(value, "__dict__"):
+        return vars(value)
+    return {}
+
+
+def _opposite_trade_side(side: str) -> str:
+    normalized = _normalize_order_side(side)
+    if normalized == "BUY":
+        return "SELL"
+    if normalized == "SELL":
+        return "BUY"
+    return "UNKNOWN"
+
+
+def _extract_local_trade_context(local_state: Any) -> dict:
+    state = _coerce_state_dict(local_state)
+    order_side = _normalize_order_side(
+        _pick_first_value(state, ["order_side", "pending_side", "exit_side", "entry_side"])
+    )
+    position_side = _normalize_order_side(_pick_first_value(state, ["position_side", "side", "Side"]))
+    symbol = _safe_str(_pick_first_value(state, ["symbol", "Symbol", "ticker", "Ticker"]))
+    hold_id = _safe_str(_pick_first_value(state, ["hold_id", "HoldID", "execution_id", "ExecutionID"]))
+    order_id = _safe_str(_pick_first_value(state, ["order_id", "OrderID", "OrderId"]))
+    qty = safe_int(
+        _pick_first_value(state, ["qty", "Qty", "position_qty", "target_qty", "order_qty", "remaining_qty"]),
+        0,
+    )
+    is_closing = as_bool(
+        _pick_first_value(state, ["is_closing", "closing", "close_requested", "exit_pending", "is_exit"]),
+        False,
+    )
+    phase_markers = [
+        _safe_str(_pick_first_value(state, ["phase", "intent", "action"])).upper(),
+        _safe_str(_pick_first_value(state, ["status", "trade_status", "state"])).upper(),
+    ]
+    phase_text = " ".join(marker for marker in phase_markers if marker)
+
+    phase = ""
+    if is_closing or any(token in phase_text for token in {"EXIT", "CLOSE", "CLOSING", "SELL_EXIT"}):
+        phase = "EXIT"
+    elif any(token in phase_text for token in {"ENTRY", "OPEN", "BUY_ENTRY"}):
+        phase = "ENTRY"
+    elif order_side == "SELL" and hold_id:
+        phase = "EXIT"
+    elif order_side == "BUY":
+        phase = "ENTRY"
+
+    return {
+        "symbol": symbol,
+        "hold_id": hold_id,
+        "order_id": order_id,
+        "qty": qty,
+        "phase": phase,
+        "order_side": order_side,
+        "position_side": position_side,
+        "is_closing": is_closing,
+        "raw": state,
+    }
+
+
+def _match_position_snapshot(local_context: dict, positions_snapshot: Dict[str, dict]) -> Tuple[Optional[dict], List[str]]:
+    notes: List[str] = []
+    hold_id = local_context.get("hold_id", "")
+    symbol = local_context.get("symbol", "")
+    qty = safe_int(local_context.get("qty"), 0)
+    position_side = local_context.get("position_side", "UNKNOWN")
+
+    if hold_id:
+        matched = positions_snapshot.get(hold_id)
+        if matched:
+            notes.append("matched position by hold_id")
+            return matched, notes
+        notes.append("hold_id not found in positions snapshot")
+
+    if not symbol:
+        if len(positions_snapshot) == 1:
+            notes.append("matched sole position snapshot without local hint")
+            return next(iter(positions_snapshot.values())), notes
+        return None, notes
+
+    candidates = [position for position in positions_snapshot.values() if position.get("symbol") == symbol]
+    if position_side not in {"", "UNKNOWN"}:
+        side_filtered = [position for position in candidates if position.get("side") == position_side]
+        if side_filtered:
+            candidates = side_filtered
+    if qty > 0:
+        qty_filtered = [position for position in candidates if safe_int(position.get("qty"), 0) == qty]
+        if qty_filtered:
+            candidates = qty_filtered
+    if len(candidates) == 1:
+        notes.append("matched position by symbol")
+        return candidates[0], notes
+    if len(candidates) > 1:
+        notes.append("multiple positions matched symbol; selected first candidate")
+        return candidates[0], notes
+    return None, notes
+
+
+def _select_preferred_order(candidates: List[dict]) -> Optional[dict]:
+    if not candidates:
+        return None
+    priority = {
+        "PARTIAL": 0,
+        "ORDERED": 1,
+        "FILLED": 2,
+        "CANCELED": 3,
+        "EXPIRED": 4,
+        "REJECTED": 5,
+        "UNKNOWN": 6,
+    }
+    return sorted(
+        candidates,
+        key=lambda order: (
+            priority.get(_safe_str(order.get("state")), 99),
+            _safe_str(order.get("sent_at")),
+            _safe_str(order.get("order_id")),
+        ),
+        reverse=False,
+    )[0]
+
+
+def _match_order_snapshot(
+    local_context: dict,
+    orders_snapshot: Dict[str, dict],
+    matched_position: Optional[dict],
+) -> Tuple[Optional[dict], List[str]]:
+    notes: List[str] = []
+    order_id = local_context.get("order_id", "")
+    symbol = local_context.get("symbol", "")
+    phase = local_context.get("phase", "")
+    order_side = local_context.get("order_side", "UNKNOWN")
+    position_side = local_context.get("position_side", "UNKNOWN")
+
+    if order_id:
+        matched = orders_snapshot.get(order_id)
+        if matched:
+            notes.append("matched order by order_id")
+            return matched, notes
+        notes.append("order_id not found in orders snapshot")
+
+    if not symbol:
+        if len(orders_snapshot) == 1:
+            notes.append("matched sole order snapshot without local hint")
+            return next(iter(orders_snapshot.values())), notes
+        return None, notes
+
+    expected_side = order_side
+    if expected_side in {"", "UNKNOWN"}:
+        if phase == "EXIT":
+            position_side = matched_position.get("side") if matched_position else position_side
+            expected_side = _opposite_trade_side(position_side)
+        elif phase == "ENTRY" and position_side not in {"", "UNKNOWN"}:
+            expected_side = position_side
+
+    candidates = [order for order in orders_snapshot.values() if order.get("symbol") == symbol]
+    if expected_side not in {"", "UNKNOWN"}:
+        side_filtered = [order for order in candidates if order.get("side") == expected_side]
+        if side_filtered:
+            candidates = side_filtered
+
+    matched = _select_preferred_order(candidates)
+    if matched:
+        notes.append("matched order by symbol")
+    return matched, notes
+
+
+def _resolve_status_from_order_only(order: dict) -> str:
+    state = _safe_str(order.get("state"))
+    if state == "PARTIAL":
+        return "PARTIAL"
+    if state == "ORDERED":
+        return "PENDING"
+    return "UNKNOWN"
+
+
+def reconcile_trade_state(
+    local_state: Any,
+    orders_snapshot: Optional[Dict[str, dict]],
+    positions_snapshot: Optional[Dict[str, dict]],
+) -> dict:
+    orders_snapshot = orders_snapshot if isinstance(orders_snapshot, dict) else {}
+    positions_snapshot = positions_snapshot if isinstance(positions_snapshot, dict) else {}
+    local_context = _extract_local_trade_context(local_state)
+    notes: List[str] = []
+
+    matched_position, position_notes = _match_position_snapshot(local_context, positions_snapshot)
+    matched_order, order_notes = _match_order_snapshot(local_context, orders_snapshot, matched_position)
+    notes.extend(position_notes)
+    notes.extend(order_notes)
+
+    phase = local_context.get("phase", "")
+    local_qty = safe_int(local_context.get("qty"), 0)
+    position_qty = safe_int((matched_position or {}).get("qty"), 0)
+    position_leaves_qty = safe_int((matched_position or {}).get("leaves_qty"), position_qty)
+    order_remaining_qty = safe_int((matched_order or {}).get("remaining_qty"), 0)
+    order_cum_qty = safe_int((matched_order or {}).get("cum_qty"), 0)
+    order_state = _safe_str((matched_order or {}).get("state"))
+
+    response = {
+        "result": "UNKNOWN",
+        "resolved_status": "UNKNOWN",
+        "matched_order": matched_order,
+        "matched_position": matched_position,
+        "remaining_qty": 0,
+        "notes": notes,
+    }
+
+    if phase == "EXIT":
+        if matched_position is None:
+            response["result"] = "MATCHED_CLOSED"
+            response["resolved_status"] = "CLOSED"
+            response["remaining_qty"] = 0
+            notes.append("positions snapshot has no matching hold_id/symbol; treated as closed")
+            if matched_order:
+                notes.append("positions truth takes precedence over exit order state")
+            return response
+
+        response["resolved_status"] = "OPEN"
+        response["remaining_qty"] = position_leaves_qty if position_leaves_qty > 0 else position_qty
+        if matched_order is None:
+            response["result"] = "EXIT_UNRESOLVED"
+            notes.append("position remains open but no matching exit order was found")
+            return response
+
+        if order_state == "PARTIAL" or (local_qty > 0 and response["remaining_qty"] < local_qty) or order_cum_qty > 0:
+            response["result"] = "EXIT_PARTIAL"
+            notes.append("exit order is partially filled while position still remains")
+            return response
+
+        response["result"] = "EXIT_PENDING"
+        notes.append("exit order exists but position still remains open")
+        return response
+
+    if matched_position is not None:
+        response["resolved_status"] = "OPEN"
+        response["remaining_qty"] = position_leaves_qty if position_leaves_qty > 0 else position_qty
+        if phase == "ENTRY":
+            if matched_order and (
+                order_state == "PARTIAL" or (local_qty > 0 and position_qty < local_qty) or order_remaining_qty > 0
+            ):
+                response["result"] = "ENTRY_PARTIAL"
+                notes.append("entry position exists and order still has remaining quantity")
+                return response
+            response["result"] = "MATCHED_OPEN"
+            notes.append("positions snapshot confirms open position")
+            return response
+
+        response["result"] = "POSITION_ONLY"
+        notes.append("position exists without a conclusive entry/exit phase")
+        return response
+
+    if matched_order is not None:
+        response["remaining_qty"] = order_remaining_qty
+        response["resolved_status"] = _resolve_status_from_order_only(matched_order)
+        if phase == "ENTRY":
+            if order_state == "PARTIAL":
+                response["result"] = "ENTRY_PARTIAL"
+                notes.append("entry order is partially filled and no position is visible yet")
+                return response
+            if order_state == "ORDERED":
+                response["result"] = "ENTRY_PENDING"
+                notes.append("entry order is waiting and no position is visible yet")
+                return response
+        response["result"] = "ORDER_ONLY"
+        notes.append("order exists without a matching position")
+        return response
+
+    if phase == "ENTRY":
+        response["remaining_qty"] = local_qty
+        notes.append("entry intent exists but neither position nor order matched")
+        return response
+
+    notes.append("no matching position or order was found")
+    return response
+
+
 class Config:
     DEFAULT_CONFIG = {
         "IS_PRODUCTION": False,
