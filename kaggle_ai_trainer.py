@@ -54,8 +54,6 @@ SEED = 42
 random.seed(SEED)
 np.random.seed(SEED)
 
-print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
-
 # --- 1. 日経225銘柄リスト ---
 def get_nikkei225_tickers():
     print("🌐 日経225主要銘柄リストを読み込みます...")
@@ -79,7 +77,20 @@ def get_nikkei225_tickers():
     print(f"✅ {len(tickers)} 銘柄のリストを読み込みました。")
     return tickers
 
-TICKERS = get_nikkei225_tickers()
+TICKERS = {}
+ALL_FEATURES = [
+    'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm',
+    'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm',
+    'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
+    'EMA_Diff_Ratio', 'MACD_Div', 'Log_Return_Norm_Lag1', 'Log_Return_Norm_Lag2',
+    'RSI_14_Lag1', 'RSI_14_Lag2', 'MACD_Norm_Lag1', 'MACD_Norm_Lag2', 'RSI_Z_Score',
+    'Excess_Return', 'Excess_Return_20d'
+]
+train_df = pd.DataFrame()
+X_train_sel = pd.DataFrame()
+y_train_rank = pd.Series(dtype=float)
+y_train_class = pd.Series(dtype=float)
+group_train = np.array([])
 
 # --- 2. データ取得と特徴量生成 ---
 def get_macro_data():
@@ -165,67 +176,70 @@ def get_stock_features(ticker, macro_returns):
             if attempt < max_retries - 1: time.sleep(2)
             else: return None
 
-macro_returns = get_macro_data()
-stock_data_dict = {}
-count = 0
-total = len(TICKERS)
+def prepare_training_dataset(tickers):
+    macro_returns = get_macro_data()
+    stock_data_dict = {}
+    count = 0
+    total = len(tickers)
 
-print(f"📊 {total}銘柄のデータ取得を開始します。少し時間がかかります...")
-for name, ticker in TICKERS.items():
-    data = get_stock_features(ticker, macro_returns)
-    if data is not None: stock_data_dict[name] = data
-    count += 1
-    if count % 20 == 0:
-        print(f"  ... {count}/{total} 銘柄処理完了")
-        time.sleep(1)
+    print(f"📊 {total}銘柄のデータ取得を開始します。少し時間がかかります...")
+    for name, ticker in tickers.items():
+        data = get_stock_features(ticker, macro_returns)
+        if data is not None:
+            stock_data_dict[name] = data
+        count += 1
+        if count % 20 == 0:
+            print(f"  ... {count}/{total} 銘柄処理完了")
+            time.sleep(1)
 
-if len(stock_data_dict) < 50:
-    print("❌ データが少なすぎます。")
-    import sys; sys.exit(1)
+    if len(stock_data_dict) < 50:
+        raise RuntimeError("データが少なすぎます。")
 
-rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
-rsi_mean, rsi_std = rsi_df.mean(axis=1), rsi_df.std(axis=1)
+    rsi_df = pd.DataFrame({name: df['RSI_14'] for name, df in stock_data_dict.items()})
+    rsi_mean, rsi_std = rsi_df.mean(axis=1), rsi_df.std(axis=1)
 
-df_all = []
-for name in stock_data_dict.keys():
-    stock_data_dict[name]['RSI_Z_Score'] = (stock_data_dict[name]['RSI_14'] - rsi_mean) / (rsi_std + 1e-9)
-    stock_data_dict[name]['Ticker'] = name
-    df_all.append(stock_data_dict[name])
+    df_all = []
+    for name in stock_data_dict.keys():
+        stock_data_dict[name]['RSI_Z_Score'] = (stock_data_dict[name]['RSI_14'] - rsi_mean) / (rsi_std + 1e-9)
+        stock_data_dict[name]['Ticker'] = name
+        df_all.append(stock_data_dict[name])
 
-df_panel = pd.concat(df_all).sort_index()
+    df_panel = pd.concat(df_all).sort_index()
 
-ALL_FEATURES = [
-    'Log_Return_Norm', 'Frac_Diff_0.5', 'Disparity_5_Norm', 'Disparity_25_Norm', 
-    'SMA_Cross', 'RSI_14', 'BB_PctB', 'BB_Bandwidth', 'MACD_Norm', 
-    'ATR', 'OBV_Ret', 'USDJPY_Ret', 'SP500_Ret', 'TOPIX_Ret',
-    'EMA_Diff_Ratio', 'MACD_Div', 'Log_Return_Norm_Lag1', 'Log_Return_Norm_Lag2',
-    'RSI_14_Lag1', 'RSI_14_Lag2', 'MACD_Norm_Lag1', 'MACD_Norm_Lag2', 'RSI_Z_Score',
-    'Excess_Return', 'Excess_Return_20d'
-]
+    # V2.1: dropna に ATR_Prev_Ratio を追加
+    df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class', 'ATR_Prev_Ratio'])
+    df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
+        lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
+    )
 
-# V2.1: dropna に ATR_Prev_Ratio を追加
-df_panel = df_panel.dropna(subset=ALL_FEATURES + ['Target_Return', 'Target_Class', 'ATR_Prev_Ratio'])
-df_panel['Target_Rank'] = df_panel.groupby(level=0)['Target_Return'].transform(
-    lambda x: ((x.rank(method='first') - 1) / max(1, len(x) - 1) * min(4, len(x) - 1)).astype(int)
-)
+    latest_date = df_panel.index.max()
+    prepared_train_df = df_panel[df_panel.index < latest_date]
+    X_train_raw = prepared_train_df[ALL_FEATURES]
+    prepared_y_train_rank = prepared_train_df['Target_Rank']
+    prepared_y_train_class = prepared_train_df['Target_Class']
+    prepared_group_train = prepared_train_df.groupby(level=0).size().values
 
-latest_date = df_panel.index.max()
-train_df = df_panel[df_panel.index < latest_date]
-X_train_raw = train_df[ALL_FEATURES]
-y_train_rank = train_df['Target_Rank']
-y_train_class = train_df['Target_Class']
-group_train = train_df.groupby(level=0).size().values
+    scaler = RobustScaler()
+    X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=ALL_FEATURES)
 
-scaler = RobustScaler()
-X_train_scaled = pd.DataFrame(scaler.fit_transform(X_train_raw), index=X_train_raw.index, columns=ALL_FEATURES)
+    print("🔍 特徴量選択を実行中...")
+    fs_model = lgb.LGBMRanker(n_estimators=100, random_state=SEED, verbose=-1)
+    fs_model.fit(X_train_scaled, prepared_y_train_rank, group=prepared_group_train)
+    importance = pd.Series(fs_model.feature_importances_, index=ALL_FEATURES).sort_values(ascending=False)
+    top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
+    selected_features = importance.head(top_k).index.tolist()
+    prepared_X_train_sel = X_train_scaled[selected_features]
 
-print("🔍 特徴量選択を実行中...")
-fs_model = lgb.LGBMRanker(n_estimators=100, random_state=SEED, verbose=-1)
-fs_model.fit(X_train_scaled, y_train_rank, group=group_train)
-importance = pd.Series(fs_model.feature_importances_, index=ALL_FEATURES).sort_values(ascending=False)
-top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
-selected_features = importance.head(top_k).index.tolist()
-X_train_sel = X_train_scaled[selected_features]
+    return (
+        latest_date,
+        prepared_train_df,
+        prepared_X_train_sel,
+        prepared_y_train_rank,
+        prepared_y_train_class,
+        prepared_group_train,
+        scaler,
+        selected_features,
+    )
 
 # 🔥 変更: Optunaの週1回化と best_params.json の安全な運用
 PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")
@@ -251,6 +265,8 @@ TRAINING_RUN_LOG_HEADER = [
     "selected_metric",
     "best_params_path",
     "adoption_decision",
+    "run_status",
+    "error_message",
 ]
 STRATEGY_VERSION = "V2.1_weekly_optuna"
 SELECTED_METRIC = "ndcg@1"
@@ -489,13 +505,36 @@ def build_training_window_summary(train_dates, oos_date):
         "oos_end": format_date_value(oos_date),
     }
 
+
+def normalize_training_run_row(row):
+    return {field: row.get(field, "") for field in TRAINING_RUN_LOG_HEADER}
+
+
+def ensure_training_run_log_schema():
+    if not TRAINING_RUN_LOG_PATH.exists() or TRAINING_RUN_LOG_PATH.stat().st_size == 0:
+        return
+
+    with TRAINING_RUN_LOG_PATH.open("r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        if fieldnames == TRAINING_RUN_LOG_HEADER:
+            return
+        existing_rows = [normalize_training_run_row(row) for row in reader]
+
+    with TRAINING_RUN_LOG_PATH.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRAINING_RUN_LOG_HEADER)
+        writer.writeheader()
+        writer.writerows(existing_rows)
+
+
 def append_training_run_log(row):
+    ensure_training_run_log_schema()
     file_exists = TRAINING_RUN_LOG_PATH.exists() and TRAINING_RUN_LOG_PATH.stat().st_size > 0
     with TRAINING_RUN_LOG_PATH.open("a", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=TRAINING_RUN_LOG_HEADER)
         if not file_exists:
             writer.writeheader()
-        writer.writerow({field: row.get(field, "") for field in TRAINING_RUN_LOG_HEADER})
+        writer.writerow(normalize_training_run_row(row))
 
 def resolve_ranker_params():
     cached_params, cached_source = load_best_params()
@@ -522,89 +561,121 @@ def resolve_ranker_params():
     print("⚙️ 平日実行: best_params.json が無いため fallback params を利用します。")
     return FALLBACK_RANKER_PARAMS.copy(), "fallback", False, 0
 
-best_params, best_params_source_detail, optuna_executed, optuna_trials = resolve_ranker_params()
-best_params_source = classify_params_source(best_params_source_detail)
-best_params_path = resolve_best_params_path(best_params_source_detail)
-train_dates = sorted(train_df.index.unique())
-training_window = build_training_window_summary(train_dates, latest_date)
-training_run_row = {
-    "run_at": jst_now().strftime("%Y-%m-%d %H:%M:%S"),
-    "strategy_version": STRATEGY_VERSION,
-    "params_version": build_params_version(best_params),
-    "optuna_executed": str(bool(optuna_executed)),
-    "n_trials": optuna_trials,
-    "params_source": best_params_source,
-    "train_start": training_window["train_start"],
-    "train_end": training_window["train_end"],
-    "valid_start": training_window["valid_start"],
-    "valid_end": training_window["valid_end"],
-    "oos_start": training_window["oos_start"],
-    "oos_end": training_window["oos_end"],
-    "selected_metric": SELECTED_METRIC,
-    "best_params_path": best_params_path,
-    "adoption_decision": build_adoption_decision(best_params_source_detail, optuna_executed),
-}
-append_training_run_log(training_run_row)
-print(
-    f"🧭 Ranker params source={best_params_source} optuna_executed={optuna_executed} "
-    f"best_params_path={best_params_path or 'N/A'}"
-)
+def main():
+    global TICKERS, train_df, X_train_sel, y_train_rank, y_train_class, group_train
 
-# --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
-print("🧠 最終モデル(Ranker)を学習中...")
-ranker_model = lgb.LGBMRanker(**best_params)
-ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
+    print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
+    training_run_row = {field: "" for field in TRAINING_RUN_LOG_HEADER}
+    training_run_row["run_at"] = jst_now().strftime("%Y-%m-%d %H:%M:%S")
+    training_run_row["strategy_version"] = STRATEGY_VERSION
+    training_run_row["selected_metric"] = SELECTED_METRIC
 
-print("🔍 メタラベリング用 OOF(クロスバリデーション)予測を生成中...")
-oof_probs = np.zeros(len(X_train_sel))
-time_splits = build_date_time_series_splits(X_train_sel.index, n_splits=5)
+    try:
+        TICKERS = get_nikkei225_tickers()
+        (
+            latest_date,
+            train_df,
+            X_train_sel,
+            y_train_rank,
+            y_train_class,
+            group_train,
+            scaler,
+            selected_features,
+        ) = prepare_training_dataset(TICKERS)
 
-for train_index, val_index in time_splits:
-    X_tr, y_tr = X_train_sel.iloc[train_index], y_train_class.iloc[train_index]
-    X_va = X_train_sel.iloc[val_index]
-    xgb_cv = xgb.XGBClassifier(
-        n_estimators=100,
-        max_depth=5,
-        learning_rate=0.05,
-        random_state=SEED,
-        eval_metric='logloss',
-    )
-    xgb_cv.fit(X_tr, y_tr)
-    oof_probs[val_index] = xgb_cv.predict_proba(X_va)[:, 1]
+        best_params, best_params_source_detail, optuna_executed, optuna_trials = resolve_ranker_params()
+        best_params_source = classify_params_source(best_params_source_detail)
+        best_params_path = resolve_best_params_path(best_params_source_detail)
+        train_dates = sorted(train_df.index.unique())
+        training_window = build_training_window_summary(train_dates, latest_date)
+        training_run_row.update(
+            {
+                "params_version": build_params_version(best_params),
+                "optuna_executed": str(bool(optuna_executed)),
+                "n_trials": optuna_trials,
+                "params_source": best_params_source,
+                "train_start": training_window["train_start"],
+                "train_end": training_window["train_end"],
+                "valid_start": training_window["valid_start"],
+                "valid_end": training_window["valid_end"],
+                "oos_start": training_window["oos_start"],
+                "oos_end": training_window["oos_end"],
+                "best_params_path": best_params_path,
+                "adoption_decision": build_adoption_decision(best_params_source_detail, optuna_executed),
+            }
+        )
+        print(
+            f"🧭 Ranker params source={best_params_source} optuna_executed={optuna_executed} "
+            f"best_params_path={best_params_path or 'N/A'}"
+        )
 
-print("🧠 メタモデル(確信度AI)を学習中...")
-X_meta = X_train_sel.copy()
-X_meta['Base_Prob'] = oof_probs
-meta_model = lgb.LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=SEED, verbose=-1)
-meta_model.fit(X_meta, y_train_class)
+        print("🧠 最終モデル(Ranker)を学習中...")
+        ranker_model = lgb.LGBMRanker(**best_params)
+        ranker_model.fit(X_train_sel, y_train_rank, group=group_train)
 
-print("🧠 本番用ベースモデル(XGBoost)を学習中...")
-xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=SEED, eval_metric='logloss')
-xgb_model.fit(X_train_sel, y_train_class)
+        print("🔍 メタラベリング用 OOF(クロスバリデーション)予測を生成中...")
+        oof_probs = np.zeros(len(X_train_sel))
+        time_splits = build_date_time_series_splits(X_train_sel.index, n_splits=5)
+        for train_index, val_index in time_splits:
+            X_tr, y_tr = X_train_sel.iloc[train_index], y_train_class.iloc[train_index]
+            X_va = X_train_sel.iloc[val_index]
+            xgb_cv = xgb.XGBClassifier(
+                n_estimators=100,
+                max_depth=5,
+                learning_rate=0.05,
+                random_state=SEED,
+                eval_metric='logloss',
+            )
+            xgb_cv.fit(X_tr, y_tr)
+            oof_probs[val_index] = xgb_cv.predict_proba(X_va)[:, 1]
 
-# --- V2.1: 回帰モデル（Pred_Return用）の学習を追加 ---
-print("🧠 本番用リターン回帰モデル(LGBMRegressor)を学習中...")
-y_train_reg = train_df["Target_Return"].astype(float)
-regressor_model = lgb.LGBMRegressor(
-    n_estimators=400,
-    learning_rate=0.03,
-    max_depth=4,
-    num_leaves=31,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    random_state=SEED,
-    objective="regression", # huberが弾かれる環境対策としてregressionを採用
-    verbose=-1,
-)
-regressor_model.fit(X_train_sel, y_train_reg)
+        print("🧠 メタモデル(確信度AI)を学習中...")
+        X_meta = X_train_sel.copy()
+        X_meta['Base_Prob'] = oof_probs
+        meta_model = lgb.LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.05, random_state=SEED, verbose=-1)
+        meta_model.fit(X_meta, y_train_class)
 
-# --- 4. モデルの保存 (KaggleのOutputとして保存) ---
-print("💾 モデルをファイルに保存中(Kaggle Output)...")
-atomic_joblib_dump(ranker_model, 'ranker_model.pkl')
-atomic_joblib_dump(xgb_model, 'classifier_model.pkl')
-atomic_joblib_dump(meta_model, 'meta_model.pkl')
-atomic_joblib_dump(regressor_model, 'regressor_model.pkl') # V2.1で追加
-atomic_joblib_dump(scaler, 'scaler.pkl')
-atomic_joblib_dump(selected_features, 'selected_features.pkl')
+        print("🧠 本番用ベースモデル(XGBoost)を学習中...")
+        xgb_model = xgb.XGBClassifier(n_estimators=100, max_depth=5, learning_rate=0.05, random_state=SEED, eval_metric='logloss')
+        xgb_model.fit(X_train_sel, y_train_class)
 
-print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
+        print("🧠 本番用リターン回帰モデル(LGBMRegressor)を学習中...")
+        y_train_reg = train_df["Target_Return"].astype(float)
+        regressor_model = lgb.LGBMRegressor(
+            n_estimators=400,
+            learning_rate=0.03,
+            max_depth=4,
+            num_leaves=31,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            random_state=SEED,
+            objective="regression",
+            verbose=-1,
+        )
+        regressor_model.fit(X_train_sel, y_train_reg)
+
+        print("💾 モデルをファイルに保存中(Kaggle Output)...")
+        atomic_joblib_dump(ranker_model, 'ranker_model.pkl')
+        atomic_joblib_dump(xgb_model, 'classifier_model.pkl')
+        atomic_joblib_dump(meta_model, 'meta_model.pkl')
+        atomic_joblib_dump(regressor_model, 'regressor_model.pkl')
+        atomic_joblib_dump(scaler, 'scaler.pkl')
+        atomic_joblib_dump(selected_features, 'selected_features.pkl')
+
+        training_run_row["run_status"] = "success"
+        training_run_row["error_message"] = ""
+        append_training_run_log(training_run_row)
+        print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
+        return 0
+    except Exception as exc:
+        training_run_row["run_status"] = "failed"
+        training_run_row["error_message"] = str(exc)
+        try:
+            append_training_run_log(training_run_row)
+        except Exception as log_exc:
+            print(f"⚠️ training_run_log.csv の記録に失敗しました: {log_exc}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
