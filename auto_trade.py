@@ -48,6 +48,14 @@ EXEC_LOG_HEADER = [
     "qty",
     "spread_pct",
     "slippage_yen",
+    "entry_or_exit",
+    "expected_side_price",
+    "slippage_pct",
+    "slippage_bps",
+    "time_bucket",
+    "is_force_exit",
+    "price_level",
+    "turnover_proxy",
 ]
 
 ORDER_STATUS_HEADER = [
@@ -93,6 +101,87 @@ def safe_float(value, default: float = 0.0) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _parse_log_timestamp(value: Any) -> Optional[datetime]:
+    text = str(value).strip() if value is not None else ""
+    if not text:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _classify_time_bucket(fill_time: Any, order_sent_time: Any) -> str:
+    timestamp = _parse_log_timestamp(fill_time) or _parse_log_timestamp(order_sent_time)
+    if timestamp is None:
+        return ""
+
+    minutes = timestamp.hour * 60 + timestamp.minute
+    if 9 * 60 <= minutes < 9 * 60 + 5:
+        return "open_0_5m"
+    if 9 * 60 + 5 <= minutes < 9 * 60 + 30:
+        return "open_5_30m"
+    if 14 * 60 + 30 <= minutes <= 15 * 60:
+        return "preclose"
+    return "midday"
+
+
+def _is_force_exit_reason(reason: Any) -> bool:
+    text = str(reason).strip().lower() if reason is not None else ""
+    return "force_exit" in text
+
+
+def _derive_expected_side_price(side: Any, expected_ask: Any, expected_bid: Any) -> Any:
+    normalized_side = _normalize_order_side(side)
+    if normalized_side == "BUY":
+        return expected_ask
+    if normalized_side == "SELL":
+        return expected_bid
+    return ""
+
+
+def _derive_slippage_yen(side: Any, actual_price: Any, expected_side_price: Any) -> Any:
+    actual = safe_float(actual_price, 0.0)
+    expected = safe_float(expected_side_price, 0.0)
+    if actual <= 0 or expected <= 0:
+        return ""
+
+    normalized_side = _normalize_order_side(side)
+    if normalized_side == "BUY":
+        return actual - expected
+    if normalized_side == "SELL":
+        return expected - actual
+    return ""
+
+
+def _derive_slippage_metrics(side: Any, actual_price: Any, expected_side_price: Any, slippage_yen: Any) -> Tuple[Any, Any]:
+    expected = safe_float(expected_side_price, 0.0)
+    slippage = safe_float(slippage_yen, 0.0)
+    if expected <= 0 or slippage_yen in ("", None):
+        slippage = safe_float(_derive_slippage_yen(side, actual_price, expected_side_price), 0.0)
+    if expected <= 0:
+        return "", ""
+
+    # slippage_pct is adverse-positive for both sides:
+    # BUY=(actual-expected_ask)/expected_ask, SELL=(expected_bid-actual)/expected_bid
+    slippage_pct = slippage / expected
+    slippage_bps = slippage_pct * 10000
+    return slippage_pct, slippage_bps
+
+
+def _derive_price_level(actual_price: Any, expected_side_price: Any) -> Any:
+    actual = safe_float(actual_price, 0.0)
+    if actual > 0:
+        return actual
+    expected = safe_float(expected_side_price, 0.0)
+    if expected > 0:
+        return expected
+    return ""
 
 
 def _pick_first_value(data: Optional[dict], keys: List[str]) -> Any:
@@ -1302,14 +1391,69 @@ class ExecutionLogger:
     def _ensure_header(self, path: str, header: List[str]) -> None:
         self._ensure_parent_dir(path)
         file_exists = os.path.exists(path) and os.path.getsize(path) > 0
-        if file_exists:
+        if not file_exists:
+            with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+                writer = csv.writer(handle)
+                writer.writerow(header)
             return
+
+        with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.reader(handle)
+            existing_header = next(reader, [])
+        if existing_header == header:
+            return
+
+        with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+            dict_reader = csv.DictReader(handle)
+            rows = list(dict_reader) if dict_reader.fieldnames else []
+
         with open(path, "w", newline="", encoding="utf-8-sig") as handle:
-            writer = csv.writer(handle)
-            writer.writerow(header)
+            writer = csv.DictWriter(handle, fieldnames=header)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({field: row.get(field, "") for field in header})
+
+    def _enrich_trade_execution_row(self, row: dict) -> dict:
+        enriched = dict(row)
+        normalized_side = _normalize_order_side(row.get("side"))
+        entry_or_exit = "entry" if normalized_side == "BUY" else "exit" if normalized_side == "SELL" else ""
+        expected_side_price = _derive_expected_side_price(
+            normalized_side,
+            row.get("expected_ask"),
+            row.get("expected_bid"),
+        )
+        slippage_yen = row.get("slippage_yen", "")
+        if slippage_yen in ("", None):
+            slippage_yen = _derive_slippage_yen(normalized_side, row.get("actual_price"), expected_side_price)
+        slippage_pct, slippage_bps = _derive_slippage_metrics(
+            normalized_side,
+            row.get("actual_price"),
+            expected_side_price,
+            slippage_yen,
+        )
+        price_level = _derive_price_level(row.get("actual_price"), expected_side_price)
+        qty = safe_int(row.get("qty"), 0)
+        turnover_proxy = safe_float(price_level, 0.0) * qty if safe_float(price_level, 0.0) > 0 and qty > 0 else ""
+
+        enriched.update(
+            {
+                "entry_or_exit": entry_or_exit,
+                "expected_side_price": expected_side_price,
+                "slippage_yen": slippage_yen,
+                "slippage_pct": slippage_pct,
+                "slippage_bps": slippage_bps,
+                "time_bucket": _classify_time_bucket(row.get("fill_time"), row.get("order_sent_time")),
+                "is_force_exit": _is_force_exit_reason(
+                    row.get("execution_reason") or row.get("pending_reason") or row.get("reason")
+                ),
+                "price_level": price_level,
+                "turnover_proxy": turnover_proxy,
+            }
+        )
+        return enriched
 
     def log_trade_execution(self, row: dict) -> None:
-        self._write_row(self.exec_log_path, EXEC_LOG_HEADER, row)
+        self._write_row(self.exec_log_path, EXEC_LOG_HEADER, self._enrich_trade_execution_row(row))
 
     def log_order_status(self, row: dict) -> None:
         self._write_row(self.status_log_path, ORDER_STATUS_HEADER, row)
@@ -1329,6 +1473,7 @@ class PendingOrder:
     spread_pct: float
     time_added: float
     side: str
+    reason: str = ""
 
 
 @dataclass
@@ -1423,6 +1568,7 @@ class PortfolioManager:
         expected_ask: float,
         expected_bid: float,
         side: str,
+        reason: str = "",
     ) -> None:
         pending = PendingOrder(
             order_id=order_id,
@@ -1433,6 +1579,7 @@ class PortfolioManager:
             spread_pct=MarketData.calculate_spread_pct(expected_ask, expected_bid),
             time_added=time.time(),
             side=side,
+            reason=reason,
         )
         self.pending_orders.setdefault(symbol, []).append(pending)
 
@@ -1568,6 +1715,7 @@ class PortfolioManager:
                         "qty": position.qty,
                         "spread_pct": pending.spread_pct,
                         "slippage_yen": slippage_yen,
+                        "execution_reason": pending.reason,
                     }
                 )
                 if actual_price is not None:
@@ -1620,6 +1768,7 @@ class PortfolioManager:
                                 "qty": qty,
                                 "spread_pct": pending.spread_pct,
                                 "slippage_yen": slippage_yen,
+                                "execution_reason": pending.reason,
                             }
                         )
                         logger.info(
@@ -1815,6 +1964,7 @@ class PortfolioManager:
                 expected_ask=ask1,
                 expected_bid=bid1,
                 side="SELL",
+                reason="barrier_exit",
             )
             return
 
@@ -2074,6 +2224,7 @@ class TradingEngine:
                         expected_ask=ask1,
                         expected_bid=bid1,
                         side="BUY",
+                        reason="entry",
                     )
                     active_orders_count += 1
             else:
@@ -2122,6 +2273,7 @@ class TradingEngine:
                     expected_ask=ask1,
                     expected_bid=bid1,
                     side="SELL",
+                    reason=reason,
                 )
             return result
 

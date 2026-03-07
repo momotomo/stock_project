@@ -54,6 +54,8 @@
 - `order_status_log*.csv` に `TIMEOUT` や `CANCELED/REJECTED` が増えていないか
 - `daily_health_log.csv` に当日 1 行追記されているか
 - ブレーカー発動日は `recommendations.csv` が空であること
+- `trade_execution_log*.csv` には `entry_or_exit` / `expected_side_price` / `slippage_pct` / `slippage_bps` / `time_bucket` / `is_force_exit` / `price_level` が追加されている
+- `slippage_pct` は不利方向を正で統一し、BUY は `(actual_price-expected_ask)/expected_ask`、SELL は `(expected_bid-actual_price)/expected_bid`、`slippage_bps = slippage_pct * 10000`
 
 マージ後チェックリスト:
 
