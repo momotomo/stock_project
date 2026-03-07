@@ -14,8 +14,9 @@
 10. GitHub Actions から Kaggle 学習を手動起動する場合は `Run Kaggle Notebook Manually` workflow を実行
 11. 必要な Secrets は `KAGGLE_USERNAME` と `KAGGLE_KEY`
 12. workflow は download 後に成果物検証を行い、`best_params.json`、`classifier_model.pkl`、`meta_model.pkl`、`ranker_model.pkl`、`regressor_model.pkl`、`scaler.pkl`、`selected_features.pkl`、`stock-ai-trainer.log` が 1 つでも欠けると fail する
-13. `training_run_log.csv` は現時点では validation 上 optional だが、Kaggle trainer は成功時・失敗時ともに `/kaggle/working/training_run_log.csv` へ残す想定に揃えている
-14. workflow ログには download 後の `kaggle-output/` 一覧が出るので、`kaggle-output-<kernel_slug>` artifact に `training_run_log.csv` が含まれたかを確認する
+13. `training_run_log.csv` は現時点では validation 上 optional だが、Kaggle trainer は成功時・失敗時ともに `/kaggle/working/training_run_log.csv` を finally で保存する
+14. 保存時は `stock-ai-trainer.log` に `RUN_LOG_PERSIST_START` / `RUN_LOG_PERSIST_TARGET=...` / `RUN_LOG_PERSIST_DONE exists=True/False` が出る
+15. `/kaggle/working/run_log_written.txt` も作られるので、workflow ログの `kaggle-output/` 一覧と artifact で `training_run_log.csv` の有無を確認する
 
 事前確認:
 

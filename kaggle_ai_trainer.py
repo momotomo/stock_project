@@ -33,6 +33,7 @@ ensure_notebook_dependencies()
 
 import csv
 import hashlib
+import logging
 import yfinance as yf
 import pandas as pd
 import numpy as np
@@ -258,6 +259,9 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 PARAMS_OUT = OUTPUT_DIR / "best_params.json"
 PARAMS_LOCAL = OUTPUT_DIR / "best_params.json"
 TRAINING_RUN_LOG_PATH = OUTPUT_DIR / "training_run_log.csv"
+TRAINING_RUN_LOG_TARGET_PATH = KAGGLE_OUTPUT_DIR / "training_run_log.csv" if KAGGLE_OUTPUT_DIR.exists() else TRAINING_RUN_LOG_PATH
+RUN_LOG_SENTINEL_PATH = KAGGLE_OUTPUT_DIR / "run_log_written.txt" if KAGGLE_OUTPUT_DIR.exists() else OUTPUT_DIR / "run_log_written.txt"
+TRAINER_LOG_PATH = OUTPUT_DIR / "stock-ai-trainer.log"
 RANKER_MODEL_PATH = OUTPUT_DIR / "ranker_model.pkl"
 CLASSIFIER_MODEL_PATH = OUTPUT_DIR / "classifier_model.pkl"
 META_MODEL_PATH = OUTPUT_DIR / "meta_model.pkl"
@@ -298,6 +302,33 @@ FALLBACK_RANKER_PARAMS = {
     "verbose": -1,
 }
 REQUIRED_RANKER_PARAM_KEYS = {"n_estimators", "learning_rate", "max_depth", "num_leaves"}
+RUN_LOGGER = logging.getLogger("stock_ai_trainer")
+
+
+def ensure_run_logger():
+    target_path = TRAINER_LOG_PATH.resolve()
+    current_handler = next(
+        (
+            handler for handler in RUN_LOGGER.handlers
+            if isinstance(handler, logging.FileHandler)
+            and Path(handler.baseFilename).resolve() == target_path
+        ),
+        None,
+    )
+    if current_handler is None:
+        for handler in list(RUN_LOGGER.handlers):
+            RUN_LOGGER.removeHandler(handler)
+            try:
+                handler.close()
+            except Exception:
+                pass
+        TRAINER_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(TRAINER_LOG_PATH, encoding="utf-8")
+        file_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        RUN_LOGGER.addHandler(file_handler)
+    RUN_LOGGER.setLevel(logging.INFO)
+    RUN_LOGGER.propagate = False
+    return RUN_LOGGER
 
 def jst_now():
     return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
@@ -568,13 +599,22 @@ def export_to_kaggle_working(path):
 
 
 def write_training_run_log_fallback(row):
-    fallback_path = KAGGLE_OUTPUT_DIR / "training_run_log.csv" if KAGGLE_OUTPUT_DIR.exists() else TRAINING_RUN_LOG_PATH
+    fallback_path = TRAINING_RUN_LOG_TARGET_PATH
     fallback_path.parent.mkdir(parents=True, exist_ok=True)
     with fallback_path.open("w", newline="", encoding="utf-8-sig") as handle:
         writer = csv.DictWriter(handle, fieldnames=TRAINING_RUN_LOG_HEADER)
         writer.writeheader()
         writer.writerow(normalize_training_run_row(row))
     return fallback_path
+
+
+def write_run_log_sentinel(target_path):
+    RUN_LOG_SENTINEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+    RUN_LOG_SENTINEL_PATH.write_text(
+        f"run_log_path={target_path}\nexists={Path(target_path).exists()}\n",
+        encoding="utf-8",
+    )
+    return RUN_LOG_SENTINEL_PATH
 
 
 def list_output_files(label):
@@ -595,18 +635,27 @@ def list_output_files(label):
 
 
 def persist_training_run_log(row):
+    logger = ensure_run_logger()
+    logger.info("RUN_LOG_PERSIST_START")
+    logger.info("RUN_LOG_PERSIST_TARGET=%s", TRAINING_RUN_LOG_TARGET_PATH)
+    exported_path = TRAINING_RUN_LOG_TARGET_PATH
     try:
         append_training_run_log(row)
         exported_path = export_to_kaggle_working(TRAINING_RUN_LOG_PATH)
         print(f"📝 training_run_log.csv を保存しました: {exported_path}")
     except Exception as exc:
         print(f"⚠️ training_run_log.csv の通常記録に失敗しました。fallback を試みます: {exc}")
-        try:
-            fallback_path = write_training_run_log_fallback(row)
-            print(f"📝 training_run_log.csv を fallback 保存しました: {fallback_path}")
-        except Exception as fallback_exc:
-            print(f"⚠️ training_run_log.csv の fallback 保存にも失敗しました: {fallback_exc}")
+        fallback_path = write_training_run_log_fallback(row)
+        exported_path = export_to_kaggle_working(fallback_path)
+        print(f"📝 training_run_log.csv を fallback 保存しました: {exported_path}")
+    exists = Path(exported_path).exists()
+    if exists:
+        write_run_log_sentinel(exported_path)
+    logger.info("RUN_LOG_PERSIST_DONE exists=%s", exists)
     list_output_files("current output files")
+    if not exists:
+        raise FileNotFoundError(f"training_run_log.csv が見つかりません: {exported_path}")
+    return exported_path
 
 def resolve_ranker_params():
     cached_params, cached_source = load_best_params()
@@ -636,12 +685,16 @@ def resolve_ranker_params():
 def main():
     global TICKERS, train_df, X_train_sel, y_train_rank, y_train_class, group_train
 
+    logger = ensure_run_logger()
     print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
     print(f"📦 成果物出力先: {OUTPUT_DIR.resolve()}")
     training_run_row = {field: "" for field in TRAINING_RUN_LOG_HEADER}
     training_run_row["run_at"] = jst_now().strftime("%Y-%m-%d %H:%M:%S")
     training_run_row["strategy_version"] = STRATEGY_VERSION
     training_run_row["selected_metric"] = SELECTED_METRIC
+    training_run_row["run_status"] = "started"
+    training_run_row["error_message"] = ""
+    pipeline_error = None
 
     try:
         TICKERS = get_nikkei225_tickers()
@@ -737,14 +790,22 @@ def main():
 
         training_run_row["run_status"] = "success"
         training_run_row["error_message"] = ""
-        persist_training_run_log(training_run_row)
-        print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
-        return 0
     except Exception as exc:
-        training_run_row["run_status"] = "failed"
+        training_run_row["run_status"] = "error"
         training_run_row["error_message"] = str(exc)
-        persist_training_run_log(training_run_row)
-        raise
+        logger.exception("TRAINING_PIPELINE_FAILED")
+        pipeline_error = exc
+    finally:
+        try:
+            persist_training_run_log(training_run_row)
+        except Exception:
+            logger.exception("RUN_LOG_PERSIST_FAILED")
+
+    if pipeline_error is not None:
+        raise pipeline_error
+
+    print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
+    return 0
 
 
 if __name__ == "__main__":
