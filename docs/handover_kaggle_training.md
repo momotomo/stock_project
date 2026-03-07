@@ -43,3 +43,5 @@
 - 3 回連続成功または 1 週間安定したら required 化を再検討する
 - schedule は安定性観測後に追加する
 - schedule 追加前に `Push Kaggle kernel`、`COMPLETE`、`training_run_log.csv`、`run_log_written.txt`、`stock-ai-trainer.log` の安定出力を確認する
+- 次の段階として artifact promotion policy を整理した
+- まだ docs 化のみで、自動昇格や required 強化は未実施
