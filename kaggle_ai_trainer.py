@@ -3,6 +3,7 @@
 # ==============================================================================
 import os
 import random
+import shutil
 import tempfile
 
 
@@ -247,7 +248,7 @@ KAGGLE_OUTPUT_DIR = Path("/kaggle/working")
 
 
 def resolve_output_dir():
-    if os.getenv("KAGGLE_KERNEL_RUN_TYPE") and KAGGLE_OUTPUT_DIR.exists():
+    if KAGGLE_OUTPUT_DIR.exists():
         return KAGGLE_OUTPUT_DIR
     return Path(".")
 
@@ -553,6 +554,60 @@ def append_training_run_log(row):
             writer.writeheader()
         writer.writerow(normalize_training_run_row(row))
 
+
+def export_to_kaggle_working(path):
+    source_path = Path(path)
+    if not source_path.exists() or not KAGGLE_OUTPUT_DIR.exists():
+        return source_path
+    target_path = KAGGLE_OUTPUT_DIR / source_path.name
+    if source_path.resolve() == target_path.resolve():
+        return target_path
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source_path, target_path)
+    return target_path
+
+
+def write_training_run_log_fallback(row):
+    fallback_path = KAGGLE_OUTPUT_DIR / "training_run_log.csv" if KAGGLE_OUTPUT_DIR.exists() else TRAINING_RUN_LOG_PATH
+    fallback_path.parent.mkdir(parents=True, exist_ok=True)
+    with fallback_path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=TRAINING_RUN_LOG_HEADER)
+        writer.writeheader()
+        writer.writerow(normalize_training_run_row(row))
+    return fallback_path
+
+
+def list_output_files(label):
+    listed_directories = []
+    for directory in (OUTPUT_DIR, KAGGLE_OUTPUT_DIR):
+        if not directory.exists():
+            continue
+        directory_key = str(directory.resolve())
+        if directory_key in listed_directories:
+            continue
+        listed_directories.append(directory_key)
+        files = sorted(
+            str(path.relative_to(directory))
+            for path in directory.rglob("*")
+            if path.is_file()
+        )
+        print(f"📦 {label}: {directory} -> {files if files else ['<no files>']}")
+
+
+def persist_training_run_log(row):
+    try:
+        append_training_run_log(row)
+        exported_path = export_to_kaggle_working(TRAINING_RUN_LOG_PATH)
+        print(f"📝 training_run_log.csv を保存しました: {exported_path}")
+    except Exception as exc:
+        print(f"⚠️ training_run_log.csv の通常記録に失敗しました。fallback を試みます: {exc}")
+        try:
+            fallback_path = write_training_run_log_fallback(row)
+            print(f"📝 training_run_log.csv を fallback 保存しました: {fallback_path}")
+        except Exception as fallback_exc:
+            print(f"⚠️ training_run_log.csv の fallback 保存にも失敗しました: {fallback_exc}")
+    list_output_files("current output files")
+
 def resolve_ranker_params():
     cached_params, cached_source = load_best_params()
 
@@ -682,16 +737,13 @@ def main():
 
         training_run_row["run_status"] = "success"
         training_run_row["error_message"] = ""
-        append_training_run_log(training_run_row)
+        persist_training_run_log(training_run_row)
         print(f"🎉 [{datetime.datetime.now()}] 全ての処理が完了しました！ファイルはKaggleのOutputとして保存されました。")
         return 0
     except Exception as exc:
         training_run_row["run_status"] = "failed"
         training_run_row["error_message"] = str(exc)
-        try:
-            append_training_run_log(training_run_row)
-        except Exception as log_exc:
-            print(f"⚠️ training_run_log.csv の記録に失敗しました: {log_exc}")
+        persist_training_run_log(training_run_row)
         raise
 
 
