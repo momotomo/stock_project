@@ -18,6 +18,39 @@
 14. 保存時は `stock-ai-trainer.log` に `RUN_LOG_PERSIST_START` / `RUN_LOG_PERSIST_TARGET=...` / `RUN_LOG_PERSIST_DONE exists=True/False` が出る
 15. `/kaggle/working/run_log_written.txt` も作られるので、workflow ログの `kaggle-output/` 一覧と artifact で `training_run_log.csv` の有無を確認する
 
+Kaggle 学習成功条件:
+
+- `Push Kaggle kernel` が成功すること
+- `Poll Kaggle kernel status` が `COMPLETE` まで到達すること
+- `List downloaded Kaggle output files` に `training_run_log.csv` / `run_log_written.txt` / `stock-ai-trainer.log` が出ること
+- required artifact の `best_params.json`、モデル群、`stock-ai-trainer.log` が揃うこと
+
+当面の運用方針:
+
+- `training_run_log.csv` は当面 optional のまま維持する
+- missing でも即 fail にはしない
+- 毎回 `downloaded files` / artifact / `stock-ai-trainer.log` を見て有無を確認する
+- 3回連続成功、または 1 週間安定したら required 化を再検討する
+
+Kaggle 側前提:
+
+- GitHub Actions は `kaggle_ai_trainer.py` を `Script kernel` として push する
+- Kaggle 側の kernel も `Script kernel` 型である必要がある
+- `kernel_slug` の既定値は `stock-ai-trainer`
+
+editor type mismatch の対処:
+
+- エラー `You cannot change the editor type of a kernel` が出たら、既存 slug が Notebook 型で残っていないかを確認する
+- `stock-ai-trainer` とは別の slug を使うか、Kaggle 側で Script 型の kernel を作り直してから再実行する
+- `kernel_slug` の取り違え、過去の手動コピペ運用で残った Notebook 型 kernel の再利用を優先的に疑う
+
+今回の障害整理:
+
+- `training_run_log.csv` 不達は単一原因ではなく複合だった
+- `finally` 到達前に保存処理が漏れる経路があった
+- Kaggle 側の手動コピペ運用で GitHub 側コードと乖離していた
+- GitHub Actions 側では `editor type mismatch` で `Push Kaggle kernel` が失敗するケースがあった
+
 事前確認:
 
 - `python auto_trade.py --dry-run`
