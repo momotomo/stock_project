@@ -195,17 +195,15 @@ top_k = min(int(len(ALL_FEATURES) * 0.8), len(ALL_FEATURES))
 selected_features = importance.head(top_k).index.tolist()
 X_train_sel = X_train_scaled[selected_features]
 
-# 🔥 変更: Optunaの週1回化と永続化のロジック
-PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")  # Kaggle Datasetのマウント先
+# 🔥 変更: Optunaの週1回化と best_params.json の安全な運用
+PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")
 PARAMS_OUT = Path("best_params.json")
+PARAMS_LOCAL = Path("best_params.json")
+DEFAULT_TUNING_WEEKDAY = 5  # 5=土曜日
+DEFAULT_OPTUNA_TRIALS = 15
+FORCE_WEEKLY_TUNING = os.getenv("FORCE_WEEKLY_TUNING", "").strip().lower() in {"1", "true", "yes", "on"}
 
-def jst_now():
-    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
-
-def is_tuning_day():
-    return jst_now().weekday() == 5  # 5=土曜日
-
-DEFAULT_PARAMS = {
+FALLBACK_RANKER_PARAMS = {
     "n_estimators": 400,
     "learning_rate": 0.03,
     "max_depth": 4,
@@ -213,54 +211,150 @@ DEFAULT_PARAMS = {
     "random_state": 42,
     "verbose": -1,
 }
+REQUIRED_RANKER_PARAM_KEYS = {"n_estimators", "learning_rate", "max_depth", "num_leaves"}
+
+def jst_now():
+    return datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+
+def get_tuning_weekday():
+    try:
+        weekday = int(os.getenv("OPTUNA_TUNING_WEEKDAY", str(DEFAULT_TUNING_WEEKDAY)))
+    except ValueError:
+        weekday = DEFAULT_TUNING_WEEKDAY
+    return weekday if 0 <= weekday <= 6 else DEFAULT_TUNING_WEEKDAY
+
+def get_optuna_trials():
+    try:
+        trials = int(os.getenv("OPTUNA_N_TRIALS", str(DEFAULT_OPTUNA_TRIALS)))
+    except ValueError:
+        trials = DEFAULT_OPTUNA_TRIALS
+    return max(trials, 1)
+
+def is_tuning_day(current_time=None):
+    if FORCE_WEEKLY_TUNING:
+        return True
+    current_time = current_time or jst_now()
+    return current_time.weekday() == get_tuning_weekday()
+
+def normalize_ranker_params(params):
+    if not isinstance(params, dict):
+        return None
+    normalized = FALLBACK_RANKER_PARAMS.copy()
+    for key, value in params.items():
+        if value in (None, ""):
+            continue
+        normalized[key] = value
+    if any(normalized.get(key) in (None, "") for key in REQUIRED_RANKER_PARAM_KEYS):
+        return None
+    return normalized
+
+def iter_param_sources():
+    seen = set()
+    for path in (PARAMS_LOCAL, PARAMS_IN):
+        path_key = str(path)
+        if path_key in seen:
+            continue
+        seen.add(path_key)
+        yield path
 
 def load_best_params():
-    if PARAMS_IN.exists():
+    for path in iter_param_sources():
+        if not path.exists():
+            continue
         try:
-            return json.loads(PARAMS_IN.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"⚠️ パラメータ読み込みエラー: {e}")
-    return DEFAULT_PARAMS.copy()
+            params = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            print(f"⚠️ パラメータ読み込みエラー: path={path} error={exc}")
+            continue
+        normalized = normalize_ranker_params(params)
+        if normalized is None:
+            print(f"⚠️ パラメータ内容が不正または空です: path={path}")
+            continue
+        return normalized, str(path)
+    return None, ""
 
 def save_best_params(params: dict):
-    PARAMS_OUT.write_text(json.dumps(params, ensure_ascii=False, indent=2), encoding="utf-8")
+    normalized = normalize_ranker_params(params)
+    if normalized is None:
+        raise ValueError("best_params.json に保存できない不正な params です")
+    temp_path = Path(f"{PARAMS_OUT}.tmp")
+    temp_path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path.replace(PARAMS_OUT)
+    print(f"💾 best_params.json を更新しました: {PARAMS_OUT}")
 
-if is_tuning_day():
-    print("⚙️ 本日は土曜日: Optunaによるパラメータ最適化を実行中 (15 Trials)...")
+def run_weekly_optuna():
+    trial_count = get_optuna_trials()
+    print(
+        f"⚙️ 週次 Optuna を実行します: weekday={get_tuning_weekday()} "
+        f"trials={trial_count}"
+    )
+
     def objective(trial):
         params = {
-            'n_estimators': trial.suggest_int('n_estimators', 50, 200),
-            'max_depth': trial.suggest_int('max_depth', 3, 8),
-            'learning_rate': trial.suggest_float('learning_rate', 0.01, 0.1, log=True),
-            'num_leaves': trial.suggest_int('num_leaves', 10, 60),
-            'random_state': 42,
-            'verbose': -1
+            "n_estimators": trial.suggest_int("n_estimators", 50, 200),
+            "max_depth": trial.suggest_int("max_depth", 3, 8),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.1, log=True),
+            "num_leaves": trial.suggest_int("num_leaves", 10, 60),
+            "random_state": 42,
+            "verbose": -1,
         }
         dates = train_df.index.unique()
         split_idx = int(len(dates) * 0.8)
         mask_train = train_df.index < dates[split_idx]
         mask_val = train_df.index >= dates[split_idx]
-        
+
         X_t, y_t = X_train_sel[mask_train], y_train_rank[mask_train]
         g_t = train_df[mask_train].groupby(level=0).size().values
         X_v, y_v = X_train_sel[mask_val], y_train_rank[mask_val]
         g_v = train_df[mask_val].groupby(level=0).size().values
-        
-        if len(g_t) == 0 or len(g_v) == 0: return 0.0
-        model = lgb.LGBMRanker(**params)
-        model.fit(X_t, y_t, group=g_t, eval_set=[(X_v, y_v)], eval_group=[g_v], callbacks=[lgb.early_stopping(10, verbose=False)])
-        return model.best_score_['valid_0']['ndcg@1']
 
-    study = optuna.create_study(direction='maximize')
-    study.optimize(objective, n_trials=15)
-    best_params = study.best_params
-    best_params['random_state'] = 42
-    best_params['verbose'] = -1
-    save_best_params(best_params)
-else:
-    print("⚙️ 本日は平日: 保存されたパラメータ(またはデフォルト)を読み込みます...")
-    best_params = load_best_params()
-    save_best_params(best_params) # 平日もOutputに残すために保存
+        if len(g_t) == 0 or len(g_v) == 0:
+            return 0.0
+        model = lgb.LGBMRanker(**params)
+        model.fit(
+            X_t,
+            y_t,
+            group=g_t,
+            eval_set=[(X_v, y_v)],
+            eval_group=[g_v],
+            callbacks=[lgb.early_stopping(10, verbose=False)],
+        )
+        return model.best_score_["valid_0"]["ndcg@1"]
+
+    study = optuna.create_study(direction="maximize")
+    study.optimize(objective, n_trials=trial_count)
+    best_params = normalize_ranker_params(study.best_params)
+    if best_params is None:
+        raise ValueError("Optuna が不正または空の params を返しました")
+    return best_params
+
+def resolve_ranker_params():
+    cached_params, cached_source = load_best_params()
+
+    if is_tuning_day():
+        if FORCE_WEEKLY_TUNING:
+            print("⚙️ FORCE_WEEKLY_TUNING=1 のため、曜日に関係なく Optuna を実行します。")
+        else:
+            print("⚙️ 本日はチューニング曜日です。Optuna を実行します。")
+        try:
+            tuned_params = run_weekly_optuna()
+            save_best_params(tuned_params)
+            return tuned_params, "weekly_optuna", True
+        except Exception as exc:
+            print(f"⚠️ Optuna 実行に失敗しました。既存 params を優先し、best_params.json は更新しません: {exc}")
+            if cached_params is not None:
+                return cached_params, f"cached_after_optuna_failure:{cached_source}", False
+            return FALLBACK_RANKER_PARAMS.copy(), "fallback_after_optuna_failure", False
+
+    if cached_params is not None:
+        print(f"⚙️ 平日実行: Optuna をスキップし、既存 params を利用します: {cached_source}")
+        return cached_params, f"cached:{cached_source}", False
+
+    print("⚙️ 平日実行: best_params.json が無いため fallback params を利用します。")
+    return FALLBACK_RANKER_PARAMS.copy(), "fallback", False
+
+best_params, best_params_source, optuna_ran = resolve_ranker_params()
+print(f"🧭 Ranker params source={best_params_source} optuna_ran={optuna_ran}")
 
 # --- 3. 最終モデルの学習 (Ranker & ベースXGBoost & メタLightGBM & Regressor) ---
 print("🧠 最終モデル(Ranker)を学習中...")
