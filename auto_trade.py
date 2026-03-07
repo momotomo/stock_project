@@ -341,7 +341,12 @@ def _extract_local_trade_context(local_state: Any) -> dict:
     position_side = _normalize_order_side(_pick_first_value(state, ["position_side", "side", "Side"]))
     symbol = _safe_str(_pick_first_value(state, ["symbol", "Symbol", "ticker", "Ticker"]))
     hold_id = _safe_str(_pick_first_value(state, ["hold_id", "HoldID", "execution_id", "ExecutionID"]))
-    order_id = _safe_str(_pick_first_value(state, ["order_id", "OrderID", "OrderId"]))
+    order_id = _safe_str(
+        _pick_first_value(
+            state,
+            ["order_id", "OrderID", "OrderId", "exit_order_id", "entry_order_id"],
+        )
+    )
     qty = safe_int(
         _pick_first_value(state, ["qty", "Qty", "position_qty", "target_qty", "order_qty", "remaining_qty"]),
         0,
@@ -651,17 +656,29 @@ async def request_exit(api: "KabuAPI", position: Any, local_state: Any, reason: 
     exchange = position_context["exchange"]
     exit_side = "1" if position_context["exit_side"] == "SELL" else "2"
 
+    local_data["exit_attempt_no"] = next_attempt
+    local_data["last_exit_reason"] = reason
+    local_data["last_exit_attempt_at"] = requested_at
+    if hold_id:
+        local_data["hold_id"] = hold_id
+    if qty > 0:
+        local_data["known_position_qty"] = qty
+
     if not hasattr(api, "send_order"):
         response["error"] = "api.send_order is not available"
+        local_data["last_exit_error"] = response["error"]
         return response
     if not symbol:
         response["error"] = "missing symbol for exit request"
+        local_data["last_exit_error"] = response["error"]
         return response
     if qty <= 0:
         response["error"] = "missing qty for exit request"
+        local_data["last_exit_error"] = response["error"]
         return response
     if not hold_id:
         response["error"] = "missing hold_id for exit request"
+        local_data["last_exit_error"] = response["error"]
         return response
 
     try:
@@ -678,32 +695,136 @@ async def request_exit(api: "KabuAPI", position: Any, local_state: Any, reason: 
             result = await result
     except Exception as exc:
         response["error"] = str(exc)
+        local_data["last_exit_error"] = response["error"]
         logger.error(f"❌ 決済注文送信例外: {symbol} reason={reason} error={exc}")
         return response
 
     if not isinstance(result, dict) or result.get("Result") != 0:
         response["error"] = _safe_str(_pick_first_value(result or {}, ["Message", "ErrorMessage", "Code"])) or str(result)
+        local_data["last_exit_error"] = response["error"]
         logger.error(f"❌ 決済注文送信失敗: {symbol} reason={reason} result={result}")
         return response
 
     exit_order_id = _safe_str(_pick_first_value(result, ["OrderId", "OrderID", "ID"]))
     if not exit_order_id:
         response["error"] = "exit order accepted without order id"
+        local_data["last_exit_error"] = response["error"]
         logger.error(f"❌ 決済注文送信失敗: {symbol} reason={reason} result={result}")
         return response
 
-    local_data["hold_id"] = hold_id
     local_data["exit_order_id"] = exit_order_id
-    local_data["exit_attempt_no"] = next_attempt
     local_data["exit_requested_at"] = requested_at
     local_data["status"] = "EXIT_SENT"
-    local_data["known_position_qty"] = qty
+    local_data["last_exit_error"] = ""
 
     response["ok"] = True
     response["exit_order_id"] = exit_order_id
     response["error"] = ""
     logger.info(f"✅ 決済注文送信受付: {symbol} hold_id={hold_id} order_id={exit_order_id} reason={reason}")
     return response
+
+
+def _parse_state_timestamp(value: Any) -> Optional[datetime]:
+    text = _safe_str(value)
+    if not text:
+        return None
+
+    for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _resolve_exit_retry_limit(local_state: Any) -> int:
+    local_data = _coerce_state_dict(local_state)
+    retry_limit = safe_int(
+        _pick_first_value(local_data, ["exit_retry_limit", "max_exit_attempts", "exit_max_attempts"]),
+        3,
+    )
+    return max(retry_limit, 1)
+
+
+def confirm_exit(
+    local_state: Any,
+    orders_snapshot: Optional[Dict[str, dict]],
+    positions_snapshot: Optional[Dict[str, dict]],
+    ttl_sec: int = 30,
+) -> dict:
+    local_data = _coerce_state_dict(local_state)
+    reconciliation = reconcile_trade_state(local_state, orders_snapshot, positions_snapshot)
+    matched_position = reconciliation.get("matched_position") or {}
+    remaining_qty = safe_int(reconciliation.get("remaining_qty"), 0)
+    if remaining_qty <= 0 and matched_position:
+        remaining_qty = safe_int(
+            _pick_first_value(matched_position, ["leaves_qty", "qty"]),
+            0,
+        )
+
+    known_position_qty = safe_int(
+        _pick_first_value(local_data, ["known_position_qty", "qty", "position_qty"]),
+        0,
+    )
+    exit_attempt_no = safe_int(_pick_first_value(local_data, ["exit_attempt_no"]), 0)
+    retry_limit = _resolve_exit_retry_limit(local_state)
+    attempted_at = _parse_state_timestamp(
+        _pick_first_value(local_data, ["exit_requested_at", "last_exit_attempt_at"])
+    )
+    ttl_expired = False
+    if attempted_at is not None:
+        ttl_expired = (datetime.now() - attempted_at).total_seconds() > max(ttl_sec, 0)
+
+    if reconciliation.get("result") == "MATCHED_CLOSED":
+        return {
+            "result": "CLOSED",
+            "remaining_qty": 0,
+            "should_retry": False,
+            "reason": "positions snapshot no longer contains the hold_id",
+        }
+
+    if remaining_qty > 0 and known_position_qty > 0 and remaining_qty < known_position_qty:
+        return {
+            "result": "PARTIAL",
+            "remaining_qty": remaining_qty,
+            "should_retry": False,
+            "reason": "position remains but quantity decreased after exit request",
+        }
+
+    if reconciliation.get("result") == "EXIT_PARTIAL":
+        return {
+            "result": "PARTIAL",
+            "remaining_qty": remaining_qty,
+            "should_retry": False,
+            "reason": "exit order is partially filled",
+        }
+
+    if not ttl_expired:
+        return {
+            "result": "PENDING",
+            "remaining_qty": remaining_qty,
+            "should_retry": False,
+            "reason": "exit confirmation is waiting within ttl",
+        }
+
+    if exit_attempt_no < retry_limit:
+        return {
+            "result": "RETRY",
+            "remaining_qty": remaining_qty,
+            "should_retry": True,
+            "reason": "exit confirmation exceeded ttl and retry is still available",
+        }
+
+    return {
+        "result": "UNRESOLVED",
+        "remaining_qty": remaining_qty,
+        "should_retry": False,
+        "reason": "exit confirmation exceeded ttl and retry limit is exhausted",
+    }
 
 
 class Config:
