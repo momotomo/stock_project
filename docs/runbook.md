@@ -9,6 +9,8 @@
 5. ブレーカー傾向の確認が必要なら `python scripts/health_log_report.py --days 14`
 6. スリッページ基礎集計は `python scripts/slippage_report.py --env sim --days 14` または `--env prod`
 7. `slippage_summary.csv` / `slippage_by_time_bucket.csv` / `slippage_by_symbol.csv` で `slippage_bps` を確認
+8. `python scripts/cost_hat_gap_report.py --env sim --days 14` または `--env prod` で `cost_hat` の過大/過小を確認
+9. `cost_gap_bps = current_cost_hat_bps - actual_cost_bps` で、正は過大見積もり、負は過小見積もり
 
 事前確認:
 
