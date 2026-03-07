@@ -243,9 +243,26 @@ def prepare_training_dataset(tickers):
 
 # 🔥 変更: Optunaの週1回化と best_params.json の安全な運用
 PARAMS_IN = Path("/kaggle/input/stock-project-params/best_params.json")
-PARAMS_OUT = Path("best_params.json")
-PARAMS_LOCAL = Path("best_params.json")
-TRAINING_RUN_LOG_PATH = Path("training_run_log.csv")
+KAGGLE_OUTPUT_DIR = Path("/kaggle/working")
+
+
+def resolve_output_dir():
+    if os.getenv("KAGGLE_KERNEL_RUN_TYPE") and KAGGLE_OUTPUT_DIR.exists():
+        return KAGGLE_OUTPUT_DIR
+    return Path(".")
+
+
+OUTPUT_DIR = resolve_output_dir()
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+PARAMS_OUT = OUTPUT_DIR / "best_params.json"
+PARAMS_LOCAL = OUTPUT_DIR / "best_params.json"
+TRAINING_RUN_LOG_PATH = OUTPUT_DIR / "training_run_log.csv"
+RANKER_MODEL_PATH = OUTPUT_DIR / "ranker_model.pkl"
+CLASSIFIER_MODEL_PATH = OUTPUT_DIR / "classifier_model.pkl"
+META_MODEL_PATH = OUTPUT_DIR / "meta_model.pkl"
+REGRESSOR_MODEL_PATH = OUTPUT_DIR / "regressor_model.pkl"
+SCALER_PATH = OUTPUT_DIR / "scaler.pkl"
+SELECTED_FEATURES_PATH = OUTPUT_DIR / "selected_features.pkl"
 DEFAULT_TUNING_WEEKDAY = 5  # 5=土曜日
 DEFAULT_OPTUNA_TRIALS = 15
 FORCE_WEEKLY_TUNING = os.getenv("FORCE_WEEKLY_TUNING", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -565,6 +582,7 @@ def main():
     global TICKERS, train_df, X_train_sel, y_train_rank, y_train_class, group_train
 
     print(f"🚀 [{datetime.datetime.now()}] AI学習パイプライン(V2.1)を起動します...")
+    print(f"📦 成果物出力先: {OUTPUT_DIR.resolve()}")
     training_run_row = {field: "" for field in TRAINING_RUN_LOG_HEADER}
     training_run_row["run_at"] = jst_now().strftime("%Y-%m-%d %H:%M:%S")
     training_run_row["strategy_version"] = STRATEGY_VERSION
@@ -655,12 +673,12 @@ def main():
         regressor_model.fit(X_train_sel, y_train_reg)
 
         print("💾 モデルをファイルに保存中(Kaggle Output)...")
-        atomic_joblib_dump(ranker_model, 'ranker_model.pkl')
-        atomic_joblib_dump(xgb_model, 'classifier_model.pkl')
-        atomic_joblib_dump(meta_model, 'meta_model.pkl')
-        atomic_joblib_dump(regressor_model, 'regressor_model.pkl')
-        atomic_joblib_dump(scaler, 'scaler.pkl')
-        atomic_joblib_dump(selected_features, 'selected_features.pkl')
+        atomic_joblib_dump(ranker_model, RANKER_MODEL_PATH)
+        atomic_joblib_dump(xgb_model, CLASSIFIER_MODEL_PATH)
+        atomic_joblib_dump(meta_model, META_MODEL_PATH)
+        atomic_joblib_dump(regressor_model, REGRESSOR_MODEL_PATH)
+        atomic_joblib_dump(scaler, SCALER_PATH)
+        atomic_joblib_dump(selected_features, SELECTED_FEATURES_PATH)
 
         training_run_row["run_status"] = "success"
         training_run_row["error_message"] = ""
