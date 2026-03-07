@@ -69,6 +69,12 @@ INITIAL_EQUITY = 1_000_000
 PLACEHOLDER_PREFIXES = ("YOUR_",)
 PLACEHOLDER_VALUES = {"", "dummy", "changeme", "replace_me", "your_password"}
 HALT_FORCE_EXIT_UNRESOLVED = "HALT_FORCE_EXIT_UNRESOLVED"
+HALT_API_BOARD_FAILURE = "HALT_API_BOARD_FAILURE"
+HALT_API_ORDERS_FAILURE = "HALT_API_ORDERS_FAILURE"
+HALT_API_POSITIONS_FAILURE = "HALT_API_POSITIONS_FAILURE"
+HALT_API_ORDER_ID_MISSING = "HALT_API_ORDER_ID_MISSING"
+HALT_UNEXPECTED_POSITION = "HALT_UNEXPECTED_POSITION"
+API_FAILURE_HALT_THRESHOLD = 3
 
 
 def now_str() -> str:
@@ -101,6 +107,84 @@ def _pick_first_value(data: Optional[dict], keys: List[str]) -> Any:
 
 def _safe_str(value: Any) -> str:
     return str(value).strip() if value is not None else ""
+
+
+def _reset_failure_counter(trading_state: Any, counter_name: str) -> None:
+    if trading_state is None or not hasattr(trading_state, counter_name):
+        return
+    setattr(trading_state, counter_name, 0)
+
+
+def _increment_failure_counter(trading_state: Any, counter_name: str) -> int:
+    if trading_state is None or not hasattr(trading_state, counter_name):
+        return 0
+    next_count = safe_int(getattr(trading_state, counter_name), 0) + 1
+    setattr(trading_state, counter_name, next_count)
+    return next_count
+
+
+def _halt_trading(
+    trading_state: Any,
+    reason_code: str,
+    detail: str = "",
+    execution_logger: Any = None,
+    symbol: str = "",
+    side: str = "",
+    order_id: str = "",
+    order_sent_time: str = "",
+) -> bool:
+    if trading_state is None:
+        return False
+    if getattr(trading_state, "trading_halted", False) and _safe_str(getattr(trading_state, "halt_reason", "")):
+        return False
+
+    trading_state.trading_halted = True
+    trading_state.halt_reason = reason_code
+    logger.error(f"🛑 API/KillSwitch発動: {reason_code} detail={detail}")
+
+    if execution_logger is not None:
+        execution_logger.log_order_status(
+            {
+                "order_id": order_id,
+                "symbol": symbol,
+                "side": side,
+                "expected_ask": "",
+                "expected_bid": "",
+                "order_sent_time": order_sent_time,
+                "status": "HALT",
+                "reason": f"{reason_code}: {detail}" if detail else reason_code,
+            }
+        )
+
+    return True
+
+
+def _record_api_failure(
+    trading_state: Any,
+    counter_name: str,
+    reason_code: str,
+    detail: str,
+    execution_logger: Any = None,
+    symbol: str = "",
+    side: str = "",
+    order_id: str = "",
+    order_sent_time: str = "",
+    threshold: int = API_FAILURE_HALT_THRESHOLD,
+) -> int:
+    failure_count = _increment_failure_counter(trading_state, counter_name)
+    logger.warning(f"⚠️ API異常を検知: reason={reason_code} count={failure_count} detail={detail}")
+    if failure_count >= max(threshold, 1):
+        _halt_trading(
+            trading_state,
+            reason_code,
+            detail=detail,
+            execution_logger=execution_logger,
+            symbol=symbol,
+            side=side,
+            order_id=order_id,
+            order_sent_time=order_sent_time,
+        )
+    return failure_count
 
 
 def _normalize_order_side(value: Any) -> str:
@@ -649,6 +733,7 @@ async def request_exit(api: "KabuAPI", position: Any, local_state: Any, reason: 
         "requested_at": requested_at,
         "reason": reason,
         "error": "",
+        "error_code": "",
     }
 
     symbol = position_context["symbol"]
@@ -709,6 +794,7 @@ async def request_exit(api: "KabuAPI", position: Any, local_state: Any, reason: 
     exit_order_id = _safe_str(_pick_first_value(result, ["OrderId", "OrderID", "ID"]))
     if not exit_order_id:
         response["error"] = "exit order accepted without order id"
+        response["error_code"] = HALT_API_ORDER_ID_MISSING
         local_data["last_exit_error"] = response["error"]
         logger.error(f"❌ 決済注文送信失敗: {symbol} reason={reason} result={result}")
         return response
@@ -1084,16 +1170,39 @@ class KabuAPI:
 
 
 class MarketData:
-    def __init__(self, api: KabuAPI):
+    def __init__(
+        self,
+        api: KabuAPI,
+        trading_state: Optional["TradingState"] = None,
+        execution_logger: Any = None,
+        api_failure_threshold: int = API_FAILURE_HALT_THRESHOLD,
+    ):
         self.api = api
+        self.trading_state = trading_state
+        self.execution_logger = execution_logger
+        self.api_failure_threshold = api_failure_threshold
+
+    def _record_board_failure(self, symbol: str, detail: str) -> None:
+        _record_api_failure(
+            self.trading_state,
+            "board_failure_count",
+            HALT_API_BOARD_FAILURE,
+            detail=detail,
+            execution_logger=self.execution_logger,
+            symbol=symbol,
+            threshold=self.api_failure_threshold,
+        )
 
     async def safe_get_board(self, symbol: str, exchange: int) -> Optional[dict]:
         board = await self.api.get_board(symbol, exchange)
         if board is None:
+            self._record_board_failure(symbol, "board api returned no data")
             return None
         if not isinstance(board, dict):
+            self._record_board_failure(symbol, f"invalid board payload type={type(board).__name__}")
             logger.warning(f"⚠️ 板情報の形式が不正です: {symbol}")
             return None
+        _reset_failure_counter(self.trading_state, "board_failure_count")
         return board
 
     async def safe_get_price(self, symbol: str, exchange: int) -> Tuple[Optional[dict], Optional[float]]:
@@ -1242,6 +1351,9 @@ class TradingState:
     trading_halted: bool = False
     halt_reason: str = ""
     unresolved_exit_count: int = 0
+    board_failure_count: int = 0
+    orders_failure_count: int = 0
+    positions_failure_count: int = 0
 
 
 class PortfolioManager:
@@ -1271,6 +1383,36 @@ class PortfolioManager:
             for signal in signals
             if signal.get("symbol")
         }
+
+    def _record_orders_failure(self, detail: str) -> None:
+        _record_api_failure(
+            self.trading_state,
+            "orders_failure_count",
+            HALT_API_ORDERS_FAILURE,
+            detail=detail,
+            execution_logger=self.execution_logger,
+            threshold=API_FAILURE_HALT_THRESHOLD,
+        )
+
+    def _record_positions_failure(self, detail: str) -> None:
+        _record_api_failure(
+            self.trading_state,
+            "positions_failure_count",
+            HALT_API_POSITIONS_FAILURE,
+            detail=detail,
+            execution_logger=self.execution_logger,
+            threshold=API_FAILURE_HALT_THRESHOLD,
+        )
+
+    def _halt_unexpected_position(self, symbol: str, hold_id: str) -> None:
+        _halt_trading(
+            self.trading_state,
+            HALT_UNEXPECTED_POSITION,
+            detail=f"unexpected live position detected symbol={symbol} hold_id={hold_id}",
+            execution_logger=self.execution_logger,
+            symbol=symbol,
+            side="BUY",
+        )
 
     def register_pending(
         self,
@@ -1340,8 +1482,13 @@ class PortfolioManager:
         active_symbols = []
         active_details = []
         orders = await self.api.get_orders()
+        if orders is None:
+            self._record_orders_failure("orders api returned no data")
+            return active_count, active_symbols, active_details, []
         if not isinstance(orders, list):
+            self._record_orders_failure(f"invalid orders payload type={type(orders).__name__}")
             return active_count, active_symbols, active_details, orders or []
+        _reset_failure_counter(self.trading_state, "orders_failure_count")
 
         for order in orders:
             state = safe_int(order.get("State"), 0)
@@ -1375,10 +1522,13 @@ class PortfolioManager:
         product = 1 if self.config.TRADE_MODE == "CASH" else 2
         positions_data = await self.api.get_positions(product=product)
         if positions_data is None:
+            self._record_positions_failure("positions api returned no data")
             return
         if not isinstance(positions_data, list):
+            self._record_positions_failure(f"invalid positions payload type={type(positions_data).__name__}")
             logger.warning("⚠️ positions API の返却形式が不正です")
             return
+        _reset_failure_counter(self.trading_state, "positions_failure_count")
 
         current_hold_ids = {
             str(position.get("HoldID", position.get("ExecutionID", ""))): position
@@ -1446,6 +1596,7 @@ class PortfolioManager:
             found_positions = True
             if symbol not in self.positions:
                 self.add_position(symbol, qty, entry_price, exchange, hold_id)
+                pending = None
 
                 if hold_id and hold_id not in self.seen_exec_ids:
                     self.seen_exec_ids.add(hold_id)
@@ -1499,6 +1650,8 @@ class PortfolioManager:
                         f"🎉 注文の約定を確認しました！監視モードに移行します: "
                         f"{symbol} (建玉ID: {hold_id})"
                     )
+                    if pending is None:
+                        self._halt_unexpected_position(symbol, hold_id)
                 else:
                     logger.info(f"📥 既存ポジションを認識しました: {symbol} (建玉ID: {hold_id})")
             else:
@@ -1626,6 +1779,17 @@ class PortfolioManager:
         )
         if result and result.get("Result") == 0:
             order_id = str(result.get("OrderId", ""))
+            if not order_id:
+                _halt_trading(
+                    self.trading_state,
+                    HALT_API_ORDER_ID_MISSING,
+                    detail=f"close order accepted without order id symbol={position.symbol}",
+                    execution_logger=self.execution_logger,
+                    symbol=position.symbol,
+                    side="SELL",
+                    order_sent_time=now_str(),
+                )
+                return
             logger.info(f"✅ 決済注文受付成功: {position.symbol} (OrderID: {order_id})")
 
             if not self.config.IS_PRODUCTION and order_id.startswith("SIM_"):
@@ -1875,6 +2039,17 @@ class TradingEngine:
             result = await self.api.send_order(signal["symbol"], side="2", qty=qty, is_close=False)
             if result and result.get("Result") == 0:
                 order_id = str(result.get("OrderId", ""))
+                if not order_id:
+                    _halt_trading(
+                        self.portfolio.trading_state,
+                        HALT_API_ORDER_ID_MISSING,
+                        detail=f"entry order accepted without order id symbol={signal['symbol']}",
+                        execution_logger=self.portfolio.execution_logger,
+                        symbol=signal["symbol"],
+                        side="BUY",
+                        order_sent_time=order_sent_time,
+                    )
+                    break
                 logger.info(f"✅ エントリー注文送信成功 order_id={order_id}")
 
                 if not self.config.IS_PRODUCTION and order_id.startswith("SIM_"):
@@ -1949,6 +2124,17 @@ class TradingEngine:
                     side="SELL",
                 )
             return result
+
+        if result.get("error_code") == HALT_API_ORDER_ID_MISSING:
+            _halt_trading(
+                self.portfolio.trading_state,
+                HALT_API_ORDER_ID_MISSING,
+                detail=f"exit order accepted without order id symbol={symbol}",
+                execution_logger=self.portfolio.execution_logger,
+                symbol=symbol,
+                side="SELL",
+                order_sent_time=result.get("requested_at", ""),
+            )
 
         logger.error(
             f"❌ 強制決済注文の送信に失敗: {symbol} "
@@ -2138,8 +2324,8 @@ async def main() -> None:
 def build_components(config: Config):
     trading_state = TradingState()
     api = KabuAPI(config)
-    market_data = MarketData(api)
     execution_logger = ExecutionLogger(is_sim=not config.IS_PRODUCTION)
+    market_data = MarketData(api, trading_state=trading_state, execution_logger=execution_logger)
     portfolio = PortfolioManager(
         config=config,
         api=api,
