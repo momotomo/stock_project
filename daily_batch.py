@@ -55,6 +55,37 @@ HEALTH_LOG_COLUMNS = [
     "note",
 ]
 
+BREAKER_EVENT_LOG_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "side_candidate",
+    "intended_qty",
+    "breaker_name",
+    "breaker_reason",
+    "market_phase",
+    "price_reference",
+    "volatility_reference",
+    "spread_reference",
+    "action_taken",
+]
+
+SIMULATED_ORDER_LOG_COLUMNS = [
+    "timestamp",
+    "symbol",
+    "side",
+    "qty",
+    "order_type",
+    "intended_price",
+    "signal_score",
+    "model_decision",
+    "blocked_by_breaker",
+    "blocker_reason",
+    "would_open_or_close",
+]
+
+BREAKER_EVENT_LOG_PATH = "breaker_event_log.csv"
+SIMULATED_ORDER_LOG_PATH = "simulated_order_log.csv"
+
 
 def cost_hat_roundtrip(atr_prev_ratio: float) -> float:
     return (BASE_FEE * 2.0) + (atr_prev_ratio * SLIPPAGE_FACTOR * 2.0) + TIME_LAG_PENALTY
@@ -77,6 +108,41 @@ def append_note(current: str, extra: str) -> str:
     if not current:
         return extra
     return f"{current}; {extra}"
+
+
+def normalize_observation_row(row: Dict[str, object], columns) -> Dict[str, object]:
+    return {column: row.get(column, "") for column in columns}
+
+
+def ensure_observation_log_schema(path: str, columns) -> None:
+    ensure_parent_dir(path)
+    if not os.path.exists(path) or os.path.getsize(path) == 0:
+        with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+            writer = csv.DictWriter(handle, fieldnames=columns)
+            writer.writeheader()
+        return
+
+    with open(path, "r", newline="", encoding="utf-8-sig") as handle:
+        reader = csv.DictReader(handle)
+        fieldnames = reader.fieldnames or []
+        if fieldnames == list(columns):
+            return
+        existing_rows = [normalize_observation_row(row, columns) for row in reader]
+
+    with open(path, "w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(existing_rows)
+
+
+def append_observation_rows(path: str, columns, rows) -> None:
+    if not rows:
+        return
+    ensure_observation_log_schema(path, columns)
+    with open(path, "a", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=columns)
+        for row in rows:
+            writer.writerow(normalize_observation_row(row, columns))
 
 
 def write_health_log(path: str, row: Dict[str, object]) -> None:
@@ -337,6 +403,89 @@ def check_market_breaker(config: BatchConfig) -> MarketBreakerResult:
         return result
 
 
+def build_breaker_observation_rows(
+    breaker_result: MarketBreakerResult,
+    blocked_candidates: Optional[pd.DataFrame],
+) -> tuple[list[Dict[str, object]], list[Dict[str, object]]]:
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    breaker_name = "market_breaker"
+    event_rows = []
+    simulated_rows = []
+
+    if blocked_candidates is None or blocked_candidates.empty:
+        event_rows.append(
+            {
+                "timestamp": timestamp,
+                "symbol": "",
+                "side_candidate": "",
+                "intended_qty": "",
+                "breaker_name": breaker_name,
+                "breaker_reason": breaker_result.reason,
+                "market_phase": "pre_market_batch",
+                "price_reference": breaker_result.close if breaker_result.close is not None else "",
+                "volatility_reference": breaker_result.ret1 if breaker_result.ret1 is not None else "",
+                "spread_reference": "",
+                "action_taken": "halt",
+            }
+        )
+        return event_rows, simulated_rows
+
+    for _, row in blocked_candidates.iterrows():
+        symbol = str(row.get("TickerCode", ""))
+        price_reference = float(row.get("Close", 0.0)) if pd.notna(row.get("Close")) else ""
+        volatility_reference = (
+            float(row.get("ATR_Prev_Ratio", 0.0)) if pd.notna(row.get("ATR_Prev_Ratio")) else ""
+        )
+        signal_score = float(row.get("Net_Score", 0.0) * 100.0) if pd.notna(row.get("Net_Score")) else ""
+
+        event_rows.append(
+            {
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "side_candidate": "BUY",
+                "intended_qty": "",
+                "breaker_name": breaker_name,
+                "breaker_reason": breaker_result.reason,
+                "market_phase": "pre_market_batch",
+                "price_reference": price_reference,
+                "volatility_reference": volatility_reference,
+                "spread_reference": "",
+                "action_taken": "skip_entry",
+            }
+        )
+
+        simulated_rows.append(
+            {
+                "timestamp": timestamp,
+                "symbol": symbol,
+                "side": "BUY",
+                "qty": "",
+                "order_type": "MARKET",
+                "intended_price": price_reference,
+                "signal_score": signal_score,
+                "model_decision": "recommendation_candidate",
+                "blocked_by_breaker": True,
+                "blocker_reason": breaker_result.reason,
+                "would_open_or_close": "open",
+            }
+        )
+
+    return event_rows, simulated_rows
+
+
+def record_breaker_observations(
+    breaker_result: MarketBreakerResult,
+    blocked_candidates: Optional[pd.DataFrame],
+) -> None:
+    event_rows, simulated_rows = build_breaker_observation_rows(breaker_result, blocked_candidates)
+    append_observation_rows(BREAKER_EVENT_LOG_PATH, BREAKER_EVENT_LOG_COLUMNS, event_rows)
+    logger.info(f"BREAKER_EVENT_LOGGED count={len(event_rows)} path={BREAKER_EVENT_LOG_PATH}")
+
+    if simulated_rows:
+        append_observation_rows(SIMULATED_ORDER_LOG_PATH, SIMULATED_ORDER_LOG_COLUMNS, simulated_rows)
+        logger.info(f"SIMULATED_ORDER_LOGGED count={len(simulated_rows)} path={SIMULATED_ORDER_LOG_PATH}")
+
+
 def build_health_row(breaker_result: MarketBreakerResult) -> Dict[str, object]:
     return {
         "run_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -363,14 +512,9 @@ def main() -> int:
     config = BatchConfig.load()
     breaker_result = check_market_breaker(config)
     health_row = build_health_row(breaker_result)
+    breaker_active = breaker_result.breaker
 
     try:
-        if breaker_result.breaker:
-            logger.warning("🛑 ブレーカー発動：recommendations.csv を空で出力します")
-            write_empty_recommendations(config.RECO_CSV_PATH)
-            health_row["note"] = append_note(str(health_row.get("note", "")), "recommendations cleared by breaker")
-            return 0
-
         try:
             ranker_model = joblib.load("models/ranker_model.pkl")
             classifier_model = joblib.load("models/classifier_model.pkl")
@@ -474,12 +618,28 @@ def main() -> int:
         latest = latest[latest["Net_Score"] > 0].copy()
 
         if latest.empty:
+            if breaker_active:
+                record_breaker_observations(breaker_result, blocked_candidates=None)
+                logger.warning("🛑 ブレーカー発動：recommendations.csv を空で出力します")
+                write_empty_recommendations(config.RECO_CSV_PATH)
+                health_row["note"] = append_note(str(health_row.get("note", "")), "breaker observation only")
+                health_row["note"] = append_note(str(health_row.get("note", "")), "recommendations cleared by breaker")
+                return 0
             logger.info("😴 本日は Net_Score>0 の銘柄がありませんでした")
             write_empty_recommendations(config.RECO_CSV_PATH)
             health_row["note"] = append_note(str(health_row.get("note", "")), "no_recommendations")
             return 0
 
         latest = latest.sort_values("Net_Score", ascending=False)
+
+        if breaker_active:
+            blocked_count = len(latest)
+            record_breaker_observations(breaker_result, blocked_candidates=latest)
+            logger.warning("🛑 ブレーカー発動：recommendations.csv を空で出力します")
+            write_empty_recommendations(config.RECO_CSV_PATH)
+            health_row["note"] = append_note(str(health_row.get("note", "")), f"breaker_blocked_candidates={blocked_count}")
+            health_row["note"] = append_note(str(health_row.get("note", "")), "recommendations cleared by breaker")
+            return 0
 
         results = []
         for index, (_, row) in enumerate(latest.iterrows()):
