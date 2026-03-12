@@ -1,9 +1,11 @@
 import argparse
 import csv
 import os
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
 try:
@@ -13,8 +15,14 @@ except ModuleNotFoundError:
     go = None
     make_subplots = None
 
-HEALTH_LOG_PATH_DEFAULT = "daily_health_log.csv"
-OUT_DIR_DEFAULT = "logs"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from runtime_paths import DAILY_HEALTH_LOG_PATH, REPORTS_OUTPUT_DIR
+
+HEALTH_LOG_PATH_DEFAULT = DAILY_HEALTH_LOG_PATH
+OUT_DIR_DEFAULT = REPORTS_OUTPUT_DIR
 NEW_FORMAT_COLUMNS = [
     "breaker_enabled",
     "ret_threshold",

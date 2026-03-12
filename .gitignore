@@ -3,3 +3,14 @@
 models/
 __pycache__/
 settings.local.yml
+runtime/
+logs/
+daily_health_log.csv
+order_status_log.csv
+order_status_log_SIM.csv
+prediction_history.csv
+recommendations.csv
+trade_execution_log.csv
+trade_execution_log_SIM.csv
+breaker_event_log.csv
+simulated_order_log.csv

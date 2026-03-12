@@ -18,7 +18,8 @@
 補足:
 
 - `settings.yml` は Git 管理用テンプレートで、ローカル上書きは `settings.local.yml` が優先されます。
-- `daily_batch.py` はブレーカー停止でも `daily_health_log.csv` を更新します。
-- 約定/注文状態ログは SIM/PROD で分離されます。
+- `daily_batch.py` はブレーカー停止でも `runtime/health/daily_health_log.csv` を更新します。
+- runtime 生成物は `runtime/health` / `runtime/orders` / `runtime/signals` / `runtime/logs` に出力されます。
+- 約定/注文状態ログは `runtime/orders/` 配下で SIM/PROD を分離します。
 
 詳細は [docs/architecture.md](/Users/kasuyatomohiro/stock_project/docs/architecture.md)、[docs/runbook.md](/Users/kasuyatomohiro/stock_project/docs/runbook.md)、[agents.md](/Users/kasuyatomohiro/stock_project/agents.md) を参照してください。
