@@ -15,14 +15,23 @@ try:
 except ModuleNotFoundError:
     aiohttp = None
 
+from runtime_paths import (
+    ORDER_STATUS_LOG_PATH as RUNTIME_ORDER_STATUS_LOG_PATH,
+    ORDER_STATUS_LOG_SIM_PATH as RUNTIME_ORDER_STATUS_LOG_SIM_PATH,
+    RECOMMENDATIONS_PATH,
+    TRADE_EXECUTION_LOG_PATH as RUNTIME_TRADE_EXECUTION_LOG_PATH,
+    TRADE_EXECUTION_LOG_SIM_PATH as RUNTIME_TRADE_EXECUTION_LOG_SIM_PATH,
+    build_auto_trade_log_path,
+    ensure_runtime_dirs,
+)
 from settings_loader import as_bool, as_float, as_int, load_settings, resolve_api_password
 
 # =========================================================
 # kabuステーション 自動取引エンジン (V2.1 完全突合・品質向上版)
 # =========================================================
 
-os.makedirs("logs", exist_ok=True)
-log_filename = f"logs/auto_trade_{datetime.now().strftime('%Y%m%d')}.log"
+ensure_runtime_dirs()
+log_filename = build_auto_trade_log_path()
 
 logging.basicConfig(
     level=logging.INFO,
@@ -69,10 +78,10 @@ ORDER_STATUS_HEADER = [
     "reason",
 ]
 
-EXEC_LOG_PATH = "trade_execution_log.csv"
-EXEC_LOG_PATH_SIM = "trade_execution_log_SIM.csv"
-ORDER_STATUS_LOG_PATH = "order_status_log.csv"
-ORDER_STATUS_LOG_PATH_SIM = "order_status_log_SIM.csv"
+EXEC_LOG_PATH = RUNTIME_TRADE_EXECUTION_LOG_PATH
+EXEC_LOG_PATH_SIM = RUNTIME_TRADE_EXECUTION_LOG_SIM_PATH
+ORDER_STATUS_LOG_PATH = RUNTIME_ORDER_STATUS_LOG_PATH
+ORDER_STATUS_LOG_PATH_SIM = RUNTIME_ORDER_STATUS_LOG_SIM_PATH
 INITIAL_EQUITY = 1_000_000
 PLACEHOLDER_PREFIXES = ("YOUR_",)
 PLACEHOLDER_VALUES = {"", "dummy", "changeme", "replace_me", "your_password"}
@@ -1024,7 +1033,7 @@ class Config:
         "STOP_LOSS_PCT": 0.05,
         "ATR_K1": 2.0,
         "ATR_K2": 3.0,
-        "RECO_CSV_PATH": "recommendations.csv",
+        "RECO_CSV_PATH": RECOMMENDATIONS_PATH,
     }
 
     def __init__(self):

@@ -1,15 +1,26 @@
 import argparse
 import csv
 import os
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 from statistics import median
 from typing import Dict, Iterable, List, Optional, Tuple
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
-OUT_DIR_DEFAULT = "logs"
-TRADE_LOG_PROD = "trade_execution_log.csv"
-TRADE_LOG_SIM = "trade_execution_log_SIM.csv"
+from runtime_paths import (
+    REPORTS_OUTPUT_DIR,
+    TRADE_EXECUTION_LOG_PATH,
+    TRADE_EXECUTION_LOG_SIM_PATH,
+)
+
+OUT_DIR_DEFAULT = REPORTS_OUTPUT_DIR
+TRADE_LOG_PROD = TRADE_EXECUTION_LOG_PATH
+TRADE_LOG_SIM = TRADE_EXECUTION_LOG_SIM_PATH
 SUMMARY_PATH = "cost_hat_gap_summary.csv"
 SUMMARY_TEXT_PATH = "cost_hat_gap_summary.txt"
 BY_TIME_BUCKET_PATH = "cost_hat_gap_by_time_bucket.csv"

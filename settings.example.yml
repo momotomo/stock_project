@@ -23,5 +23,5 @@ BREAKER_ENABLED: true
 BREAKER_TICKER: "1306.T"
 BREAKER_RET_THRESHOLD: -0.015
 BREAKER_MA_DAYS: 5
-HEALTH_LOG_PATH: "daily_health_log.csv"
-RECO_CSV_PATH: "recommendations.csv"
+HEALTH_LOG_PATH: "runtime/health/daily_health_log.csv"
+RECO_CSV_PATH: "runtime/signals/recommendations.csv"

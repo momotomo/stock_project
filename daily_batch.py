@@ -12,6 +12,14 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 
+from runtime_paths import (
+    BREAKER_EVENT_LOG_PATH as DEFAULT_BREAKER_EVENT_LOG_PATH,
+    DAILY_HEALTH_LOG_PATH,
+    PREDICTION_HISTORY_PATH,
+    RECOMMENDATIONS_PATH,
+    SIMULATED_ORDER_LOG_PATH as DEFAULT_SIMULATED_ORDER_LOG_PATH,
+    ensure_runtime_dirs,
+)
 from settings_loader import as_bool, as_float, as_int, load_settings
 
 # =========================================================
@@ -22,6 +30,7 @@ warnings.simplefilter("ignore", ResourceWarning)
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+ensure_runtime_dirs()
 
 BASE_FEE = 0.001
 SLIPPAGE_FACTOR = 0.05
@@ -90,8 +99,8 @@ SIMULATED_ORDER_LOG_COLUMNS = [
     "would_open_or_close",
 ]
 
-BREAKER_EVENT_LOG_PATH = "breaker_event_log.csv"
-SIMULATED_ORDER_LOG_PATH = "simulated_order_log.csv"
+BREAKER_EVENT_LOG_PATH = DEFAULT_BREAKER_EVENT_LOG_PATH
+SIMULATED_ORDER_LOG_PATH = DEFAULT_SIMULATED_ORDER_LOG_PATH
 
 
 def cost_hat_roundtrip(atr_prev_ratio: float) -> float:
@@ -325,8 +334,8 @@ class BatchConfig:
             "BREAKER_TICKER": "1306.T",
             "BREAKER_RET_THRESHOLD": -0.015,
             "BREAKER_MA_DAYS": 5,
-            "HEALTH_LOG_PATH": "daily_health_log.csv",
-            "RECO_CSV_PATH": "recommendations.csv",
+            "HEALTH_LOG_PATH": DAILY_HEALTH_LOG_PATH,
+            "RECO_CSV_PATH": RECOMMENDATIONS_PATH,
         }
         config_data = load_settings(defaults, logger=logger)
         return cls(
@@ -766,10 +775,11 @@ def main() -> int:
         logger.info("✅ V2.1 recommendations.csv を更新しました（Net_Score採用）")
         health_row["note"] = append_note(str(health_row.get("note", "")), f"recommendations={len(df_res)}")
 
-        history_file = "prediction_history.csv"
+        history_file = PREDICTION_HISTORY_PATH
         df_hist = df_res.copy()
         df_hist.insert(0, "Date", latest_date.strftime("%Y-%m-%d"))
 
+        ensure_parent_dir(history_file)
         if os.path.exists(history_file):
             df_hist.to_csv(history_file, mode="a", header=False, index=False, encoding="utf-8-sig")
         else:

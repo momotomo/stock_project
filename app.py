@@ -10,6 +10,8 @@ import time
 from datetime import datetime, timedelta
 import warnings
 
+from runtime_paths import PREDICTION_HISTORY_PATH, RECOMMENDATIONS_PATH
+
 # =========================================================
 # AI株価スクリーニング ダッシュボード (V2.1 実運用対応版)
 # =========================================================
@@ -215,8 +217,8 @@ def main():
 
     with tab1:
         st.header("✨ 本日のスコアランキング (Net Score順)")
-        if os.path.exists("recommendations.csv"):
-            df_recom = pd.read_csv("recommendations.csv")
+        if os.path.exists(RECOMMENDATIONS_PATH):
+            df_recom = pd.read_csv(RECOMMENDATIONS_PATH)
             if not df_recom.empty:
                 st.dataframe(df_recom, use_container_width=True)
             else:
@@ -226,8 +228,8 @@ def main():
 
     with tab2:
         st.header("📈 過去の予測スコア推移")
-        if os.path.exists("prediction_history.csv"):
-            df_hist = pd.read_csv("prediction_history.csv")
+        if os.path.exists(PREDICTION_HISTORY_PATH):
+            df_hist = pd.read_csv(PREDICTION_HISTORY_PATH)
             df_hist['Date'] = pd.to_datetime(df_hist['Date'])
             
             stocks = df_hist['銘柄名'].unique()

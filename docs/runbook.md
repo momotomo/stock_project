@@ -3,7 +3,7 @@
 日次手順:
 
 1. `python daily_batch.py`
-2. `recommendations.csv` と `daily_health_log.csv` を確認
+2. `runtime/signals/recommendations.csv` と `runtime/health/daily_health_log.csv` を確認
 3. `python auto_trade.py`
 4. 取引終了後に `python scripts/ops_kpi_report.py --env sim --days 7` または `--env prod` を実行
 5. ブレーカー傾向の確認が必要なら `python scripts/health_log_report.py --days 14`
@@ -61,7 +61,7 @@ editor type mismatch の対処:
 - `python -m unittest discover -s tests -p "test_*.py" -v`
 - board / orders / positions failure、`HALT_FORCE_EXIT_UNRESOLVED`、`HALT_API_ORDER_ID_MISSING` などの安全性テストを再実行できる
 
-`daily_health_log.csv` の主要列:
+`runtime/health/daily_health_log.csv` の主要列:
 
 - `breaker_enabled`: 設定値の `BREAKER_ENABLED`
 - `ret_threshold`: 設定値の `BREAKER_RET_THRESHOLD`
@@ -72,13 +72,13 @@ editor type mismatch の対処:
 `health_log_report.py`:
 
 - `python scripts/health_log_report.py --days 14`
-- `python scripts/health_log_report.py --input daily_health_log.csv --out-dir logs`
+- `python scripts/health_log_report.py --input runtime/health/daily_health_log.csv --out-dir runtime/logs`
 - 標準出力では対象期間、`breaker_true_rate`、`reason` 内訳、`cond_close_lt_ma_true_count`、`cond_ret_lt_threshold_true_count` を確認
-- `logs/health_summary.csv`
-- `logs/health_reason_counts.csv`
-- `logs/health_daily.csv`
-- `logs/health_summary.txt`
-- `logs/health_reason_counts.html` / `logs/health_daily.html` は Plotly が使える環境で出力される
+- `runtime/logs/health_summary.csv`
+- `runtime/logs/health_reason_counts.csv`
+- `runtime/logs/health_daily.csv`
+- `runtime/logs/health_summary.txt`
+- `runtime/logs/health_reason_counts.html` / `runtime/logs/health_daily.html` は Plotly が使える環境で出力される
 
 見方:
 
@@ -98,12 +98,12 @@ editor type mismatch の対処:
 日次確認項目:
 
 - `order_status_log*.csv` に `TIMEOUT` や `CANCELED/REJECTED` が増えていないか
-- `daily_health_log.csv` に当日 1 行追記されているか
-- ブレーカー発動日は `recommendations.csv` が空であること
-- ブレーカー発動日は `breaker_event_log.csv` と `simulated_order_log.csv` を確認し、停止そのものを観測対象として扱う
-- `simulated_order_log.csv` は実注文ログではなく、ブレーカーが無ければ候補になっていた entry 観測ログとして扱う
-- `simulated_order_log.csv` が出ない日は `breaker_event_log.csv` と `daily_health_log.csv` の `candidate_count` / `blocked_candidate_count` / `halt_stage` で理由を切り分ける
-- `trade_execution_log*.csv` には `entry_or_exit` / `expected_side_price` / `slippage_pct` / `slippage_bps` / `time_bucket` / `is_force_exit` / `price_level` が追加されている
+- `runtime/health/daily_health_log.csv` に当日 1 行追記されているか
+- ブレーカー発動日は `runtime/signals/recommendations.csv` が空であること
+- ブレーカー発動日は `runtime/signals/breaker_event_log.csv` と `runtime/signals/simulated_order_log.csv` を確認し、停止そのものを観測対象として扱う
+- `runtime/signals/simulated_order_log.csv` は実注文ログではなく、ブレーカーが無ければ候補になっていた entry 観測ログとして扱う
+- `runtime/signals/simulated_order_log.csv` が出ない日は `runtime/signals/breaker_event_log.csv` と `runtime/health/daily_health_log.csv` の `candidate_count` / `blocked_candidate_count` / `halt_stage` で理由を切り分ける
+- `runtime/orders/trade_execution_log*.csv` には `entry_or_exit` / `expected_side_price` / `slippage_pct` / `slippage_bps` / `time_bucket` / `is_force_exit` / `price_level` が追加されている
 - `slippage_pct` は不利方向を正で統一し、BUY は `(actual_price-expected_ask)/expected_ask`、SELL は `(expected_bid-actual_price)/expected_bid`、`slippage_bps = slippage_pct * 10000`
 
 マージ後チェックリスト:
@@ -128,22 +128,22 @@ dry-run:
 
 daily_batch:
 - `python daily_batch.py` が成功する
-- ブレーカー停止日でも `daily_health_log.csv` が 1 行増える
-- `recommendations.csv` の出力が壊れていない
-- `daily_health_log.csv` の `reason` / `cond_*` / `ret_threshold` が埋まっている
-- ブレーカー発動時は `breaker_event_log.csv` に `breaker_reason` / `action_taken` が追記される
-- `breaker_event_log.csv` の summary 行でも `candidate_count` / `blocked_candidate_count` / `halt_stage` で停止段階を追える
-- 注文候補があった日は `simulated_order_log.csv` に `blocked_by_breaker=True` / `would_open_or_close=open` が追記される
-- `daily_health_log.csv` では `raw_candidate_count` / `post_filter_candidate_count` / `blocked_candidate_count` / `halt_stage` を見る
+- ブレーカー停止日でも `runtime/health/daily_health_log.csv` が 1 行増える
+- `runtime/signals/recommendations.csv` の出力が壊れていない
+- `runtime/health/daily_health_log.csv` の `reason` / `cond_*` / `ret_threshold` が埋まっている
+- ブレーカー発動時は `runtime/signals/breaker_event_log.csv` に `breaker_reason` / `action_taken` が追記される
+- `runtime/signals/breaker_event_log.csv` の summary 行でも `candidate_count` / `blocked_candidate_count` / `halt_stage` で停止段階を追える
+- 注文候補があった日は `runtime/signals/simulated_order_log.csv` に `blocked_by_breaker=True` / `would_open_or_close=open` が追記される
+- `runtime/health/daily_health_log.csv` では `raw_candidate_count` / `post_filter_candidate_count` / `blocked_candidate_count` / `halt_stage` を見る
 
 KPI:
 - `python scripts/ops_kpi_report.py --env sim --days 7` が成功する
-- `logs/` に CSV/HTML が出る
+- `runtime/logs/` に CSV/HTML が出る
 - 空ログでも落ちない
 
 auto_trade（SIM）:
 - kabuステ環境で `IS_PRODUCTION: false` で起動できる
-- `trade_execution_log_SIM.csv` / `order_status_log_SIM.csv` にのみ出力される
+- `runtime/orders/trade_execution_log_SIM.csv` / `runtime/orders/order_status_log_SIM.csv` にのみ出力される
 - 本番ログに混ざらない
 
 本番前の最終確認:
