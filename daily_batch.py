@@ -53,6 +53,10 @@ HEALTH_LOG_COLUMNS = [
     "topix_ma",
     "topix_ret1",
     "note",
+    "raw_candidate_count",
+    "post_filter_candidate_count",
+    "blocked_candidate_count",
+    "halt_stage",
 ]
 
 BREAKER_EVENT_LOG_COLUMNS = [
@@ -67,6 +71,9 @@ BREAKER_EVENT_LOG_COLUMNS = [
     "volatility_reference",
     "spread_reference",
     "action_taken",
+    "candidate_count",
+    "blocked_candidate_count",
+    "halt_stage",
 ]
 
 SIMULATED_ORDER_LOG_COLUMNS = [
@@ -156,6 +163,19 @@ def write_health_log(path: str, row: Dict[str, object]) -> None:
 
 def normalize_health_log_row(row: Dict[str, object]) -> Dict[str, object]:
     return {column: row.get(column, "") for column in HEALTH_LOG_COLUMNS}
+
+
+def set_health_candidate_observation(
+    health_row: Dict[str, object],
+    raw_candidate_count: int,
+    post_filter_candidate_count: int,
+    blocked_candidate_count: int,
+    halt_stage: str,
+) -> None:
+    health_row["raw_candidate_count"] = raw_candidate_count
+    health_row["post_filter_candidate_count"] = post_filter_candidate_count
+    health_row["blocked_candidate_count"] = blocked_candidate_count
+    health_row["halt_stage"] = halt_stage
 
 
 def ensure_health_log_schema(path: str) -> None:
@@ -406,6 +426,9 @@ def check_market_breaker(config: BatchConfig) -> MarketBreakerResult:
 def build_breaker_observation_rows(
     breaker_result: MarketBreakerResult,
     blocked_candidates: Optional[pd.DataFrame],
+    candidate_count: int,
+    blocked_candidate_count: int,
+    halt_stage: str,
 ) -> tuple[list[Dict[str, object]], list[Dict[str, object]]]:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     breaker_name = "market_breaker"
@@ -426,6 +449,9 @@ def build_breaker_observation_rows(
                 "volatility_reference": breaker_result.ret1 if breaker_result.ret1 is not None else "",
                 "spread_reference": "",
                 "action_taken": "halt",
+                "candidate_count": candidate_count,
+                "blocked_candidate_count": blocked_candidate_count,
+                "halt_stage": halt_stage,
             }
         )
         return event_rows, simulated_rows
@@ -451,6 +477,9 @@ def build_breaker_observation_rows(
                 "volatility_reference": volatility_reference,
                 "spread_reference": "",
                 "action_taken": "skip_entry",
+                "candidate_count": candidate_count,
+                "blocked_candidate_count": blocked_candidate_count,
+                "halt_stage": halt_stage,
             }
         )
 
@@ -476,8 +505,17 @@ def build_breaker_observation_rows(
 def record_breaker_observations(
     breaker_result: MarketBreakerResult,
     blocked_candidates: Optional[pd.DataFrame],
+    candidate_count: int,
+    blocked_candidate_count: int,
+    halt_stage: str,
 ) -> None:
-    event_rows, simulated_rows = build_breaker_observation_rows(breaker_result, blocked_candidates)
+    event_rows, simulated_rows = build_breaker_observation_rows(
+        breaker_result,
+        blocked_candidates,
+        candidate_count=candidate_count,
+        blocked_candidate_count=blocked_candidate_count,
+        halt_stage=halt_stage,
+    )
     append_observation_rows(BREAKER_EVENT_LOG_PATH, BREAKER_EVENT_LOG_COLUMNS, event_rows)
     logger.info(f"BREAKER_EVENT_LOGGED count={len(event_rows)} path={BREAKER_EVENT_LOG_PATH}")
 
@@ -501,6 +539,10 @@ def build_health_row(breaker_result: MarketBreakerResult) -> Dict[str, object]:
         "topix_ma": breaker_result.ma if breaker_result.ma is not None else "",
         "topix_ret1": breaker_result.ret1 if breaker_result.ret1 is not None else "",
         "note": breaker_result.note,
+        "raw_candidate_count": 0,
+        "post_filter_candidate_count": 0,
+        "blocked_candidate_count": 0,
+        "halt_stage": "before_candidate_generation",
     }
 
 
@@ -513,6 +555,10 @@ def main() -> int:
     breaker_result = check_market_breaker(config)
     health_row = build_health_row(breaker_result)
     breaker_active = breaker_result.breaker
+    raw_candidate_count = 0
+    post_filter_candidate_count = 0
+    blocked_candidate_count = 0
+    halt_stage = "before_candidate_generation"
 
     try:
         try:
@@ -599,6 +645,15 @@ def main() -> int:
         latest_date = panel.index.max()
         latest = panel.loc[panel.index == latest_date].copy()
         logger.info(f"📅 予測対象日: {latest_date.strftime('%Y-%m-%d')} のデータで推論します")
+        raw_candidate_count = len(latest)
+        halt_stage = "after_candidate_generation"
+        set_health_candidate_observation(
+            health_row,
+            raw_candidate_count=raw_candidate_count,
+            post_filter_candidate_count=post_filter_candidate_count,
+            blocked_candidate_count=blocked_candidate_count,
+            halt_stage=halt_stage,
+        )
 
         x_raw = latest[all_features]
         x_scaled = pd.DataFrame(scaler.transform(x_raw), index=x_raw.index, columns=all_features)
@@ -616,10 +671,25 @@ def main() -> int:
         latest["cost_hat"] = latest["ATR_Prev_Ratio"].apply(cost_hat_roundtrip)
         latest["Net_Score"] = latest["Pred_Return"] - latest["cost_hat"]
         latest = latest[latest["Net_Score"] > 0].copy()
+        post_filter_candidate_count = len(latest)
+        halt_stage = "after_candidate_filter"
+        set_health_candidate_observation(
+            health_row,
+            raw_candidate_count=raw_candidate_count,
+            post_filter_candidate_count=post_filter_candidate_count,
+            blocked_candidate_count=blocked_candidate_count,
+            halt_stage=halt_stage,
+        )
 
         if latest.empty:
             if breaker_active:
-                record_breaker_observations(breaker_result, blocked_candidates=None)
+                record_breaker_observations(
+                    breaker_result,
+                    blocked_candidates=None,
+                    candidate_count=raw_candidate_count,
+                    blocked_candidate_count=0,
+                    halt_stage=halt_stage,
+                )
                 logger.warning("🛑 ブレーカー発動：recommendations.csv を空で出力します")
                 write_empty_recommendations(config.RECO_CSV_PATH)
                 health_row["note"] = append_note(str(health_row.get("note", "")), "breaker observation only")
@@ -634,7 +704,22 @@ def main() -> int:
 
         if breaker_active:
             blocked_count = len(latest)
-            record_breaker_observations(breaker_result, blocked_candidates=latest)
+            blocked_candidate_count = blocked_count
+            halt_stage = "before_recommendation_write"
+            set_health_candidate_observation(
+                health_row,
+                raw_candidate_count=raw_candidate_count,
+                post_filter_candidate_count=post_filter_candidate_count,
+                blocked_candidate_count=blocked_candidate_count,
+                halt_stage=halt_stage,
+            )
+            record_breaker_observations(
+                breaker_result,
+                blocked_candidates=latest,
+                candidate_count=raw_candidate_count,
+                blocked_candidate_count=blocked_candidate_count,
+                halt_stage=halt_stage,
+            )
             logger.warning("🛑 ブレーカー発動：recommendations.csv を空で出力します")
             write_empty_recommendations(config.RECO_CSV_PATH)
             health_row["note"] = append_note(str(health_row.get("note", "")), f"breaker_blocked_candidates={blocked_count}")
@@ -667,6 +752,14 @@ def main() -> int:
 
         df_res = pd.DataFrame(results)
         df_res = df_res[[column for column in RECOMMENDATION_COLUMNS if column in df_res.columns]]
+        halt_stage = "before_recommendation_write"
+        set_health_candidate_observation(
+            health_row,
+            raw_candidate_count=raw_candidate_count,
+            post_filter_candidate_count=post_filter_candidate_count,
+            blocked_candidate_count=blocked_candidate_count,
+            halt_stage=halt_stage,
+        )
 
         ensure_parent_dir(config.RECO_CSV_PATH)
         df_res.to_csv(config.RECO_CSV_PATH, index=False, encoding="utf-8-sig")
