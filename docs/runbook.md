@@ -102,6 +102,7 @@ editor type mismatch の対処:
 - ブレーカー発動日は `recommendations.csv` が空であること
 - ブレーカー発動日は `breaker_event_log.csv` と `simulated_order_log.csv` を確認し、停止そのものを観測対象として扱う
 - `simulated_order_log.csv` は実注文ログではなく、ブレーカーが無ければ候補になっていた entry 観測ログとして扱う
+- `simulated_order_log.csv` が出ない日は `breaker_event_log.csv` と `daily_health_log.csv` の `candidate_count` / `blocked_candidate_count` / `halt_stage` で理由を切り分ける
 - `trade_execution_log*.csv` には `entry_or_exit` / `expected_side_price` / `slippage_pct` / `slippage_bps` / `time_bucket` / `is_force_exit` / `price_level` が追加されている
 - `slippage_pct` は不利方向を正で統一し、BUY は `(actual_price-expected_ask)/expected_ask`、SELL は `(expected_bid-actual_price)/expected_bid`、`slippage_bps = slippage_pct * 10000`
 
@@ -131,7 +132,9 @@ daily_batch:
 - `recommendations.csv` の出力が壊れていない
 - `daily_health_log.csv` の `reason` / `cond_*` / `ret_threshold` が埋まっている
 - ブレーカー発動時は `breaker_event_log.csv` に `breaker_reason` / `action_taken` が追記される
+- `breaker_event_log.csv` の summary 行でも `candidate_count` / `blocked_candidate_count` / `halt_stage` で停止段階を追える
 - 注文候補があった日は `simulated_order_log.csv` に `blocked_by_breaker=True` / `would_open_or_close=open` が追記される
+- `daily_health_log.csv` では `raw_candidate_count` / `post_filter_candidate_count` / `blocked_candidate_count` / `halt_stage` を見る
 
 KPI:
 - `python scripts/ops_kpi_report.py --env sim --days 7` が成功する

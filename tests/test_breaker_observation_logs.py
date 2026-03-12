@@ -38,12 +38,21 @@ class BreakerObservationLogTests(unittest.TestCase):
             ]
         )
 
-        event_rows, simulated_rows = build_breaker_observation_rows(breaker_result, blocked_candidates)
+        event_rows, simulated_rows = build_breaker_observation_rows(
+            breaker_result,
+            blocked_candidates,
+            candidate_count=3,
+            blocked_candidate_count=1,
+            halt_stage="before_recommendation_write",
+        )
 
         self.assertEqual(len(event_rows), 1)
         self.assertEqual(event_rows[0]["symbol"], "7203")
         self.assertEqual(event_rows[0]["breaker_reason"], "close_below_ma")
         self.assertEqual(event_rows[0]["action_taken"], "skip_entry")
+        self.assertEqual(event_rows[0]["candidate_count"], 3)
+        self.assertEqual(event_rows[0]["blocked_candidate_count"], 1)
+        self.assertEqual(event_rows[0]["halt_stage"], "before_recommendation_write")
 
         self.assertEqual(len(simulated_rows), 1)
         self.assertEqual(simulated_rows[0]["side"], "BUY")
@@ -72,6 +81,9 @@ class BreakerObservationLogTests(unittest.TestCase):
                         "volatility_reference": 0.02,
                         "spread_reference": "",
                         "action_taken": "skip_entry",
+                        "candidate_count": 3,
+                        "blocked_candidate_count": 1,
+                        "halt_stage": "before_recommendation_write",
                     }
                 ],
             )
